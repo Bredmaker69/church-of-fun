@@ -298,6 +298,7 @@ function decodeHtmlEntities(text) {
 
 function normalizeCaptionText(text) {
     return decodeHtmlEntities(String(text || ""))
+        .replace(/<[^>]+>/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -412,15 +413,19 @@ function parseJson3Transcript(payload, fallbackLanguage) {
 }
 
 function parseXmlTranscript(xml, fallbackLanguage) {
-    const pattern = /<text start="([^"]+)" dur="([^"]+)">([\s\S]*?)<\/text>/g;
+    const pattern = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
     const entries = [];
     let match;
 
     while ((match = pattern.exec(xml)) !== null) {
-        const offset = Number(match[1]);
-        const duration = Number(match[2]);
-        const text = normalizeCaptionText(match[3]);
+        const attrs = match[1] || "";
+        const text = normalizeCaptionText(match[2]);
         if (!text) continue;
+
+        const startMatch = attrs.match(/\bstart="([^"]+)"/);
+        const durMatch = attrs.match(/\bdur="([^"]+)"/);
+        const offset = Number(startMatch?.[1]);
+        const duration = Number(durMatch?.[1]);
 
         entries.push({
             text,
@@ -512,15 +517,22 @@ async function fetchYouTubeTranscriptViaWatchPage(videoId, language) {
     });
 
     if (transcriptJsonResponse.ok) {
-        const transcriptJson = await transcriptJsonResponse.json();
-        const jsonEntries = parseJson3Transcript(transcriptJson, selectedTrack.languageCode);
-        if (jsonEntries.length > 0) {
-            return toTranscriptResult(jsonEntries, {
-                videoId,
-                languageUsed: selectedTrack.languageCode || language || "auto",
-                provider: "watch-page-json3",
-                attemptMode: language ? "language" : "auto",
-            });
+        const transcriptJsonText = await transcriptJsonResponse.text();
+        if (transcriptJsonText.trim().length > 0) {
+            try {
+                const transcriptJson = JSON.parse(transcriptJsonText);
+                const jsonEntries = parseJson3Transcript(transcriptJson, selectedTrack.languageCode);
+                if (jsonEntries.length > 0) {
+                    return toTranscriptResult(jsonEntries, {
+                        videoId,
+                        languageUsed: selectedTrack.languageCode || language || "auto",
+                        provider: "watch-page-json3",
+                        attemptMode: language ? "language" : "auto",
+                    });
+                }
+            } catch {
+                // Continue to XML fallback below.
+            }
         }
     }
 
