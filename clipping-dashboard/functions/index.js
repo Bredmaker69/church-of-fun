@@ -294,9 +294,68 @@ exports.generateClips = onCall({ cors: true }, async (request) => {
     }
 });
 
+exports.checkTranscriptAvailability = onCall({ cors: true }, async (request) => {
+    try {
+        const { videoUrl, transcriptLanguage } = request.data || {};
+
+        if (!videoUrl) {
+            throw new HttpsError("invalid-argument", "The function must be called with a 'videoUrl'.");
+        }
+
+        if (!isLikelyYouTubeUrl(videoUrl)) {
+            return {
+                success: true,
+                provider: "openai_only",
+                isYouTube: false,
+                hasCaptions: false,
+                message: "URL is not a YouTube link. Transcript generation will use OpenAI.",
+            };
+        }
+
+        if (process.env.ENABLE_YOUTUBE_TRANSCRIPT === "false") {
+            return {
+                success: true,
+                provider: "youtube_caption",
+                isYouTube: true,
+                hasCaptions: false,
+                message: "YouTube caption provider is disabled by environment configuration.",
+            };
+        }
+
+        try {
+            const segments = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
+            return {
+                success: true,
+                provider: "youtube_caption",
+                isYouTube: true,
+                hasCaptions: true,
+                segmentCount: segments.length,
+                message: `YouTube captions are available (${segments.length} segments).`,
+            };
+        } catch (error) {
+            return {
+                success: true,
+                provider: "youtube_caption",
+                isYouTube: true,
+                hasCaptions: false,
+                message: `YouTube captions unavailable: ${error.message}`,
+            };
+        }
+    } catch (error) {
+        console.error("Error checking transcript availability:", error);
+        throw new HttpsError("internal", "An error occurred while checking transcript availability.", error.message);
+    }
+});
+
 exports.generateTranscript = onCall({ cors: true }, async (request) => {
     try {
-        const { videoUrl, videoTitle, contentType, transcriptLanguage } = request.data || {};
+        const {
+            videoUrl,
+            videoTitle,
+            contentType,
+            transcriptLanguage,
+            allowOpenAiFallback,
+        } = request.data || {};
 
         if (!videoUrl) {
             throw new HttpsError("invalid-argument", "The function must be called with a 'videoUrl'.");
@@ -304,6 +363,8 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
 
         const normalizedContentType = normalizeContentType(contentType);
         const profileInstruction = CONTENT_PROFILE_INSTRUCTIONS[normalizedContentType];
+        const canUseOpenAiFallback = allowOpenAiFallback !== false;
+        let youtubeFailureReason = "";
 
         try {
             const youtubeSegments = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
@@ -317,7 +378,19 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
                 };
             }
         } catch (youtubeError) {
-            console.warn("YouTube transcript provider failed; falling back to OpenAI transcript.", youtubeError.message);
+            youtubeFailureReason = youtubeError.message || "Unknown YouTube caption error.";
+            console.warn("YouTube transcript provider failed.", youtubeError.message);
+        }
+
+        if (!canUseOpenAiFallback && isLikelyYouTubeUrl(videoUrl)) {
+            throw new HttpsError(
+                "failed-precondition",
+                `YouTube captions were not available and AI fallback is disabled. ${youtubeFailureReason}`.trim()
+            );
+        }
+
+        if (isLikelyYouTubeUrl(videoUrl)) {
+            console.log(`Falling back to OpenAI transcript for ${videoTitle || "Untitled"} because YouTube captions were unavailable.`);
         }
 
         const apiKey = ensureOpenAiApiKey();

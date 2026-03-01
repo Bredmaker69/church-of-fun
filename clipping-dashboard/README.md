@@ -74,6 +74,7 @@ Notes:
 - Local mode includes a **Manual Clip Lab** with video scrubbing, manual in/out ranges, and MP4 export.
 - Manual Clip Lab can generate a transcript index, search keywords, jump to hits, and create manual clips directly from transcript matches.
 - Manual Clip Lab supports URL sources: drag/drop a YouTube URL (or paste one) and run transcript generation/search without uploading a file.
+- Manual Clip Lab now runs a visible YouTube caption availability check before transcript generation and exposes an explicit "Allow AI fallback" toggle to control token usage.
 - Rendering `.mp4` clips still requires a local uploaded file source.
 
 ## Quality checks
@@ -98,6 +99,7 @@ npm run build
 - Transcript provider behavior for `generateTranscript`:
   - For YouTube URLs, backend tries YouTube captions first.
   - If YouTube captions are unavailable or fail, backend falls back to OpenAI transcript generation.
+  - Frontend can disable this fallback per request by sending `allowOpenAiFallback=false`.
   - Optional env flags in `functions/.env.local`:
     - `ENABLE_YOUTUBE_TRANSCRIPT` (`false` to disable YouTube caption provider; default enabled)
     - `YOUTUBE_TRANSCRIPT_LANG` (default `en`)

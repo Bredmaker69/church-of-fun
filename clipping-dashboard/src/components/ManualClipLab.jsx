@@ -76,6 +76,7 @@ const buildTimedUrl = (sourceUrl, seconds) => {
 
 const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) => {
   const videoRef = useRef(null);
+  const transcriptAvailabilityRequestRef = useRef(0);
   const [sourceMode, setSourceMode] = useState('file');
   const [sourceFile, setSourceFile] = useState(null);
   const [videoUrl, setVideoUrl] = useState('');
@@ -89,10 +90,14 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   const [transcriptSegments, setTranscriptSegments] = useState([]);
   const [transcriptQuery, setTranscriptQuery] = useState('');
   const [transcriptSource, setTranscriptSource] = useState('');
+  const [transcriptAvailability, setTranscriptAvailability] = useState(null);
+  const [isCheckingTranscriptAvailability, setIsCheckingTranscriptAvailability] = useState(false);
+  const [allowOpenAiFallback, setAllowOpenAiFallback] = useState(true);
   const [isRendering, setIsRendering] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [status, setStatus] = useState('');
   const generateTranscript = httpsCallable(functions, 'generateTranscript');
+  const checkTranscriptAvailability = httpsCallable(functions, 'checkTranscriptAvailability');
 
   useEffect(() => {
     return () => {
@@ -107,12 +112,73 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     renderedClips.forEach((clip) => {
       if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
     });
+    transcriptAvailabilityRequestRef.current += 1;
     setSegments([]);
     setRenderedClips([]);
     setTranscriptSegments([]);
     setTranscriptQuery('');
     setTranscriptSource('');
+    setTranscriptAvailability(null);
+    setIsCheckingTranscriptAvailability(false);
     setStatus('');
+  };
+
+  const checkUrlTranscriptAvailability = async (url) => {
+    const requestId = transcriptAvailabilityRequestRef.current + 1;
+    transcriptAvailabilityRequestRef.current = requestId;
+
+    if (!looksLikeYouTubeUrl(url)) {
+      setTranscriptAvailability({
+        status: 'ready',
+        isYouTube: false,
+        hasCaptions: false,
+        segmentCount: 0,
+        message: 'Non-YouTube URL detected. Transcript generation will use OpenAI.',
+      });
+      setIsCheckingTranscriptAvailability(false);
+      return;
+    }
+
+    setIsCheckingTranscriptAvailability(true);
+    setTranscriptAvailability({
+      status: 'checking',
+      isYouTube: true,
+      hasCaptions: false,
+      segmentCount: 0,
+      message: 'Checking YouTube captions...',
+    });
+
+    try {
+      const result = await withTimeout(
+        checkTranscriptAvailability({ videoUrl: url }),
+        20000,
+        'Timed out checking YouTube captions.'
+      );
+
+      if (transcriptAvailabilityRequestRef.current !== requestId) return;
+
+      const data = result.data || {};
+      setTranscriptAvailability({
+        status: 'ready',
+        isYouTube: Boolean(data.isYouTube),
+        hasCaptions: Boolean(data.hasCaptions),
+        segmentCount: Number(data.segmentCount) || 0,
+        message: String(data.message || 'Transcript availability checked.'),
+      });
+    } catch (error) {
+      if (transcriptAvailabilityRequestRef.current !== requestId) return;
+      setTranscriptAvailability({
+        status: 'error',
+        isYouTube: true,
+        hasCaptions: false,
+        segmentCount: 0,
+        message: error.message || 'Unable to check YouTube captions.',
+      });
+    } finally {
+      if (transcriptAvailabilityRequestRef.current === requestId) {
+        setIsCheckingTranscriptAvailability(false);
+      }
+    }
   };
 
   const setFileSource = (file) => {
@@ -127,6 +193,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     setCurrentTime(0);
     setStartTime('00:00');
     setEndTime('00:15');
+    setAllowOpenAiFallback(true);
     clearProcessingState();
   };
 
@@ -145,8 +212,12 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     setCurrentTime(0);
     setStartTime('00:00');
     setEndTime('00:15');
+    setAllowOpenAiFallback(!looksLikeYouTubeUrl(value));
     clearProcessingState();
-    setStatus(`URL source ready: ${looksLikeYouTubeUrl(value) ? 'YouTube detected' : 'Direct URL'}`);
+    setStatus(looksLikeYouTubeUrl(value)
+      ? 'YouTube URL ready. Checking caption availability...'
+      : 'URL source ready: non-YouTube link.');
+    checkUrlTranscriptAvailability(value);
   };
 
   const addSegmentFromRange = ({ startTimestamp, endTimestamp, title, description }) => {
@@ -241,6 +312,20 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       setStatus('Choose a source file or paste/drop a source URL first.');
       return;
     }
+    if (sourceMode === 'url' && looksLikeYouTubeUrl(sourceUrl) && isCheckingTranscriptAvailability) {
+      setStatus('Still checking YouTube captions. Wait a moment, then try again.');
+      return;
+    }
+    if (
+      sourceMode === 'url' &&
+      looksLikeYouTubeUrl(sourceUrl) &&
+      transcriptAvailability?.status === 'ready' &&
+      !transcriptAvailability?.hasCaptions &&
+      !allowOpenAiFallback
+    ) {
+      setStatus('No YouTube captions found. Enable AI fallback to generate a transcript.');
+      return;
+    }
 
     setIsTranscribing(true);
     setStatus('Generating transcript index...');
@@ -251,6 +336,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
           videoUrl: activeSource.sourceRef,
           videoTitle: activeSource.sourceTitle,
           contentType: contentProfile,
+          allowOpenAiFallback,
         }),
         45000,
         'Timed out generating transcript.'
@@ -260,7 +346,11 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       const sourceTag = result.data?.transcriptSource || 'unknown';
       setTranscriptSegments(segmentsData);
       setTranscriptSource(sourceTag);
-      setStatus(`Transcript ready: ${segmentsData.length} segments (${sourceTag}).`);
+      if (sourceTag === 'youtube_caption') {
+        setStatus(`Transcript ready: ${segmentsData.length} segments from YouTube captions (no OpenAI tokens used).`);
+      } else {
+        setStatus(`Transcript ready: ${segmentsData.length} segments (${sourceTag}).`);
+      }
     } catch (error) {
       setStatus(`Transcript failed: ${error.message || 'Unknown error'}`);
     } finally {
@@ -307,6 +397,40 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     return `${segment.speaker} ${segment.text}`.toLowerCase().includes(needle);
   });
 
+  const isYouTubeSource = sourceMode === 'url' && looksLikeYouTubeUrl(sourceUrl);
+  const disableGenerateForCaptionOnlyMode = (
+    isYouTubeSource &&
+    transcriptAvailability?.status === 'ready' &&
+    !transcriptAvailability?.hasCaptions &&
+    !allowOpenAiFallback
+  );
+  const canGenerateTranscript = (
+    !isTranscribing &&
+    !!(sourceFile || sourceUrl) &&
+    !(isYouTubeSource && isCheckingTranscriptAvailability) &&
+    !disableGenerateForCaptionOnlyMode
+  );
+
+  const generateTranscriptButtonLabel = isTranscribing
+    ? 'Generating Transcript...'
+    : (
+      isYouTubeSource && transcriptAvailability?.hasCaptions
+        ? 'Use YouTube Captions'
+        : (
+          sourceMode === 'url'
+            ? 'Generate Transcript (AI)'
+            : 'Generate Transcript Index'
+        )
+    );
+
+  const transcriptAvailabilityClasses = isCheckingTranscriptAvailability
+    ? 'border-sky-300 bg-sky-50 text-sky-900 dark:border-sky-700 dark:bg-sky-950/40 dark:text-sky-100'
+    : (
+      transcriptAvailability?.hasCaptions
+        ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-100'
+        : 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-100'
+    );
+
   return (
     <section className="glass rounded-3xl p-5 lg:p-6 space-y-4">
       <div className="flex items-center justify-between gap-4">
@@ -349,8 +473,9 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
         />
         <button
           onClick={() => applySourceUrl(sourceUrlInput)}
-          className="bg-indigo-600 text-white px-3 py-2 rounded-lg text-sm font-semibold"
+          className="inline-flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-2 rounded-lg text-sm font-semibold transition-colors"
         >
+          <span className="material-symbols-outlined text-[18px]">link</span>
           Use URL Source
         </button>
       </div>
@@ -358,6 +483,52 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       {(sourceFile || sourceUrl) && (
         <div className="text-xs text-slate-500 dark:text-slate-400">
           Source: {sourceMode === 'file' ? `Local file (${sourceFile?.name})` : sourceUrl}
+        </div>
+      )}
+
+      {sourceMode === 'url' && sourceUrl && (
+        <div className={`rounded-xl border px-3 py-3 space-y-2 ${transcriptAvailabilityClasses}`}>
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold">
+              {isYouTubeSource ? 'YouTube Transcript Status' : 'Transcript Provider Status'}
+            </div>
+            <div className="flex items-center gap-2">
+              {isCheckingTranscriptAvailability && (
+                <span className="inline-flex items-center gap-1 text-xs font-semibold">
+                  <span className="material-symbols-outlined text-[14px] animate-spin">progress_activity</span>
+                  Checking...
+                </span>
+              )}
+              <button
+                onClick={() => checkUrlTranscriptAvailability(sourceUrl)}
+                disabled={isCheckingTranscriptAvailability}
+                className="text-xs font-semibold px-2 py-1 rounded-md bg-black/10 hover:bg-black/20 dark:bg-white/10 dark:hover:bg-white/20 disabled:opacity-50 transition-colors"
+              >
+                Re-check
+              </button>
+            </div>
+          </div>
+
+          <p className="text-sm leading-relaxed">
+            {transcriptAvailability?.message || 'Ready to generate transcript.'}
+          </p>
+
+          {isYouTubeSource && transcriptAvailability?.hasCaptions && (
+            <p className="text-xs font-semibold">
+              Captions available. Generation will use YouTube captions first (no OpenAI tokens).
+            </p>
+          )}
+
+          {isYouTubeSource && (
+            <label className="inline-flex items-center gap-2 text-xs font-semibold">
+              <input
+                type="checkbox"
+                checked={allowOpenAiFallback}
+                onChange={(event) => setAllowOpenAiFallback(event.target.checked)}
+              />
+              Allow AI fallback if YouTube captions are unavailable (uses OpenAI tokens)
+            </label>
+          )}
         </div>
       )}
 
@@ -377,10 +548,13 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
         <div className="md:col-span-2 flex items-end">
           <button
             onClick={handleGenerateTranscript}
-            disabled={isTranscribing || (!sourceFile && !sourceUrl)}
-            className="bg-indigo-600 text-white px-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
+            disabled={!canGenerateTranscript}
+            className="inline-flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-600 via-primary to-cyan-600 text-white px-4 py-2.5 rounded-xl text-sm font-bold shadow-lg shadow-indigo-500/30 hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 transition-all disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none disabled:shadow-none"
           >
-            {isTranscribing ? 'Generating Transcript...' : 'Generate Transcript Index'}
+            <span className="material-symbols-outlined text-[18px]">
+              {isTranscribing ? 'hourglass_top' : 'auto_awesome'}
+            </span>
+            {generateTranscriptButtonLabel}
           </button>
         </div>
       </div>
