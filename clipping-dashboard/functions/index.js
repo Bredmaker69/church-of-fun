@@ -217,29 +217,112 @@ function ensureOpenAiApiKey() {
     return process.env.OPENAI_API_KEY;
 }
 
+const YOUTUBE_VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
+
+function extractYouTubeVideoId(value) {
+    const text = String(value || "").trim();
+    if (!text) return null;
+    if (YOUTUBE_VIDEO_ID_PATTERN.test(text)) return text;
+
+    try {
+        const url = new URL(text);
+        const host = url.hostname.toLowerCase().replace(/^www\./, "");
+
+        if (host === "youtu.be") {
+            const directId = url.pathname.split("/").filter(Boolean)[0];
+            if (YOUTUBE_VIDEO_ID_PATTERN.test(directId || "")) return directId;
+        }
+
+        if (
+            host.endsWith("youtube.com") ||
+            host === "youtube-nocookie.com" ||
+            host.endsWith(".youtube-nocookie.com")
+        ) {
+            const watchId = url.searchParams.get("v");
+            if (YOUTUBE_VIDEO_ID_PATTERN.test(watchId || "")) return watchId;
+
+            const parts = url.pathname.split("/").filter(Boolean);
+            if (parts.length >= 2) {
+                const first = parts[0].toLowerCase();
+                const second = parts[1];
+                if (["shorts", "embed", "live", "v", "e"].includes(first) && YOUTUBE_VIDEO_ID_PATTERN.test(second || "")) {
+                    return second;
+                }
+            }
+        }
+    } catch {
+        // If URL parsing fails, fallback regex below.
+    }
+
+    const fallbackMatch = text.match(
+        /(?:youtube\.com\/(?:shorts|embed|live|v|e)\/|youtube\.com\/.*[?&]v=|youtu\.be\/)([A-Za-z0-9_-]{11})/i
+    );
+    return fallbackMatch ? fallbackMatch[1] : null;
+}
+
 function isLikelyYouTubeUrl(value) {
-    const url = String(value || "").toLowerCase();
-    return url.includes("youtube.com") || url.includes("youtu.be");
+    return Boolean(extractYouTubeVideoId(value));
+}
+
+function cleanYouTubeErrorMessage(error) {
+    return String(error?.message || "Unknown caption lookup error.")
+        .replace(/^\[YoutubeTranscript\]\s*🚨\s*/i, "")
+        .replace(/\s+/g, " ")
+        .trim();
 }
 
 async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
-    if (!isLikelyYouTubeUrl(videoUrl)) return null;
+    const videoId = extractYouTubeVideoId(videoUrl);
+    if (!videoId) return null;
     if (process.env.ENABLE_YOUTUBE_TRANSCRIPT === "false") return null;
 
-    const lang = String(preferredLanguage || process.env.YOUTUBE_TRANSCRIPT_LANG || "en");
-    const transcript = await YoutubeTranscript.fetchTranscript(videoUrl, { lang });
-    const rawSegments = transcript.map((entry) => ({
-        startTimestamp: formatSecondsToTimestamp(entry.offset),
-        endTimestamp: formatSecondsToTimestamp(entry.offset + entry.duration),
-        speaker: "Caption",
-        text: entry.text,
-    }));
+    const explicitLangs = [preferredLanguage, process.env.YOUTUBE_TRANSCRIPT_LANG]
+        .map((value) => String(value || "").trim())
+        .filter(Boolean);
 
-    const segments = applyTranscriptRules(rawSegments);
-    if (segments.length === 0) {
-        throw new Error("YouTube captions were returned but no valid segments were produced.");
+    const langAttempts = [];
+    for (const lang of explicitLangs) {
+        if (!langAttempts.includes(lang)) {
+            langAttempts.push(lang);
+        }
     }
-    return segments;
+    langAttempts.push(null);
+    if (!langAttempts.includes("en")) {
+        langAttempts.push("en");
+    }
+
+    const errors = [];
+    for (const lang of langAttempts) {
+        try {
+            const transcript = lang
+                ? await YoutubeTranscript.fetchTranscript(videoId, { lang })
+                : await YoutubeTranscript.fetchTranscript(videoId);
+
+            const rawSegments = transcript.map((entry) => ({
+                startTimestamp: formatSecondsToTimestamp(entry.offset),
+                endTimestamp: formatSecondsToTimestamp(entry.offset + entry.duration),
+                speaker: "Caption",
+                text: entry.text,
+            }));
+
+            const segments = applyTranscriptRules(rawSegments);
+            if (segments.length === 0) {
+                errors.push(`${lang || "auto"}: caption track returned no valid segments`);
+                continue;
+            }
+
+            return {
+                segments,
+                videoId,
+                languageUsed: transcript[0]?.lang || lang || "auto",
+                attemptMode: lang ? "language" : "auto",
+            };
+        } catch (error) {
+            errors.push(`${lang || "auto"}: ${cleanYouTubeErrorMessage(error)}`);
+        }
+    }
+
+    throw new Error(`No usable YouTube captions found. Attempts: ${errors.join(" | ")}`.slice(0, 800));
 }
 
 exports.generateClips = onCall({ cors: true }, async (request) => {
@@ -323,14 +406,16 @@ exports.checkTranscriptAvailability = onCall({ cors: true }, async (request) => 
         }
 
         try {
-            const segments = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
+            const transcript = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
             return {
                 success: true,
                 provider: "youtube_caption",
                 isYouTube: true,
                 hasCaptions: true,
-                segmentCount: segments.length,
-                message: `YouTube captions are available (${segments.length} segments).`,
+                videoId: transcript.videoId,
+                languageUsed: transcript.languageUsed,
+                segmentCount: transcript.segments.length,
+                message: `YouTube captions are available (${transcript.segments.length} segments, lang ${transcript.languageUsed}).`,
             };
         } catch (error) {
             return {
@@ -367,14 +452,17 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
         let youtubeFailureReason = "";
 
         try {
-            const youtubeSegments = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
-            if (youtubeSegments && youtubeSegments.length > 0) {
-                console.log(`Using YouTube transcript provider (${youtubeSegments.length} segments) for ${videoTitle || "Untitled"}`);
+            const youtubeTranscript = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
+            if (youtubeTranscript && youtubeTranscript.segments.length > 0) {
+                console.log(
+                    `Using YouTube transcript provider (${youtubeTranscript.segments.length} segments, ${youtubeTranscript.languageUsed}) for ${videoTitle || "Untitled"}`
+                );
                 return {
                     success: true,
                     contentType: normalizedContentType,
                     transcriptSource: "youtube_caption",
-                    segments: youtubeSegments,
+                    transcriptLanguageUsed: youtubeTranscript.languageUsed,
+                    segments: youtubeTranscript.segments,
                 };
             }
         } catch (youtubeError) {
