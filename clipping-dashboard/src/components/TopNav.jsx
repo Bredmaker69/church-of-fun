@@ -1,7 +1,7 @@
 import React from 'react';
 import logo from '../assets/logo.jpg';
 
-const TopNav = ({ isDarkMode, toggleTheme }) => {
+const TopNav = ({ isDarkMode, toggleTheme, onUpload }) => {
     return (
         <header className="flex items-center justify-between p-4 lg:p-8 lg:pb-0">
             <div className="flex items-center gap-4 lg:hidden">

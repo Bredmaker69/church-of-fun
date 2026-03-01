@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { db, storage } from './firebase';
 import { collection, addDoc, serverTimestamp, query, orderBy, onSnapshot } from 'firebase/firestore';
-import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytesResumable } from 'firebase/storage';
 import Sidebar from './components/Sidebar';
 import TopNav from './components/TopNav';
 import DashboardGrid from './components/DashboardGrid';
@@ -63,7 +63,7 @@ function App() {
       const uploadTask = uploadBytesResumable(storageRef, file);
 
       uploadTask.on('state_changed',
-        (snapshot) => {
+        () => {
           // Progress handled by CSS mock progress bar in VideoCard
         },
         (error) => {
