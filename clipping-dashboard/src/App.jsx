@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { db, storage } from './firebase';
-import { collection, addDoc, serverTimestamp, query, orderBy, onSnapshot } from 'firebase/firestore';
-import { ref, uploadBytesResumable } from 'firebase/storage';
+import { db, storage, functions } from './firebase';
+import { collection, addDoc, updateDoc, serverTimestamp, query, orderBy, onSnapshot } from 'firebase/firestore';
+import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
+import { httpsCallable } from 'firebase/functions';
 import Sidebar from './components/Sidebar';
 import TopNav from './components/TopNav';
 import DashboardGrid from './components/DashboardGrid';
@@ -12,6 +13,7 @@ function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [videos, setVideos] = useState([]);
   const fileInputRef = useRef(null);
+  const generateClips = httpsCallable(functions, 'generateClips');
 
   useEffect(() => {
     const q = query(collection(db, 'videos'), orderBy('createdAt', 'desc'));
@@ -66,12 +68,57 @@ function App() {
         () => {
           // Progress handled by CSS mock progress bar in VideoCard
         },
-        (error) => {
+        async (error) => {
           console.error("Upload failed", error);
+          try {
+            await updateDoc(docRef, {
+              status: 'failed',
+              statusLabel: 'Upload failed',
+              errorMessage: error.message || 'Upload error',
+              updatedAt: serverTimestamp()
+            });
+          } catch (updateError) {
+            console.error("Failed to update upload error state", updateError);
+          }
         },
         async () => {
-          console.log("Upload complete!");
-          // Wait for backend triggers or directly call the HTTP Cloud Function
+          try {
+            const videoUrl = await getDownloadURL(uploadTask.snapshot.ref);
+
+            await updateDoc(docRef, {
+              status: 'processing',
+              statusLabel: 'Analyzing video...',
+              videoUrl,
+              updatedAt: serverTimestamp()
+            });
+
+            const result = await generateClips({
+              videoUrl,
+              videoTitle: file.name
+            });
+
+            const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
+
+            await updateDoc(docRef, {
+              status: 'processed',
+              statusLabel: 'Ready',
+              clips: generatedClips,
+              clipsGenerated: generatedClips.length,
+              updatedAt: serverTimestamp()
+            });
+          } catch (error) {
+            console.error("Processing failed", error);
+            try {
+              await updateDoc(docRef, {
+                status: 'failed',
+                statusLabel: 'Processing failed',
+                errorMessage: error.message || 'Processing error',
+                updatedAt: serverTimestamp()
+              });
+            } catch (updateError) {
+              console.error("Failed to update processing error state", updateError);
+            }
+          }
         }
       );
     } catch (err) {

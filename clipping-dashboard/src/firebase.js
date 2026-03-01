@@ -3,16 +3,25 @@ import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
 import { getFunctions } from "firebase/functions";
 
-// TODO: Replace the following with your app's Firebase project configuration
-// You can find these in the Firebase Console under Project Settings -> General -> Web App
 const firebaseConfig = {
-    apiKey: "YOUR_API_KEY",
-    authDomain: "YOUR_AUTH_DOMAIN",
-    projectId: "YOUR_PROJECT_ID",
-    storageBucket: "YOUR_STORAGE_BUCKET",
-    messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
-    appId: "YOUR_APP_ID"
+    apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+    authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+    projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+    storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+    messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+    appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
+
+const missingFirebaseConfig = Object.entries(firebaseConfig)
+    .filter(([, value]) => !value)
+    .map(([key]) => key);
+
+if (missingFirebaseConfig.length > 0) {
+    throw new Error(
+        `Missing Firebase config values: ${missingFirebaseConfig.join(", ")}. ` +
+        "Set the required VITE_FIREBASE_* values in your .env.local file."
+    );
+}
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -20,6 +29,9 @@ const app = initializeApp(firebaseConfig);
 // Initialize Firebase services
 export const db = getFirestore(app);
 export const storage = getStorage(app);
-export const functions = getFunctions(app);
+export const functions = getFunctions(
+    app,
+    import.meta.env.VITE_FIREBASE_FUNCTIONS_REGION || "us-central1"
+);
 
 export default app;
