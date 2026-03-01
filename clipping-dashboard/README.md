@@ -98,10 +98,12 @@ npm run build
 - Transcript index is available via callable function `generateTranscript`.
 - Transcript provider behavior for `generateTranscript`:
   - For YouTube URLs, backend tries YouTube captions first.
+  - In local dev, backend also attempts a `yt-dlp` caption fallback when direct YouTube caption endpoints return empty.
   - If YouTube captions are unavailable or fail, backend falls back to OpenAI transcript generation.
   - Frontend can disable this fallback per request by sending `allowOpenAiFallback=false`.
   - Optional env flags in `functions/.env.local`:
     - `ENABLE_YOUTUBE_TRANSCRIPT` (`false` to disable YouTube caption provider; default enabled)
+    - `ENABLE_YTDLP_TRANSCRIPT` (`false` to disable yt-dlp fallback; default enabled)
     - `YOUTUBE_TRANSCRIPT_LANG` (default `en`)
 
 ## Deploy Functions

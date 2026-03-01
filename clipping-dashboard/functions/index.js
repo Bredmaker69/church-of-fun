@@ -1,5 +1,12 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { YoutubeTranscript } = require("youtube-transcript");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const os = require("node:os");
+
+const execFileAsync = promisify(execFile);
 
 const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const TARGET_CLIP_COUNT = Number(process.env.CLIP_TARGET_COUNT || 3);
@@ -285,6 +292,15 @@ function cleanYouTubeErrorMessage(error) {
         .trim();
 }
 
+function summarizeExecError(error) {
+    const stderr = String(error?.stderr || "").trim();
+    const stdout = String(error?.stdout || "").trim();
+    const base = String(error?.message || "process failed");
+    const tail = stderr || stdout;
+    if (!tail) return base;
+    return `${base} :: ${tail.slice(0, 280)}`;
+}
+
 function decodeHtmlEntities(text) {
     return String(text || "")
         .replace(/&amp;/g, "&")
@@ -532,6 +548,36 @@ function parseVttTranscript(vtt, fallbackLanguage) {
     return entries;
 }
 
+function languageScore(candidate, preferredLanguage) {
+    const preferred = String(preferredLanguage || "").toLowerCase().trim();
+    const value = String(candidate || "").toLowerCase().trim();
+    if (!value) return 0;
+    if (preferred && value === preferred) return 100;
+    const preferredRoot = preferred.split("-")[0];
+    if (preferredRoot && value.startsWith(preferredRoot)) return 80;
+    if (value.startsWith("en")) return 60;
+    return 10;
+}
+
+function inferLanguageFromSubtitleFileName(fileName) {
+    const withoutExt = String(fileName || "").replace(/\.vtt$/i, "");
+    const parts = withoutExt.split(".");
+    if (parts.length < 2) return "auto";
+    const languagePart = parts[parts.length - 1];
+    return languagePart.replace(/-orig$/i, "");
+}
+
+function rankSubtitleFiles(fileNames, preferredLanguage) {
+    return [...fileNames].sort((a, b) => {
+        const aLang = inferLanguageFromSubtitleFileName(a);
+        const bLang = inferLanguageFromSubtitleFileName(b);
+        const aScore = languageScore(aLang, preferredLanguage);
+        const bScore = languageScore(bLang, preferredLanguage);
+        if (aScore !== bScore) return bScore - aScore;
+        return a.localeCompare(b);
+    });
+}
+
 function toTranscriptResult(entries, meta) {
     const rawSegments = entries.map((entry) => ({
         startTimestamp: formatSecondsToTimestamp(entry.offset),
@@ -739,6 +785,69 @@ async function fetchYouTubeTranscriptViaNoFmtTrack(videoId, language, trackUrl, 
     throw new Error(`No-fmt track returned no transcript text. Sample: ${sample}`);
 }
 
+async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
+    if (process.env.ENABLE_YTDLP_TRANSCRIPT === "false") {
+        throw new Error("yt-dlp transcript provider disabled by environment configuration.");
+    }
+
+    const targetUrl = String(videoUrl || "").trim() || `https://www.youtube.com/watch?v=${videoId}`;
+    const preferredLanguage = String(language || "").trim();
+    const langSpec = preferredLanguage
+        ? `${preferredLanguage}.*,${preferredLanguage},en.*,en,-live_chat`
+        : "en.*,en,all,-live_chat";
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "yt-captions-"));
+    try {
+        const args = [
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-format",
+            "vtt",
+            "--sub-langs",
+            langSpec,
+            "--output",
+            "%(id)s.%(ext)s",
+            targetUrl,
+        ];
+
+        await execFileAsync("yt-dlp", args, {
+            cwd: tempDir,
+            timeout: 180000,
+            maxBuffer: 20 * 1024 * 1024,
+        });
+
+        const fileNames = await fs.readdir(tempDir);
+        const vttFiles = rankSubtitleFiles(
+            fileNames.filter((name) => name.toLowerCase().endsWith(".vtt")),
+            preferredLanguage
+        );
+
+        if (vttFiles.length === 0) {
+            throw new Error("yt-dlp did not produce subtitle files.");
+        }
+
+        for (const fileName of vttFiles) {
+            const body = await fs.readFile(path.join(tempDir, fileName), "utf8");
+            const entries = parseVttTranscript(body, inferLanguageFromSubtitleFileName(fileName));
+            if (entries.length > 0) {
+                return toTranscriptResult(entries, {
+                    videoId,
+                    languageUsed: inferLanguageFromSubtitleFileName(fileName),
+                    provider: "yt-dlp-vtt",
+                    attemptMode: preferredLanguage ? "language" : "auto",
+                });
+            }
+        }
+
+        throw new Error("yt-dlp subtitle files contained no transcript text.");
+    } catch (error) {
+        throw new Error(`yt-dlp provider failed: ${summarizeExecError(error)}`);
+    } finally {
+        await fs.rm(tempDir, { recursive: true, force: true });
+    }
+}
+
 async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
     const videoId = extractYouTubeVideoId(videoUrl);
     if (!videoId) return null;
@@ -760,15 +869,16 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
     }
 
     const providerAttempts = [
-        { name: "youtube-transcript", run: fetchYouTubeTranscriptWithLibrary },
-        { name: "watch-page", run: fetchYouTubeTranscriptViaWatchPage },
+        { name: "youtube-transcript", run: (lang) => fetchYouTubeTranscriptWithLibrary(videoId, lang) },
+        { name: "watch-page", run: (lang) => fetchYouTubeTranscriptViaWatchPage(videoId, lang) },
+        { name: "yt-dlp", run: (lang) => fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, lang) },
     ];
 
     const errors = [];
     for (const provider of providerAttempts) {
         for (const lang of langAttempts) {
             try {
-                const transcript = await provider.run(videoId, lang);
+                const transcript = await provider.run(lang);
                 return {
                     ...transcript,
                     providerUsed: transcript.providerUsed || provider.name,
