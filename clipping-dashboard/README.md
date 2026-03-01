@@ -68,6 +68,7 @@ npm run dev:local
 Notes:
 - Firestore and Storage remain on your Firebase project.
 - Only the callable `generateClips` runs locally on your Mac.
+- In `dev:local`, Storage upload is intentionally skipped and replaced with a local file reference so you can test processing flow without Storage auth/rules setup.
 
 ## Quality checks
 

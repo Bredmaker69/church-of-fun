@@ -14,6 +14,8 @@ function App() {
   const [videos, setVideos] = useState([]);
   const fileInputRef = useRef(null);
   const generateClips = httpsCallable(functions, 'generateClips');
+  const skipStorageUploadInLocalMode =
+    import.meta.env.DEV && import.meta.env.VITE_SKIP_STORAGE_UPLOAD === 'true';
 
   useEffect(() => {
     const q = query(collection(db, 'videos'), orderBy('createdAt', 'desc'));
@@ -59,6 +61,47 @@ function App() {
         clipsGenerated: 0,
         createdAt: serverTimestamp()
       });
+
+      if (skipStorageUploadInLocalMode) {
+        const localVideoReference = `local-file://${encodeURIComponent(file.name)}`;
+
+        await updateDoc(docRef, {
+          status: 'processing',
+          statusLabel: 'Analyzing video (local mode)...',
+          uploadProgress: 100,
+          videoUrl: localVideoReference,
+          updatedAt: serverTimestamp()
+        });
+
+        try {
+          const result = await generateClips({
+            videoUrl: localVideoReference,
+            videoTitle: file.name
+          });
+
+          const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
+
+          await updateDoc(docRef, {
+            status: 'processed',
+            statusLabel: 'Ready',
+            clips: generatedClips,
+            clipsGenerated: generatedClips.length,
+            uploadProgress: 100,
+            updatedAt: serverTimestamp()
+          });
+        } catch (error) {
+          console.error("Processing failed", error);
+          await updateDoc(docRef, {
+            status: 'failed',
+            statusLabel: 'Processing failed',
+            uploadProgress: 100,
+            errorMessage: error.message || 'Processing error',
+            updatedAt: serverTimestamp()
+          });
+        }
+
+        return;
+      }
 
       // 2. Upload video file to Firebase Storage
       const storageRef = ref(storage, `videos/${docRef.id}/${file.name}`);
