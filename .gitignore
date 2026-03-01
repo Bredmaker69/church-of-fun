@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Common dependency/build artifacts
+node_modules/
+dist/
+build/
+coverage/
+
+# Editor/IDE metadata
+.idea/
+.vscode/
