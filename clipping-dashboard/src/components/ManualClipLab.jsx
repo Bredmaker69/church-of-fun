@@ -90,6 +90,9 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   const [transcriptSegments, setTranscriptSegments] = useState([]);
   const [transcriptQuery, setTranscriptQuery] = useState('');
   const [transcriptSource, setTranscriptSource] = useState('');
+  const [transcriptProviderUsed, setTranscriptProviderUsed] = useState('');
+  const [transcriptLanguageUsed, setTranscriptLanguageUsed] = useState('');
+  const [transcriptCacheHit, setTranscriptCacheHit] = useState(false);
   const [transcriptAvailability, setTranscriptAvailability] = useState(null);
   const [isCheckingTranscriptAvailability, setIsCheckingTranscriptAvailability] = useState(false);
   const [allowOpenAiFallback, setAllowOpenAiFallback] = useState(true);
@@ -118,6 +121,9 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     setTranscriptSegments([]);
     setTranscriptQuery('');
     setTranscriptSource('');
+    setTranscriptProviderUsed('');
+    setTranscriptLanguageUsed('');
+    setTranscriptCacheHit(false);
     setTranscriptAvailability(null);
     setIsCheckingTranscriptAvailability(false);
     setStatus('');
@@ -151,7 +157,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     try {
       const result = await withTimeout(
         checkTranscriptAvailability({ videoUrl: url }),
-        20000,
+        90000,
         'Timed out checking YouTube captions.'
       );
 
@@ -163,6 +169,9 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
         isYouTube: Boolean(data.isYouTube),
         hasCaptions: Boolean(data.hasCaptions),
         segmentCount: Number(data.segmentCount) || 0,
+        providerUsed: String(data.providerUsed || ''),
+        languageUsed: String(data.languageUsed || ''),
+        cacheHit: Boolean(data.cacheHit),
         message: String(data.message || 'Transcript availability checked.'),
       });
     } catch (error) {
@@ -338,16 +347,24 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
           contentType: contentProfile,
           allowOpenAiFallback,
         }),
-        45000,
+        90000,
         'Timed out generating transcript.'
       );
 
       const segmentsData = Array.isArray(result.data?.segments) ? result.data.segments : [];
       const sourceTag = result.data?.transcriptSource || 'unknown';
+      const providerTag = result.data?.transcriptProviderUsed || '';
+      const languageTag = result.data?.transcriptLanguageUsed || '';
+      const cacheHit = Boolean(result.data?.cacheHit);
       setTranscriptSegments(segmentsData);
       setTranscriptSource(sourceTag);
+      setTranscriptProviderUsed(providerTag);
+      setTranscriptLanguageUsed(languageTag);
+      setTranscriptCacheHit(cacheHit);
       if (sourceTag === 'youtube_caption') {
-        setStatus(`Transcript ready: ${segmentsData.length} segments from YouTube captions (no OpenAI tokens used).`);
+        const cacheText = cacheHit ? ' (cache hit)' : '';
+        const detail = providerTag ? ` via ${providerTag}${languageTag ? ` (${languageTag})` : ''}` : '';
+        setStatus(`Transcript ready: ${segmentsData.length} segments from YouTube captions${detail}${cacheText} (no OpenAI tokens used).`);
       } else {
         setStatus(`Transcript ready: ${segmentsData.length} segments (${sourceTag}).`);
       }
@@ -429,6 +446,20 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       transcriptAvailability?.hasCaptions
         ? 'border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-100'
         : 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950/30 dark:text-amber-100'
+    );
+
+  const transcriptSourceBadge = transcriptSource === 'youtube_caption'
+    ? {
+      label: 'Real Captions (YouTube)',
+      className: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200',
+    }
+    : (
+      transcriptSource === 'openai_fallback'
+        ? {
+          label: 'AI Fallback Transcript',
+          className: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200',
+        }
+        : null
     );
 
   return (
@@ -517,6 +548,29 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
             <p className="text-xs font-semibold">
               Captions available. Generation will use YouTube captions first (no OpenAI tokens).
             </p>
+          )}
+
+          {isYouTubeSource && transcriptAvailability?.hasCaptions && (
+            <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
+              <span className="px-2 py-1 rounded-full bg-emerald-600/15 text-emerald-700 dark:text-emerald-300">
+                Real captions available
+              </span>
+              {transcriptAvailability?.providerUsed && (
+                <span className="px-2 py-1 rounded-full bg-black/10 dark:bg-white/10">
+                  Provider: {transcriptAvailability.providerUsed}
+                </span>
+              )}
+              {transcriptAvailability?.languageUsed && (
+                <span className="px-2 py-1 rounded-full bg-black/10 dark:bg-white/10">
+                  Lang: {transcriptAvailability.languageUsed}
+                </span>
+              )}
+              {transcriptAvailability?.cacheHit && (
+                <span className="px-2 py-1 rounded-full bg-black/10 dark:bg-white/10">
+                  Cache hit
+                </span>
+              )}
+            </div>
           )}
 
           {isYouTubeSource && (
@@ -620,8 +674,30 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       </div>
 
       <div className="space-y-2">
-        <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">
-          Transcript Search {transcriptSource ? `(${transcriptSource})` : ''}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+            Transcript Search
+          </div>
+          {transcriptSourceBadge && (
+            <span className={`text-xs font-semibold px-2 py-1 rounded-full ${transcriptSourceBadge.className}`}>
+              {transcriptSourceBadge.label}
+            </span>
+          )}
+          {transcriptProviderUsed && (
+            <span className="text-xs font-semibold px-2 py-1 rounded-full bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+              Provider: {transcriptProviderUsed}
+            </span>
+          )}
+          {transcriptLanguageUsed && (
+            <span className="text-xs font-semibold px-2 py-1 rounded-full bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+              Lang: {transcriptLanguageUsed}
+            </span>
+          )}
+          {transcriptCacheHit && (
+            <span className="text-xs font-semibold px-2 py-1 rounded-full bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
+              Cache hit
+            </span>
+          )}
         </div>
         <input
           type="text"

@@ -17,6 +17,8 @@ const MIN_CLIP_GAP_SECONDS = Number(process.env.CLIP_MIN_GAP_SECONDS || 1);
 const TRANSCRIPT_MIN_SEGMENT_SECONDS = Number(process.env.TRANSCRIPT_MIN_SEGMENT_SECONDS || 2);
 const TRANSCRIPT_MAX_SEGMENT_SECONDS = Number(process.env.TRANSCRIPT_MAX_SEGMENT_SECONDS || 25);
 const TRANSCRIPT_MAX_SEGMENTS = Number(process.env.TRANSCRIPT_MAX_SEGMENTS || 120);
+const TRANSCRIPT_CACHE_TTL_SECONDS = Number(process.env.TRANSCRIPT_CACHE_TTL_SECONDS || 3600);
+const TRANSCRIPT_CACHE_MAX_ENTRIES = Number(process.env.TRANSCRIPT_CACHE_MAX_ENTRIES || 200);
 
 const CONTENT_PROFILE_INSTRUCTIONS = {
     generic: "Prioritize engaging moments with clear hooks, emotional spikes, and concise standalone context.",
@@ -24,6 +26,9 @@ const CONTENT_PROFILE_INSTRUCTIONS = {
     gaming: "Prioritize clutch plays, wins/losses, surprising moments, strong reactions, and high-energy commentary.",
     podcast: "Prioritize quotable insights, controversial takes, emotional stories, and concise standalone ideas.",
 };
+
+// Local in-memory cache for repeated YouTube transcript checks in emulator/runtime process.
+const youtubeTranscriptCache = new Map();
 
 function normalizeContentType(value) {
     const text = String(value || "generic").toLowerCase().trim();
@@ -269,6 +274,44 @@ function extractYouTubeVideoId(value) {
 
 function isLikelyYouTubeUrl(value) {
     return Boolean(extractYouTubeVideoId(value));
+}
+
+function normalizeLanguageKey(value) {
+    const text = String(value || "").trim().toLowerCase();
+    return text || "auto";
+}
+
+function buildYouTubeTranscriptCacheKey(videoId, preferredLanguage) {
+    return `${videoId}::${normalizeLanguageKey(preferredLanguage)}`;
+}
+
+function getCachedYouTubeTranscript(cacheKey) {
+    const cached = youtubeTranscriptCache.get(cacheKey);
+    if (!cached) return null;
+
+    if (cached.expiresAt <= Date.now()) {
+        youtubeTranscriptCache.delete(cacheKey);
+        return null;
+    }
+
+    return cached.value;
+}
+
+function setCachedYouTubeTranscript(cacheKey, value) {
+    const ttlMs = Math.max(5, TRANSCRIPT_CACHE_TTL_SECONDS) * 1000;
+    youtubeTranscriptCache.set(cacheKey, {
+        expiresAt: Date.now() + ttlMs,
+        value,
+    });
+
+    if (youtubeTranscriptCache.size <= TRANSCRIPT_CACHE_MAX_ENTRIES) return;
+
+    // Trim oldest entries when cache grows beyond cap.
+    const entries = [...youtubeTranscriptCache.entries()].sort((a, b) => a[1].expiresAt - b[1].expiresAt);
+    const overflow = youtubeTranscriptCache.size - TRANSCRIPT_CACHE_MAX_ENTRIES;
+    for (let index = 0; index < overflow; index += 1) {
+        youtubeTranscriptCache.delete(entries[index][0]);
+    }
 }
 
 const YOUTUBE_USER_AGENT = [
@@ -876,6 +919,15 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
     if (!videoId) return null;
     if (process.env.ENABLE_YOUTUBE_TRANSCRIPT === "false") return null;
 
+    const cacheKey = buildYouTubeTranscriptCacheKey(videoId, preferredLanguage);
+    const cached = getCachedYouTubeTranscript(cacheKey);
+    if (cached) {
+        return {
+            ...cached,
+            cacheHit: true,
+        };
+    }
+
     const explicitLangs = [preferredLanguage, process.env.YOUTUBE_TRANSCRIPT_LANG]
         .map((value) => String(value || "").trim())
         .filter(Boolean);
@@ -892,14 +944,20 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
     }
 
     const providerAttempts = [
-        { name: "youtube-transcript", run: (lang) => fetchYouTubeTranscriptWithLibrary(videoId, lang) },
-        { name: "watch-page", run: (lang) => fetchYouTubeTranscriptViaWatchPage(videoId, lang) },
         { name: "yt-dlp", run: (lang) => fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, lang) },
     ];
 
+    // Optional legacy providers if yt-dlp fails and this flag is explicitly enabled.
+    if (process.env.ENABLE_LEGACY_YOUTUBE_PROVIDERS === "true") {
+        providerAttempts.push(
+            { name: "youtube-transcript", run: (lang) => fetchYouTubeTranscriptWithLibrary(videoId, lang) },
+            { name: "watch-page", run: (lang) => fetchYouTubeTranscriptViaWatchPage(videoId, lang) }
+        );
+    }
+
     const errors = [];
     for (const provider of providerAttempts) {
-        // yt-dlp already tries multiple language patterns in one call; avoid running it per language.
+        // yt-dlp already tries multiple language patterns in one call; avoid rerunning it per language.
         const langsForProvider = provider.name === "yt-dlp"
             ? [langAttempts[0] || null]
             : langAttempts;
@@ -907,10 +965,13 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
         for (const lang of langsForProvider) {
             try {
                 const transcript = await provider.run(lang);
-                return {
+                const result = {
                     ...transcript,
                     providerUsed: transcript.providerUsed || provider.name,
+                    cacheHit: false,
                 };
+                setCachedYouTubeTranscript(cacheKey, result);
+                return result;
             } catch (error) {
                 errors.push(`${provider.name}:${lang || "auto"}: ${cleanYouTubeErrorMessage(error)}`);
             }
@@ -1012,8 +1073,9 @@ exports.checkTranscriptAvailability = onCall(
                 videoId: transcript.videoId,
                 providerUsed: transcript.providerUsed,
                 languageUsed: transcript.languageUsed,
+                cacheHit: Boolean(transcript.cacheHit),
                 segmentCount: transcript.segments.length,
-                message: `YouTube captions are available via ${transcript.providerUsed} (${transcript.segments.length} segments, lang ${transcript.languageUsed}).`,
+                message: `YouTube captions are available via ${transcript.providerUsed} (${transcript.segments.length} segments, lang ${transcript.languageUsed}${transcript.cacheHit ? ", cache hit" : ""}).`,
             };
         } catch (error) {
             return {
@@ -1053,7 +1115,7 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
             const youtubeTranscript = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
             if (youtubeTranscript && youtubeTranscript.segments.length > 0) {
                 console.log(
-                    `Using YouTube transcript provider ${youtubeTranscript.providerUsed} (${youtubeTranscript.segments.length} segments, ${youtubeTranscript.languageUsed}) for ${videoTitle || "Untitled"}`
+                    `Using YouTube transcript provider ${youtubeTranscript.providerUsed} (${youtubeTranscript.segments.length} segments, ${youtubeTranscript.languageUsed}${youtubeTranscript.cacheHit ? ", cache hit" : ""}) for ${videoTitle || "Untitled"}`
                 );
                 return {
                     success: true,
@@ -1061,6 +1123,7 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
                     transcriptSource: "youtube_caption",
                     transcriptProviderUsed: youtubeTranscript.providerUsed,
                     transcriptLanguageUsed: youtubeTranscript.languageUsed,
+                    cacheHit: Boolean(youtubeTranscript.cacheHit),
                     segments: youtubeTranscript.segments,
                 };
             }

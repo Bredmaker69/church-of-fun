@@ -97,15 +97,19 @@ npm run build
   - `CLIP_TARGET_COUNT` (default `3`)
 - Transcript index is available via callable function `generateTranscript`.
 - Transcript provider behavior for `generateTranscript`:
-  - For YouTube URLs, backend tries YouTube captions first.
-  - In local dev, backend also attempts a `yt-dlp` caption fallback when direct YouTube caption endpoints return empty.
+  - For YouTube URLs, backend uses `yt-dlp` as the primary caption provider.
+  - Legacy direct caption parsers are optional fallback only when explicitly enabled.
+  - YouTube transcript lookups are cached in-memory per `videoId + language` to speed repeated checks.
   - If YouTube captions are unavailable or fail, backend falls back to OpenAI transcript generation.
   - Frontend can disable this fallback per request by sending `allowOpenAiFallback=false`.
   - Optional env flags in `functions/.env.local`:
     - `ENABLE_YOUTUBE_TRANSCRIPT` (`false` to disable YouTube caption provider; default enabled)
     - `ENABLE_YTDLP_TRANSCRIPT` (`false` to disable yt-dlp fallback; default enabled)
+    - `ENABLE_LEGACY_YOUTUBE_PROVIDERS` (`true` to enable older direct parser fallbacks; default disabled)
     - `YTDLP_COOKIES_FROM_BROWSER` (optional, e.g. `chrome` or `safari`, to let yt-dlp use your logged-in browser cookies for caption access)
     - `YOUTUBE_TRANSCRIPT_LANG` (default `en`)
+    - `TRANSCRIPT_CACHE_TTL_SECONDS` (default `3600`)
+    - `TRANSCRIPT_CACHE_MAX_ENTRIES` (default `200`)
 
 ## Deploy Functions
 
