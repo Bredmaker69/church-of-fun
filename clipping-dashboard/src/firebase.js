@@ -36,7 +36,7 @@ export const functions = getFunctions(
 
 const useFunctionsEmulator =
     import.meta.env.DEV &&
-    import.meta.env.VITE_USE_FUNCTIONS_EMULATOR === "true";
+    import.meta.env.VITE_USE_FUNCTIONS_EMULATOR !== "false";
 
 if (useFunctionsEmulator && !globalThis.__functionsEmulatorConnected) {
     const host = import.meta.env.VITE_FUNCTIONS_EMULATOR_HOST || "127.0.0.1";
