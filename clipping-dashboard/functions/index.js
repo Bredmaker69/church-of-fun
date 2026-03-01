@@ -441,13 +441,15 @@ function summarizeExecError(error) {
 
 function decodeHtmlEntities(text) {
     return String(text || "")
+        .replace(/&nbsp;/gi, " ")
         .replace(/&amp;/g, "&")
         .replace(/&lt;/g, "<")
         .replace(/&gt;/g, ">")
         .replace(/&quot;/g, "\"")
         .replace(/&#39;/g, "'")
         .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-        .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)));
+        .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCharCode(parseInt(code, 16)))
+        .replace(/\u00a0/g, " ");
 }
 
 function normalizeCaptionText(text) {
@@ -455,6 +457,56 @@ function normalizeCaptionText(text) {
         .replace(/<[^>]+>/g, " ")
         .replace(/\s+/g, " ")
         .trim();
+}
+
+function splitWords(text) {
+    return String(text || "").trim().split(/\s+/).filter(Boolean);
+}
+
+function findPrefixOverlap(contextWords, currentWords, maxOverlap = 40) {
+    const max = Math.min(contextWords.length, currentWords.length, maxOverlap);
+    for (let size = max; size > 0; size -= 1) {
+        let matched = true;
+        for (let index = 0; index < size; index += 1) {
+            if (contextWords[contextWords.length - size + index] !== currentWords[index]) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return size;
+    }
+    return 0;
+}
+
+function dedupeSequentialCaptionEntries(entries) {
+    const deduped = [];
+    const contextWords = [];
+    const maxContextWords = 160;
+
+    for (const entry of entries) {
+        const normalizedText = normalizeCaptionText(entry.text);
+        const displayWords = splitWords(normalizedText);
+        if (displayWords.length === 0) continue;
+
+        const compareWords = displayWords.map((word) => word.toLowerCase());
+        const overlap = findPrefixOverlap(contextWords, compareWords);
+        const remainingWords = displayWords.slice(overlap);
+        if (remainingWords.length === 0) continue;
+
+        const text = remainingWords.join(" ");
+        deduped.push({
+            ...entry,
+            text,
+        });
+
+        const remainingCompareWords = compareWords.slice(overlap);
+        contextWords.push(...remainingCompareWords);
+        if (contextWords.length > maxContextWords) {
+            contextWords.splice(0, contextWords.length - maxContextWords);
+        }
+    }
+
+    return deduped;
 }
 
 function extractJsonObjectFromText(text, startAt) {
@@ -767,7 +819,14 @@ async function storeRenderedClipFile({ sourcePath, clipTitle, index }) {
 }
 
 function toTranscriptResult(entries, meta) {
-    const rawSegments = entries.map((entry) => ({
+    const normalizedEntries = entries.map((entry) => ({
+        ...entry,
+        text: normalizeCaptionText(entry.text),
+    }));
+    const dedupedEntries = dedupeSequentialCaptionEntries(normalizedEntries);
+    const sourceEntries = dedupedEntries.length > 0 ? dedupedEntries : normalizedEntries;
+
+    const rawSegments = sourceEntries.map((entry) => ({
         startTimestamp: formatSecondsToTimestamp(entry.offset),
         endTimestamp: formatSecondsToTimestamp(entry.offset + entry.duration),
         speaker: "Caption",

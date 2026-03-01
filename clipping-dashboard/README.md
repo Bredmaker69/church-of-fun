@@ -99,6 +99,7 @@ npm run build
 - Transcript provider behavior for `generateTranscript`:
   - For YouTube URLs, backend uses `yt-dlp` as the primary caption provider.
   - Legacy direct caption parsers are optional fallback only when explicitly enabled.
+  - Caption cues are normalized and overlap-deduplicated to reduce repeated words from auto-caption rolling windows.
   - YouTube transcript lookups are cached in-memory per `videoId + language` to speed repeated checks.
   - If YouTube captions are unavailable or fail, backend falls back to OpenAI transcript generation.
   - Frontend can disable this fallback per request by sending `allowOpenAiFallback=false`.
