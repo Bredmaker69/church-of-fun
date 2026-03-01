@@ -104,6 +104,7 @@ npm run build
   - Optional env flags in `functions/.env.local`:
     - `ENABLE_YOUTUBE_TRANSCRIPT` (`false` to disable YouTube caption provider; default enabled)
     - `ENABLE_YTDLP_TRANSCRIPT` (`false` to disable yt-dlp fallback; default enabled)
+    - `YTDLP_COOKIES_FROM_BROWSER` (optional, e.g. `chrome` or `safari`, to let yt-dlp use your logged-in browser cookies for caption access)
     - `YOUTUBE_TRANSCRIPT_LANG` (default `en`)
 
 ## Deploy Functions

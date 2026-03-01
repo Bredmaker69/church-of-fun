@@ -296,9 +296,12 @@ function summarizeExecError(error) {
     const stderr = String(error?.stderr || "").trim();
     const stdout = String(error?.stdout || "").trim();
     const base = String(error?.message || "process failed");
-    const tail = stderr || stdout;
-    if (!tail) return base;
-    return `${base} :: ${tail.slice(0, 280)}`;
+    const details = `${stderr}\n${stdout}`.trim();
+    if (!details) return base;
+
+    const lines = details.split("\n").map((line) => line.trim()).filter(Boolean);
+    const tail = lines.slice(-18).join(" | ");
+    return `${base} :: ${tail.slice(0, 4000)}`;
 }
 
 function decodeHtmlEntities(text) {
@@ -798,7 +801,9 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
 
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "yt-captions-"));
     try {
+        const cookiesFromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
         const args = [
+            "--no-update",
             "--skip-download",
             "--write-subs",
             "--write-auto-subs",
@@ -808,8 +813,13 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
             langSpec,
             "--output",
             "%(id)s.%(ext)s",
-            targetUrl,
         ];
+
+        if (cookiesFromBrowser) {
+            args.push("--cookies-from-browser", cookiesFromBrowser);
+        }
+
+        args.push(targetUrl);
 
         await execFileAsync("yt-dlp", args, {
             cwd: tempDir,
@@ -889,7 +899,7 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
         }
     }
 
-    throw new Error(`No usable YouTube captions found. Attempts: ${errors.join(" | ")}`.slice(0, 800));
+    throw new Error(`No usable YouTube captions found. Attempts: ${errors.join(" | ")}`.slice(0, 3000));
 }
 
 exports.generateClips = onCall({ cors: true }, async (request) => {
