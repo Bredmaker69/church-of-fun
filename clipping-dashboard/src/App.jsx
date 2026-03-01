@@ -12,6 +12,7 @@ import MobileTabBar from './components/MobileTabBar';
 function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [videos, setVideos] = useState([]);
+  const [localDebugStatus, setLocalDebugStatus] = useState('');
   const fileInputRef = useRef(null);
   const generateClips = httpsCallable(functions, 'generateClips');
   const skipStorageUploadInLocalMode =
@@ -30,12 +31,29 @@ function App() {
     }
   };
 
-  const callGenerateClipsWithTimeout = async (payload, timeoutMs = 45000) => {
+  const callGenerateClipsWithTimeout = async (payload, timeoutMs = 20000) => {
     return waitWithTimeout(
       generateClips(payload),
       timeoutMs,
       `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for generateClips`
     );
+  };
+
+  const setLocalDebug = (message) => {
+    if (!import.meta.env.DEV) return;
+    setLocalDebugStatus(message);
+    console.log(`[local-debug] ${message}`);
+  };
+
+  const safeMergeDoc = async (docRef, data, context) => {
+    try {
+      await setDoc(docRef, data, { merge: true });
+      return true;
+    } catch (error) {
+      console.error(`${context} failed`, error);
+      setLocalDebug(`${context} failed: ${error.message || 'Unknown error'}`);
+      return false;
+    }
   };
 
   useEffect(() => {
@@ -72,7 +90,9 @@ function App() {
 
     try {
       if (skipStorageUploadInLocalMode) {
+        setLocalDebug('Local mode active');
         const localVideoReference = `local-file://${encodeURIComponent(file.name)}`;
+        setLocalDebug('Creating Firestore document...');
         const docRef = await addDoc(collection(db, 'videos'), {
           title: file.name,
           status: 'processing',
@@ -85,31 +105,41 @@ function App() {
           videoUrl: localVideoReference,
           createdAt: serverTimestamp()
         });
+        setLocalDebug('Firestore document created');
+        await safeMergeDoc(docRef, {
+          status: 'processing',
+          statusLabel: 'Calling AI (local mode)...',
+          updatedAt: serverTimestamp()
+        }, 'Pre-call status update');
 
         try {
+          setLocalDebug('Calling generateClips...');
           const result = await callGenerateClipsWithTimeout({
             videoUrl: localVideoReference,
             videoTitle: file.name
           });
           const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
+          setLocalDebug(`AI returned ${generatedClips.length} clips`);
 
-          await setDoc(docRef, {
+          await safeMergeDoc(docRef, {
             status: 'processed',
             statusLabel: 'Ready',
             clips: generatedClips,
             clipsGenerated: generatedClips.length,
             uploadProgress: 100,
             updatedAt: serverTimestamp()
-          }, { merge: true });
+          }, 'Final success update');
+          setLocalDebug('Done');
         } catch (error) {
           console.error("Processing failed", error);
-          await setDoc(docRef, {
+          setLocalDebug(`AI failed: ${error.message || 'Unknown error'}`);
+          await safeMergeDoc(docRef, {
             status: 'failed',
             statusLabel: 'Processing failed',
             uploadProgress: 100,
             errorMessage: error.message || 'Processing error',
             updatedAt: serverTimestamp()
-          }, { merge: true });
+          }, 'Final failure update');
         }
 
         return;
@@ -218,6 +248,11 @@ function App() {
 
   return (
     <div className={`min-h-screen font-display ${isDarkMode ? 'dark text-slate-100 bg-background-dark' : 'text-slate-900 bg-background-light'}`}>
+      {import.meta.env.DEV && localDebugStatus && (
+        <div className="fixed top-3 right-3 z-[100] rounded-lg bg-slate-900/90 text-white text-xs px-3 py-2 shadow-xl max-w-xs">
+          {localDebugStatus}
+        </div>
+      )}
       <input
         type="file"
         ref={fileInputRef}
