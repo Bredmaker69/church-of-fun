@@ -1,7 +1,7 @@
 import { initializeApp } from "firebase/app";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
-import { getFunctions } from "firebase/functions";
+import { connectFunctionsEmulator, getFunctions } from "firebase/functions";
 
 const firebaseConfig = {
     apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -33,5 +33,16 @@ export const functions = getFunctions(
     app,
     import.meta.env.VITE_FIREBASE_FUNCTIONS_REGION || "us-central1"
 );
+
+const useFunctionsEmulator =
+    import.meta.env.DEV &&
+    import.meta.env.VITE_USE_FUNCTIONS_EMULATOR === "true";
+
+if (useFunctionsEmulator && !globalThis.__functionsEmulatorConnected) {
+    const host = import.meta.env.VITE_FUNCTIONS_EMULATOR_HOST || "127.0.0.1";
+    const port = Number(import.meta.env.VITE_FUNCTIONS_EMULATOR_PORT || 5001);
+    connectFunctionsEmulator(functions, host, port);
+    globalThis.__functionsEmulatorConnected = true;
+}
 
 export default app;

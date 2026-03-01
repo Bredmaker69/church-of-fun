@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:local": "VITE_USE_FUNCTIONS_EMULATOR=true vite",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "firebase:login": "firebase login --no-localhost",
+    "firebase:emulators:functions": "firebase emulators:start --only functions",
     "firebase:deploy:functions": "firebase deploy --only functions:generateClips",
     "firebase:secrets:set:openai": "firebase functions:secrets:set OPENAI_API_KEY"
   },

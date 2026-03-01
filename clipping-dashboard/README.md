@@ -39,6 +39,36 @@ cp .env.example .env.local
 npm run dev
 ```
 
+## Run Locally On Mac (No Deploy Required)
+
+This uses your local Functions emulator, so you do not need Firebase Blaze or Cloud deployment to test clip generation.
+
+1. Create function-local env with your OpenAI key:
+
+```bash
+cp functions/.env.example functions/.env.local
+```
+
+Set `OPENAI_API_KEY` in `functions/.env.local`.
+
+2. In terminal A, start the local function emulator:
+
+```bash
+npm run firebase:emulators:functions
+```
+
+3. In terminal B, start the frontend pointing at the local emulator:
+
+```bash
+npm run dev:local
+```
+
+4. Open the app URL shown by Vite (usually `http://localhost:5173`) and test upload.
+
+Notes:
+- Firestore and Storage remain on your Firebase project.
+- Only the callable `generateClips` runs locally on your Mac.
+
 ## Quality checks
 
 ```bash
