@@ -63,10 +63,29 @@ function App() {
       // 2. Upload video file to Firebase Storage
       const storageRef = ref(storage, `videos/${docRef.id}/${file.name}`);
       const uploadTask = uploadBytesResumable(storageRef, file);
+      let lastProgressUpdate = -1;
 
       uploadTask.on('state_changed',
-        () => {
-          // Progress handled by CSS mock progress bar in VideoCard
+        (snapshot) => {
+          const progress = Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100);
+          const shouldUpdate =
+            progress === 100 ||
+            lastProgressUpdate < 0 ||
+            progress - lastProgressUpdate >= 10;
+
+          if (!shouldUpdate) {
+            return;
+          }
+
+          lastProgressUpdate = progress;
+          void updateDoc(docRef, {
+            status: 'processing',
+            statusLabel: `Uploading... ${progress}%`,
+            uploadProgress: progress,
+            updatedAt: serverTimestamp()
+          }).catch((error) => {
+            console.error("Failed to update upload progress", error);
+          });
         },
         async (error) => {
           console.error("Upload failed", error);
@@ -74,6 +93,7 @@ function App() {
             await updateDoc(docRef, {
               status: 'failed',
               statusLabel: 'Upload failed',
+              uploadProgress: 0,
               errorMessage: error.message || 'Upload error',
               updatedAt: serverTimestamp()
             });
@@ -88,6 +108,7 @@ function App() {
             await updateDoc(docRef, {
               status: 'processing',
               statusLabel: 'Analyzing video...',
+              uploadProgress: 100,
               videoUrl,
               updatedAt: serverTimestamp()
             });
@@ -104,6 +125,7 @@ function App() {
               statusLabel: 'Ready',
               clips: generatedClips,
               clipsGenerated: generatedClips.length,
+              uploadProgress: 100,
               updatedAt: serverTimestamp()
             });
           } catch (error) {
@@ -112,6 +134,7 @@ function App() {
               await updateDoc(docRef, {
                 status: 'failed',
                 statusLabel: 'Processing failed',
+                uploadProgress: 100,
                 errorMessage: error.message || 'Processing error',
                 updatedAt: serverTimestamp()
               });

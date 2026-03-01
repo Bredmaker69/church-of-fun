@@ -1,25 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 
-const VideoCard = ({ image, title, duration, statusLabel, dateLabel, clipsGenerated, status = 'processed' }) => {
-    const [progress, setProgress] = useState(0);
-
-    useEffect(() => {
-        if (status === 'processing') {
-            const interval = setInterval(() => {
-                setProgress(p => {
-                    if (p >= 100) {
-                        clearInterval(interval);
-                        return 100;
-                    }
-                    return p + Math.floor(Math.random() * 5) + 1;
-                });
-            }, 500);
-            return () => clearInterval(interval);
-        }
-    }, [status]);
-
-    const isProcessing = status === 'processing' && progress < 100;
-    const displayStatus = isProcessing ? `Processing... ${progress}%` : statusLabel;
+const VideoCard = ({ image, title, duration, statusLabel, dateLabel, clipsGenerated, uploadProgress, status = 'processed' }) => {
+    const isProcessing = status === 'processing';
+    const isFailed = status === 'failed';
+    const progressValue = Number.isFinite(uploadProgress) ? Math.max(0, Math.min(100, uploadProgress)) : null;
+    const displayStatus = statusLabel || (isProcessing ? 'Processing...' : isFailed ? 'Failed' : 'Ready');
 
     return (
         <div className={`glass rounded-3xl overflow-hidden group cursor-pointer transition-all duration-300 ${isProcessing ? 'animate-pulse' : 'hover:-translate-y-1'}`}>
@@ -30,15 +15,18 @@ const VideoCard = ({ image, title, duration, statusLabel, dateLabel, clipsGenera
                     <span className="material-symbols-outlined text-[14px]">schedule</span>
                     {duration}
                 </div>
-                <div className={`absolute top-4 left-4 backdrop-blur-md px-3 py-1 rounded-full text-xs font-bold text-white shadow-lg flex items-center gap-1 ${isProcessing ? 'bg-primary/90' : 'bg-emerald-500/90'}`}>
+                <div className={`absolute top-4 left-4 backdrop-blur-md px-3 py-1 rounded-full text-xs font-bold text-white shadow-lg flex items-center gap-1 ${isProcessing ? 'bg-primary/90' : isFailed ? 'bg-rose-500/90' : 'bg-emerald-500/90'}`}>
                     <span className="material-symbols-outlined text-[14px]">
-                        {isProcessing ? 'sync' : 'check_circle'}
+                        {isProcessing ? 'sync' : isFailed ? 'error' : 'check_circle'}
                     </span>
                     {displayStatus}
                 </div>
                 {isProcessing && (
                     <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-black/50">
-                        <div className="h-full bg-gradient-to-r from-primary to-accent-neon transition-all duration-500" style={{ width: `${progress}%` }}></div>
+                        <div
+                            className="h-full bg-gradient-to-r from-primary to-accent-neon transition-all duration-500"
+                            style={{ width: `${progressValue ?? 100}%` }}
+                        ></div>
                     </div>
                 )}
             </div>
@@ -52,7 +40,7 @@ const VideoCard = ({ image, title, duration, statusLabel, dateLabel, clipsGenera
                         <span className="material-symbols-outlined text-[16px]">calendar_today</span>
                         {dateLabel}
                     </div>
-                    {!isProcessing && (
+                    {!isProcessing && !isFailed && (
                         <div className="flex items-center gap-1 text-primary bg-primary/10 px-2 py-1 rounded-lg font-bold">
                             <span className="material-symbols-outlined text-[16px]">content_cut</span>
                             {clipsGenerated} clips
