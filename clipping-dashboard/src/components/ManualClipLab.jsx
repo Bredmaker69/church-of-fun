@@ -63,6 +63,71 @@ const looksLikeYouTubeUrl = (value) => {
   return url.includes('youtube.com') || url.includes('youtu.be');
 };
 
+const extractYouTubeVideoId = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (/^[A-Za-z0-9_-]{11}$/.test(text)) return text;
+
+  try {
+    const url = new URL(text);
+    const host = url.hostname.toLowerCase().replace(/^www\./, '');
+
+    if (host === 'youtu.be') {
+      const directId = url.pathname.split('/').filter(Boolean)[0];
+      if (/^[A-Za-z0-9_-]{11}$/.test(directId || '')) return directId;
+    }
+
+    if (host.endsWith('youtube.com') || host.endsWith('youtube-nocookie.com')) {
+      const watchId = url.searchParams.get('v');
+      if (/^[A-Za-z0-9_-]{11}$/.test(watchId || '')) return watchId;
+
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts.length >= 2 && ['shorts', 'embed', 'live', 'v', 'e'].includes(parts[0].toLowerCase())) {
+        if (/^[A-Za-z0-9_-]{11}$/.test(parts[1] || '')) return parts[1];
+      }
+    }
+  } catch {
+    // no-op, fallback regex below
+  }
+
+  const fallback = text.match(
+    /(?:youtube\.com\/(?:shorts|embed|live|v|e)\/|youtube\.com\/.*[?&]v=|youtu\.be\/)([A-Za-z0-9_-]{11})/i
+  );
+  return fallback ? fallback[1] : '';
+};
+
+let youtubeApiPromise;
+const ensureYouTubeIframeApi = () => {
+  if (window.YT?.Player) {
+    return Promise.resolve(window.YT);
+  }
+  if (youtubeApiPromise) {
+    return youtubeApiPromise;
+  }
+
+  youtubeApiPromise = new Promise((resolve) => {
+    const existingScript = document.querySelector('script[src="https://www.youtube.com/iframe_api"]');
+    if (!existingScript) {
+      const script = document.createElement('script');
+      script.src = 'https://www.youtube.com/iframe_api';
+      script.async = true;
+      document.body.appendChild(script);
+    }
+
+    const previous = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      if (typeof previous === 'function') previous();
+      resolve(window.YT);
+    };
+
+    if (window.YT?.Player) {
+      resolve(window.YT);
+    }
+  });
+
+  return youtubeApiPromise;
+};
+
 const buildTimedUrl = (sourceUrl, seconds) => {
   try {
     const url = new URL(sourceUrl);
@@ -76,6 +141,9 @@ const buildTimedUrl = (sourceUrl, seconds) => {
 
 const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) => {
   const videoRef = useRef(null);
+  const youtubePlayerMountRef = useRef(null);
+  const youtubePlayerRef = useRef(null);
+  const youtubeTimePollRef = useRef(null);
   const transcriptAvailabilityRequestRef = useRef(0);
   const [sourceMode, setSourceMode] = useState('file');
   const [sourceFile, setSourceFile] = useState(null);
@@ -96,6 +164,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   const [transcriptAvailability, setTranscriptAvailability] = useState(null);
   const [isCheckingTranscriptAvailability, setIsCheckingTranscriptAvailability] = useState(false);
   const [allowOpenAiFallback, setAllowOpenAiFallback] = useState(true);
+  const [youtubePlayerError, setYoutubePlayerError] = useState('');
   const [isRendering, setIsRendering] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [status, setStatus] = useState('');
@@ -113,6 +182,14 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   useEffect(() => {
     return () => {
       if (videoUrl) URL.revokeObjectURL(videoUrl);
+      if (youtubeTimePollRef.current) {
+        clearInterval(youtubeTimePollRef.current);
+        youtubeTimePollRef.current = null;
+      }
+      if (youtubePlayerRef.current) {
+        youtubePlayerRef.current.destroy();
+        youtubePlayerRef.current = null;
+      }
       renderedClips.forEach((clip) => {
         revokeClipDownloadUrl(clip);
       });
@@ -133,6 +210,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     setTranscriptLanguageUsed('');
     setTranscriptCacheHit(false);
     setTranscriptAvailability(null);
+    setYoutubePlayerError('');
     setIsCheckingTranscriptAvailability(false);
     setStatus('');
   };
@@ -280,11 +358,15 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   };
 
   const setFromCurrent = (type) => {
-    if (sourceMode !== 'file') {
-      setStatus('Set-from-current is available only for local uploaded files.');
+    let seconds = currentTime;
+    if (sourceMode === 'url' && looksLikeYouTubeUrl(sourceUrl) && youtubePlayerRef.current?.getCurrentTime) {
+      seconds = Number(youtubePlayerRef.current.getCurrentTime() || 0);
+    } else if (sourceMode !== 'file') {
+      setStatus('Set-from-current is available for local files or embedded YouTube playback.');
       return;
     }
-    const value = formatTimestamp(currentTime);
+
+    const value = formatTimestamp(seconds);
     if (type === 'start') {
       setStartTime(value);
     } else {
@@ -316,6 +398,17 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       videoRef.current.currentTime = seconds;
       videoRef.current.play().catch(() => {});
       return;
+    }
+
+    if (sourceMode === 'url' && looksLikeYouTubeUrl(sourceUrl) && youtubePlayerRef.current) {
+      try {
+        youtubePlayerRef.current.seekTo(seconds, true);
+        youtubePlayerRef.current.playVideo?.();
+        setCurrentTime(seconds);
+        return;
+      } catch {
+        // fallback to opening timed URL below
+      }
     }
 
     if (sourceMode === 'url' && sourceUrl) {
@@ -449,6 +542,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   });
 
   const isYouTubeSource = sourceMode === 'url' && looksLikeYouTubeUrl(sourceUrl);
+  const youtubeVideoId = isYouTubeSource ? extractYouTubeVideoId(sourceUrl) : '';
   const disableGenerateForCaptionOnlyMode = (
     isYouTubeSource &&
     transcriptAvailability?.status === 'ready' &&
@@ -495,6 +589,73 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
         }
         : null
     );
+
+  useEffect(() => {
+    const destroyPlayer = () => {
+      if (youtubeTimePollRef.current) {
+        clearInterval(youtubeTimePollRef.current);
+        youtubeTimePollRef.current = null;
+      }
+      if (youtubePlayerRef.current) {
+        youtubePlayerRef.current.destroy();
+        youtubePlayerRef.current = null;
+      }
+    };
+
+    if (sourceMode !== 'url' || !isYouTubeSource || !youtubeVideoId || !youtubePlayerMountRef.current) {
+      destroyPlayer();
+      return undefined;
+    }
+
+    let disposed = false;
+    setYoutubePlayerError('');
+
+    const initPlayer = async () => {
+      try {
+        const YT = await ensureYouTubeIframeApi();
+        if (disposed || !youtubePlayerMountRef.current) return;
+
+        destroyPlayer();
+
+        youtubePlayerRef.current = new YT.Player(youtubePlayerMountRef.current, {
+          videoId: youtubeVideoId,
+          playerVars: {
+            controls: 1,
+            rel: 0,
+            modestbranding: 1,
+            playsinline: 1,
+          },
+          events: {
+            onReady: () => {
+              if (disposed) return;
+              youtubeTimePollRef.current = setInterval(() => {
+                const seconds = Number(youtubePlayerRef.current?.getCurrentTime?.() || 0);
+                if (Number.isFinite(seconds)) setCurrentTime(seconds);
+              }, 500);
+            },
+            onError: (event) => {
+              const code = Number(event?.data);
+              const message = (
+                code === 101 || code === 150
+                  ? 'This video cannot be embedded. Use Jump to open it in YouTube.'
+                  : 'YouTube player error. Use Jump to open this timestamp in YouTube.'
+              );
+              setYoutubePlayerError(message);
+            },
+          },
+        });
+      } catch {
+        setYoutubePlayerError('Failed to load embedded YouTube player.');
+      }
+    };
+
+    initPlayer();
+
+    return () => {
+      disposed = true;
+      destroyPlayer();
+    };
+  }, [sourceMode, isYouTubeSource, youtubeVideoId]);
 
   return (
     <section className="glass rounded-3xl p-5 lg:p-6 space-y-4">
@@ -659,6 +820,22 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
           <div className="text-xs text-slate-500 dark:text-slate-400">
             Current time: <span className="font-semibold">{formatTimestamp(currentTime)}</span>
           </div>
+        </div>
+      )}
+
+      {sourceMode === 'url' && isYouTubeSource && youtubeVideoId && (
+        <div className="space-y-3">
+          <div className="aspect-video w-full rounded-xl overflow-hidden bg-black/80">
+            <div ref={youtubePlayerMountRef} className="w-full h-full" />
+          </div>
+          <div className="text-xs text-slate-500 dark:text-slate-400">
+            Current time: <span className="font-semibold">{formatTimestamp(currentTime)}</span>
+          </div>
+          {youtubePlayerError && (
+            <div className="text-xs text-amber-700 dark:text-amber-300">
+              {youtubePlayerError}
+            </div>
+          )}
         </div>
       )}
 

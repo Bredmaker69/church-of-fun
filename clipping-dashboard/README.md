@@ -75,6 +75,7 @@ Notes:
 - Manual Clip Lab can generate a transcript index, search keywords, jump to hits, and create manual clips directly from transcript matches.
 - Manual Clip Lab supports URL sources: drag/drop a YouTube URL (or paste one) and run transcript generation/search without uploading a file.
 - Manual Clip Lab now runs a visible YouTube caption availability check before transcript generation and exposes an explicit "Allow AI fallback" toggle to control token usage.
+- For YouTube URL sources, Manual Clip Lab now embeds a player in-app so you can scrub, monitor current time, and jump transcript hits without leaving the app.
 - Manual Clip Lab can also render clips from YouTube URLs via backend section downloads (`renderYouTubeClips` + `downloadRenderedClip`).
 
 ## Quality checks
