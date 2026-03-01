@@ -823,7 +823,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
 
         await execFileAsync("yt-dlp", args, {
             cwd: tempDir,
-            timeout: 180000,
+            timeout: 45000,
             maxBuffer: 20 * 1024 * 1024,
         });
 
@@ -886,7 +886,12 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
 
     const errors = [];
     for (const provider of providerAttempts) {
-        for (const lang of langAttempts) {
+        // yt-dlp already tries multiple language patterns in one call; avoid running it per language.
+        const langsForProvider = provider.name === "yt-dlp"
+            ? [langAttempts[0] || null]
+            : langAttempts;
+
+        for (const lang of langsForProvider) {
             try {
                 const transcript = await provider.run(lang);
                 return {
@@ -954,7 +959,9 @@ exports.generateClips = onCall({ cors: true }, async (request) => {
     }
 });
 
-exports.checkTranscriptAvailability = onCall({ cors: true }, async (request) => {
+exports.checkTranscriptAvailability = onCall(
+    { cors: true, timeoutSeconds: 300, memory: "1GiB" },
+    async (request) => {
     try {
         const { videoUrl, transcriptLanguage } = request.data || {};
 
