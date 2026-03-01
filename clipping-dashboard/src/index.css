@@ -1,0 +1,27 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .glass {
+    background: rgba(31, 104, 249, 0.05);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  
+  .neon-border {
+    transition: all 0.3s ease;
+  }
+  
+  .neon-border:hover {
+    box-shadow: 0 0 15px rgba(31, 104, 249, 0.4);
+    border-color: #1f68f9;
+  }
+}
+
+body {
+  min-height: max(884px, 100dvh);
+}
