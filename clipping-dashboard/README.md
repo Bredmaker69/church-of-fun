@@ -71,6 +71,7 @@ Notes:
 - In `dev:local`, Storage upload is intentionally skipped and replaced with a local file reference so you can test processing flow without Storage auth/rules setup.
 - In dev mode, the app defaults to local function emulation and local upload bypass unless explicitly set to `VITE_USE_FUNCTIONS_EMULATOR=false` or `VITE_SKIP_STORAGE_UPLOAD=false`.
 - Local mode now renders real `.mp4` subclips in-browser via `ffmpeg.wasm`; the first render may take longer while ffmpeg core assets are downloaded.
+- Local mode includes a **Manual Clip Lab** with video scrubbing, manual in/out ranges, and MP4 export.
 
 ## Quality checks
 
@@ -84,6 +85,12 @@ npm run build
 - Frontend upload flow writes a `videos` document in Firestore, uploads to Storage, then calls the callable function `generateClips`.
 - The Cloud Function expects `OPENAI_API_KEY` in the Functions runtime environment.
 - Optional: set `OPENAI_MODEL` in the Functions runtime (defaults to `gpt-4.1-mini`).
+- The backend enforces deterministic clip shaping:
+  - `CLIP_MIN_SECONDS` (default `8`)
+  - `CLIP_MAX_SECONDS` (default `45`)
+  - `CLIP_DEFAULT_SECONDS` (default `20`)
+  - `CLIP_MIN_GAP_SECONDS` (default `1`)
+  - `CLIP_TARGET_COUNT` (default `3`)
 
 ## Deploy Functions
 

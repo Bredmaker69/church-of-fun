@@ -4,10 +4,16 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util';
 const FFMPEG_CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.9/dist/umd';
 let ffmpegPromise = null;
 
-const toSeconds = (mmss) => {
-  const [minutes, seconds] = String(mmss || '00:00').split(':').map(Number);
-  if (!Number.isFinite(minutes) || !Number.isFinite(seconds)) return 0;
-  return Math.max(0, minutes * 60 + seconds);
+const toSeconds = (timestamp) => {
+  const parts = String(timestamp || '00:00').split(':').map(Number);
+  if (parts.some((value) => !Number.isFinite(value))) return 0;
+  if (parts.length === 2) {
+    return Math.max(0, parts[0] * 60 + parts[1]);
+  }
+  if (parts.length === 3) {
+    return Math.max(0, parts[0] * 3600 + parts[1] * 60 + parts[2]);
+  }
+  return 0;
 };
 
 const toTimecode = (totalSeconds) => {

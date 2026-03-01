@@ -8,6 +8,7 @@ import TopNav from './components/TopNav';
 import DashboardGrid from './components/DashboardGrid';
 import VideoGrid from './components/VideoGrid';
 import MobileTabBar from './components/MobileTabBar';
+import ManualClipLab from './components/ManualClipLab';
 import { renderLocalClipFiles } from './lib/localClipper';
 
 function App() {
@@ -279,6 +280,7 @@ function App() {
 
           <div className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-8 scroll-smooth pb-24 lg:pb-8">
             <DashboardGrid />
+            {skipStorageUploadInLocalMode && <ManualClipLab />}
             <div className="pt-4">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-primary to-accent-neon">
