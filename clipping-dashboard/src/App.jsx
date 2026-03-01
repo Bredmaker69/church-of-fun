@@ -16,6 +16,7 @@ function App() {
   const [videos, setVideos] = useState([]);
   const [localVideos, setLocalVideos] = useState([]);
   const [localDebugStatus, setLocalDebugStatus] = useState('');
+  const [contentProfile, setContentProfile] = useState('generic');
   const fileInputRef = useRef(null);
   const generateClips = httpsCallable(functions, 'generateClips');
   const skipStorageUploadInLocalMode =
@@ -112,7 +113,8 @@ function App() {
           setLocalDebug('Calling generateClips...');
           const result = await callGenerateClipsWithTimeout({
             videoUrl: localVideoReference,
-            videoTitle: file.name
+            videoTitle: file.name,
+            contentType: contentProfile
           });
           const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
           setLocalDebug(`AI returned ${generatedClips.length} clips`);
@@ -223,7 +225,8 @@ function App() {
 
             const result = await callGenerateClipsWithTimeout({
               videoUrl,
-              videoTitle: file.name
+              videoTitle: file.name,
+              contentType: contentProfile
             });
 
             const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
@@ -280,7 +283,12 @@ function App() {
 
           <div className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-8 scroll-smooth pb-24 lg:pb-8">
             <DashboardGrid />
-            {skipStorageUploadInLocalMode && <ManualClipLab />}
+            {skipStorageUploadInLocalMode && (
+              <ManualClipLab
+                contentProfile={contentProfile}
+                onContentProfileChange={setContentProfile}
+              />
+            )}
             <div className="pt-4">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-primary to-accent-neon">

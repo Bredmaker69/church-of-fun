@@ -72,6 +72,7 @@ Notes:
 - In dev mode, the app defaults to local function emulation and local upload bypass unless explicitly set to `VITE_USE_FUNCTIONS_EMULATOR=false` or `VITE_SKIP_STORAGE_UPLOAD=false`.
 - Local mode now renders real `.mp4` subclips in-browser via `ffmpeg.wasm`; the first render may take longer while ffmpeg core assets are downloaded.
 - Local mode includes a **Manual Clip Lab** with video scrubbing, manual in/out ranges, and MP4 export.
+- Manual Clip Lab can generate a transcript index, search keywords, jump to hits, and create manual clips directly from transcript matches.
 
 ## Quality checks
 
@@ -91,6 +92,7 @@ npm run build
   - `CLIP_DEFAULT_SECONDS` (default `20`)
   - `CLIP_MIN_GAP_SECONDS` (default `1`)
   - `CLIP_TARGET_COUNT` (default `3`)
+- Transcript index is available via callable function `generateTranscript`.
 
 ## Deploy Functions
 
