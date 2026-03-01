@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { db, storage, functions } from './firebase';
-import { collection, addDoc, updateDoc, serverTimestamp, query, orderBy, onSnapshot } from 'firebase/firestore';
+import { collection, addDoc, setDoc, updateDoc, serverTimestamp, query, orderBy, onSnapshot } from 'firebase/firestore';
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { httpsCallable } from 'firebase/functions';
 import Sidebar from './components/Sidebar';
@@ -73,28 +73,18 @@ function App() {
     try {
       if (skipStorageUploadInLocalMode) {
         const localVideoReference = `local-file://${encodeURIComponent(file.name)}`;
-        let docRef = null;
-
-        try {
-          docRef = await waitWithTimeout(
-            addDoc(collection(db, 'videos'), {
-              title: file.name,
-              status: 'processing',
-              image: "https://images.unsplash.com/photo-1516280440502-a169b2752101?q=80&w=2670&auto=format&fit=crop",
-              duration: "00:00",
-              statusLabel: "Analyzing video (local mode)...",
-              dateLabel: "Just Now",
-              clipsGenerated: 0,
-              uploadProgress: 100,
-              videoUrl: localVideoReference,
-              createdAt: serverTimestamp()
-            }),
-            5000,
-            "Timed out creating local processing document."
-          );
-        } catch (error) {
-          console.error("Failed to create Firestore doc in local mode, continuing anyway:", error);
-        }
+        const docRef = await addDoc(collection(db, 'videos'), {
+          title: file.name,
+          status: 'processing',
+          image: "https://images.unsplash.com/photo-1516280440502-a169b2752101?q=80&w=2670&auto=format&fit=crop",
+          duration: "00:00",
+          statusLabel: "Analyzing video (local mode)...",
+          dateLabel: "Just Now",
+          clipsGenerated: 0,
+          uploadProgress: 100,
+          videoUrl: localVideoReference,
+          createdAt: serverTimestamp()
+        });
 
         try {
           const result = await callGenerateClipsWithTimeout({
@@ -103,27 +93,23 @@ function App() {
           });
           const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
 
-          if (docRef) {
-            await updateDoc(docRef, {
-              status: 'processed',
-              statusLabel: 'Ready',
-              clips: generatedClips,
-              clipsGenerated: generatedClips.length,
-              uploadProgress: 100,
-              updatedAt: serverTimestamp()
-            });
-          }
+          await setDoc(docRef, {
+            status: 'processed',
+            statusLabel: 'Ready',
+            clips: generatedClips,
+            clipsGenerated: generatedClips.length,
+            uploadProgress: 100,
+            updatedAt: serverTimestamp()
+          }, { merge: true });
         } catch (error) {
           console.error("Processing failed", error);
-          if (docRef) {
-            await updateDoc(docRef, {
-              status: 'failed',
-              statusLabel: 'Processing failed',
-              uploadProgress: 100,
-              errorMessage: error.message || 'Processing error',
-              updatedAt: serverTimestamp()
-            });
-          }
+          await setDoc(docRef, {
+            status: 'failed',
+            statusLabel: 'Processing failed',
+            uploadProgress: 100,
+            errorMessage: error.message || 'Processing error',
+            updatedAt: serverTimestamp()
+          }, { merge: true });
         }
 
         return;
