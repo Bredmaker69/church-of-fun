@@ -412,6 +412,15 @@ function parseJson3Transcript(payload, fallbackLanguage) {
     return entries;
 }
 
+function parseSecondsOrMilliseconds(rawValue) {
+    const text = String(rawValue ?? "").trim();
+    if (!text) return null;
+    const numeric = Number(text);
+    if (!Number.isFinite(numeric)) return null;
+    if (text.includes(".")) return numeric;
+    return numeric / 1000;
+}
+
 function parseXmlTranscript(xml, fallbackLanguage) {
     const pattern = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
     const entries = [];
@@ -426,6 +435,32 @@ function parseXmlTranscript(xml, fallbackLanguage) {
         const durMatch = attrs.match(/\bdur="([^"]+)"/);
         const offset = Number(startMatch?.[1]);
         const duration = Number(durMatch?.[1]);
+
+        entries.push({
+            text,
+            offset: Number.isFinite(offset) ? offset : 0,
+            duration: Number.isFinite(duration) && duration > 0 ? duration : 2,
+            lang: fallbackLanguage || "auto",
+        });
+    }
+
+    return entries;
+}
+
+function parseSrv3Transcript(xml, fallbackLanguage) {
+    const pattern = /<p\b([^>]*)>([\s\S]*?)<\/p>/g;
+    const entries = [];
+    let match;
+
+    while ((match = pattern.exec(xml)) !== null) {
+        const attrs = match[1] || "";
+        const text = normalizeCaptionText(match[2]);
+        if (!text) continue;
+
+        const startMatch = attrs.match(/\bt="([^"]+)"/);
+        const durMatch = attrs.match(/\bd="([^"]+)"/);
+        const offset = parseSecondsOrMilliseconds(startMatch?.[1]);
+        const duration = parseSecondsOrMilliseconds(durMatch?.[1]);
 
         entries.push({
             text,
@@ -520,7 +555,8 @@ async function fetchYouTubeTranscriptViaWatchPage(videoId, language) {
         const transcriptJsonText = await transcriptJsonResponse.text();
         if (transcriptJsonText.trim().length > 0) {
             try {
-                const transcriptJson = JSON.parse(transcriptJsonText);
+                const normalizedJsonText = transcriptJsonText.replace(/^\)\]\}'\s*/, "");
+                const transcriptJson = JSON.parse(normalizedJsonText);
                 const jsonEntries = parseJson3Transcript(transcriptJson, selectedTrack.languageCode);
                 if (jsonEntries.length > 0) {
                     return toTranscriptResult(jsonEntries, {
@@ -548,14 +584,24 @@ async function fetchYouTubeTranscriptViaWatchPage(videoId, language) {
 
     const transcriptXml = await transcriptXmlResponse.text();
     const xmlEntries = parseXmlTranscript(transcriptXml, selectedTrack.languageCode);
-    if (xmlEntries.length === 0) {
+    if (xmlEntries.length > 0) {
+        return toTranscriptResult(xmlEntries, {
+            videoId,
+            languageUsed: selectedTrack.languageCode || language || "auto",
+            provider: "watch-page-xml",
+            attemptMode: language ? "language" : "auto",
+        });
+    }
+
+    const srv3Entries = parseSrv3Transcript(transcriptXml, selectedTrack.languageCode);
+    if (srv3Entries.length === 0) {
         throw new Error("Caption track returned no transcript text.");
     }
 
-    return toTranscriptResult(xmlEntries, {
+    return toTranscriptResult(srv3Entries, {
         videoId,
         languageUsed: selectedTrack.languageCode || language || "auto",
-        provider: "watch-page-xml",
+        provider: "watch-page-srv3",
         attemptMode: language ? "language" : "auto",
     });
 }
