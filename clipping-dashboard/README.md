@@ -49,4 +49,5 @@ npm run build
 ## Notes
 
 - Frontend upload flow writes a `videos` document in Firestore, uploads to Storage, then calls the callable function `generateClips`.
-- The Cloud Function expects `GEMINI_API_KEY` in the Functions runtime environment.
+- The Cloud Function expects `OPENAI_API_KEY` in the Functions runtime environment.
+- Optional: set `OPENAI_MODEL` in the Functions runtime (defaults to `gpt-4.1-mini`).

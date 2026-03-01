@@ -1,12 +1,72 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { GoogleGenAI } = require("@google/genai");
+const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-// Initialize Gemini SDK. Note: You must ensure GEMINI_API_KEY is available in your deployment environment.
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+function normalizeClip(clip) {
+    const viralScore = Number(clip.viralScore);
+    return {
+        title: String(clip.title || "").trim(),
+        startTimestamp: String(clip.startTimestamp || "").trim(),
+        endTimestamp: String(clip.endTimestamp || "").trim(),
+        description: String(clip.description || "").trim(),
+        viralScore: Number.isFinite(viralScore) ? Math.max(1, Math.min(100, viralScore)) : 50,
+    };
+}
+
+function validateClip(clip) {
+    return (
+        clip.title.length > 0 &&
+        /^\d{2}:\d{2}$/.test(clip.startTimestamp) &&
+        /^\d{2}:\d{2}$/.test(clip.endTimestamp) &&
+        clip.description.length > 0 &&
+        Number.isFinite(clip.viralScore)
+    );
+}
+
+async function requestClipSuggestions({ apiKey, prompt }) {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            model,
+            temperature: 0.3,
+            response_format: { type: "json_object" },
+            messages: [
+                {
+                    role: "system",
+                    content: "You produce structured JSON output for clip extraction."
+                },
+                {
+                    role: "user",
+                    content: prompt
+                }
+            ]
+        })
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`OpenAI request failed (${response.status}): ${errorText.slice(0, 500)}`);
+    }
+
+    const data = await response.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) {
+        throw new Error("OpenAI response did not include a message content payload.");
+    }
+
+    return content;
+}
 
 exports.generateClips = onCall({ cors: true }, async (request) => {
     try {
         const { videoUrl, videoTitle } = request.data;
+
+        if (!process.env.OPENAI_API_KEY) {
+            throw new HttpsError("failed-precondition", "Missing OPENAI_API_KEY in Functions runtime.");
+        }
 
         if (!videoUrl) {
             throw new HttpsError("invalid-argument", "The function must be called with a 'videoUrl'.");
@@ -14,43 +74,33 @@ exports.generateClips = onCall({ cors: true }, async (request) => {
 
         console.log(`Starting processing for: ${videoTitle} at ${videoUrl}`);
 
-        const prompt = `
-            You are an expert video editor and social media manager.
-            I am providing you with a video file: ${videoTitle}.
+        const prompt = [
+            "You are an expert video editor and social media strategist.",
+            `Video title: ${videoTitle || "Untitled Video"}.`,
+            `Video reference URL: ${videoUrl}.`,
+            "Analyze this video reference and identify the 3 most engaging clip moments.",
+            "Return strict JSON only in this shape:",
+            '{"clips":[{"title":"...","startTimestamp":"MM:SS","endTimestamp":"MM:SS","description":"...","viralScore":87}]}',
+            "No markdown, no code fences, no extra keys."
+        ].join("\n");
 
-            Analyze this video and identify the top 3 most engaging, viral-worthy moments.
-            For each moment, return:
-            1. A catchy title.
-            2. The start timestamp (in MM:SS format).
-            3. The end timestamp (in MM:SS format).
-            4. A short description of why it's engaging.
-            5. A viral "score" from 1-100.
-
-            You MUST strictly return the response as a valid JSON array of objects.
-        `;
-
-        // We use gemini-3.0-pro as the default powerful model for multimodal tasks
-        const response = await ai.models.generateContent({
-            model: "gemini-3.0-pro",
-            contents: [
-                prompt,
-                // In a real scenario, we would download or pass the actual file bytes/URI to the model here.
-                // For demonstration, we simulate passing the video via text reference.
-                { text: `[Simulated Video Content Reference: ${videoUrl}]` }
-            ],
-            config: {
-                responseMimeType: "application/json",
-            }
+        const responseText = await requestClipSuggestions({
+            apiKey: process.env.OPENAI_API_KEY,
+            prompt
         });
+        const parsed = JSON.parse(responseText);
+        const rawClips = Array.isArray(parsed.clips) ? parsed.clips : [];
+        const clips = rawClips.map(normalizeClip).filter(validateClip).slice(0, 3);
 
-        const jsonString = response.text;
-        const parsedClips = JSON.parse(jsonString);
+        if (clips.length === 0) {
+            throw new Error("No valid clips returned by model.");
+        }
 
-        console.log("Successfully generated clips:", parsedClips.length);
+        console.log("Successfully generated clips:", clips.length);
 
         return {
             success: true,
-            clips: parsedClips
+            clips
         };
 
     } catch (error) {
