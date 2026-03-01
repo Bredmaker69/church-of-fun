@@ -473,6 +473,65 @@ function parseSrv3Transcript(xml, fallbackLanguage) {
     return entries;
 }
 
+function parseVttTimeToSeconds(value) {
+    const text = String(value || "").trim();
+    const parts = text.split(":");
+    if (parts.length < 2 || parts.length > 3) return null;
+
+    const secondsPart = parts[parts.length - 1].replace(",", ".");
+    const seconds = Number(secondsPart);
+    if (!Number.isFinite(seconds)) return null;
+
+    let total = seconds;
+    if (parts.length === 2) {
+        const minutes = Number(parts[0]);
+        if (!Number.isFinite(minutes)) return null;
+        total += minutes * 60;
+    } else {
+        const hours = Number(parts[0]);
+        const minutes = Number(parts[1]);
+        if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+        total += hours * 3600 + minutes * 60;
+    }
+    return total;
+}
+
+function parseVttTranscript(vtt, fallbackLanguage) {
+    const normalized = String(vtt || "").replace(/\r\n/g, "\n");
+    const chunks = normalized.split("\n\n");
+    const entries = [];
+
+    for (const chunk of chunks) {
+        const lines = chunk.split("\n").map((line) => line.trim()).filter(Boolean);
+        if (lines.length === 0) continue;
+        if (lines[0].toUpperCase() === "WEBVTT") continue;
+
+        let timingLineIndex = lines.findIndex((line) => line.includes("-->"));
+        if (timingLineIndex < 0) continue;
+
+        const timingLine = lines[timingLineIndex];
+        const [rawStart, rawEndWithSettings] = timingLine.split("-->").map((part) => part.trim());
+        const rawEnd = rawEndWithSettings?.split(/\s+/)[0];
+
+        const start = parseVttTimeToSeconds(rawStart);
+        const end = parseVttTimeToSeconds(rawEnd);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+
+        const textLines = lines.slice(timingLineIndex + 1);
+        const text = normalizeCaptionText(textLines.join(" "));
+        if (!text) continue;
+
+        entries.push({
+            text,
+            offset: start,
+            duration: Math.max(0.2, end - start),
+            lang: fallbackLanguage || "auto",
+        });
+    }
+
+    return entries;
+}
+
 function toTranscriptResult(entries, meta) {
     const rawSegments = entries.map((entry) => ({
         startTimestamp: formatSecondsToTimestamp(entry.offset),
@@ -540,9 +599,7 @@ async function fetchYouTubeTranscriptViaWatchPage(videoId, language) {
     }
 
     const jsonUrl = new URL(trackUrl);
-    if (!jsonUrl.searchParams.has("fmt")) {
-        jsonUrl.searchParams.set("fmt", "json3");
-    }
+    jsonUrl.searchParams.set("fmt", "json3");
 
     const transcriptJsonResponse = await fetch(jsonUrl.toString(), {
         headers: {
@@ -572,7 +629,9 @@ async function fetchYouTubeTranscriptViaWatchPage(videoId, language) {
         }
     }
 
-    const transcriptXmlResponse = await fetch(trackUrl, {
+    const srv3Url = new URL(trackUrl);
+    srv3Url.searchParams.set("fmt", "srv3");
+    const transcriptXmlResponse = await fetch(srv3Url.toString(), {
         headers: {
             "Accept-Language": language || selectedTrack.languageCode || "en-US,en;q=0.9",
             "User-Agent": YOUTUBE_USER_AGENT,
@@ -594,16 +653,90 @@ async function fetchYouTubeTranscriptViaWatchPage(videoId, language) {
     }
 
     const srv3Entries = parseSrv3Transcript(transcriptXml, selectedTrack.languageCode);
-    if (srv3Entries.length === 0) {
-        throw new Error("Caption track returned no transcript text.");
+    if (srv3Entries.length > 0) {
+        return toTranscriptResult(srv3Entries, {
+            videoId,
+            languageUsed: selectedTrack.languageCode || language || "auto",
+            provider: "watch-page-srv3",
+            attemptMode: language ? "language" : "auto",
+        });
     }
 
-    return toTranscriptResult(srv3Entries, {
-        videoId,
-        languageUsed: selectedTrack.languageCode || language || "auto",
-        provider: "watch-page-srv3",
-        attemptMode: language ? "language" : "auto",
+    const vttEntries = parseVttTranscript(transcriptXml, selectedTrack.languageCode);
+    if (vttEntries.length > 0) {
+        return toTranscriptResult(vttEntries, {
+            videoId,
+            languageUsed: selectedTrack.languageCode || language || "auto",
+            provider: "watch-page-vtt",
+            attemptMode: language ? "language" : "auto",
+        });
+    }
+
+    try {
+        return await fetchYouTubeTranscriptViaNoFmtTrack(
+            videoId,
+            language,
+            trackUrl,
+            selectedTrack.languageCode
+        );
+    } catch (noFmtError) {
+        const sample = transcriptXml.slice(0, 120).replace(/\s+/g, " ").trim();
+        throw new Error(
+            `Caption track returned no transcript text. Sample: ${sample}. No-fmt fallback: ${cleanYouTubeErrorMessage(noFmtError)}`
+        );
+    }
+
+}
+
+async function fetchYouTubeTranscriptViaNoFmtTrack(videoId, language, trackUrl, trackLanguage) {
+    const rawUrl = new URL(trackUrl);
+    rawUrl.searchParams.delete("fmt");
+
+    const response = await fetch(rawUrl.toString(), {
+        headers: {
+            "Accept-Language": language || trackLanguage || "en-US,en;q=0.9",
+            "User-Agent": YOUTUBE_USER_AGENT,
+        },
     });
+
+    if (!response.ok) {
+        throw new Error(`No-fmt track request failed (${response.status}).`);
+    }
+
+    const body = await response.text();
+
+    const xmlEntries = parseXmlTranscript(body, trackLanguage);
+    if (xmlEntries.length > 0) {
+        return toTranscriptResult(xmlEntries, {
+            videoId,
+            languageUsed: trackLanguage || language || "auto",
+            provider: "watch-page-nofmt-xml",
+            attemptMode: language ? "language" : "auto",
+        });
+    }
+
+    const srv3Entries = parseSrv3Transcript(body, trackLanguage);
+    if (srv3Entries.length > 0) {
+        return toTranscriptResult(srv3Entries, {
+            videoId,
+            languageUsed: trackLanguage || language || "auto",
+            provider: "watch-page-nofmt-srv3",
+            attemptMode: language ? "language" : "auto",
+        });
+    }
+
+    const vttEntries = parseVttTranscript(body, trackLanguage);
+    if (vttEntries.length > 0) {
+        return toTranscriptResult(vttEntries, {
+            videoId,
+            languageUsed: trackLanguage || language || "auto",
+            provider: "watch-page-nofmt-vtt",
+            attemptMode: language ? "language" : "auto",
+        });
+    }
+
+    const sample = body.slice(0, 120).replace(/\s+/g, " ").trim();
+    throw new Error(`No-fmt track returned no transcript text. Sample: ${sample}`);
 }
 
 async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
