@@ -51,3 +51,37 @@ npm run build
 - Frontend upload flow writes a `videos` document in Firestore, uploads to Storage, then calls the callable function `generateClips`.
 - The Cloud Function expects `OPENAI_API_KEY` in the Functions runtime environment.
 - Optional: set `OPENAI_MODEL` in the Functions runtime (defaults to `gpt-4.1-mini`).
+
+## Deploy Functions
+
+1. Install root dependencies:
+
+```bash
+npm install
+```
+
+2. Create Firebase project mapping file:
+
+```bash
+cp .firebaserc.example .firebaserc
+```
+
+Then replace `YOUR_FIREBASE_PROJECT_ID` with your real project id.
+
+3. Login to Firebase CLI:
+
+```bash
+npm run firebase:login
+```
+
+4. Set OpenAI secret:
+
+```bash
+npm run firebase:secrets:set:openai
+```
+
+5. Deploy callable function:
+
+```bash
+npm run firebase:deploy:functions
+```
