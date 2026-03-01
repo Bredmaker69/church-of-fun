@@ -70,6 +70,7 @@ Notes:
 - Only the callable `generateClips` runs locally on your Mac.
 - In `dev:local`, Storage upload is intentionally skipped and replaced with a local file reference so you can test processing flow without Storage auth/rules setup.
 - In dev mode, the app defaults to local function emulation and local upload bypass unless explicitly set to `VITE_USE_FUNCTIONS_EMULATOR=false` or `VITE_SKIP_STORAGE_UPLOAD=false`.
+- Local mode now renders real `.mp4` subclips in-browser via `ffmpeg.wasm`; the first render may take longer while ffmpeg core assets are downloaded.
 
 ## Quality checks
 

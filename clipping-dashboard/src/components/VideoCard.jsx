@@ -1,10 +1,11 @@
 import React from 'react';
 
-const VideoCard = ({ image, title, duration, statusLabel, dateLabel, clipsGenerated, uploadProgress, status = 'processed' }) => {
+const VideoCard = ({ image, title, duration, statusLabel, dateLabel, clipsGenerated, clipFiles, uploadProgress, status = 'processed' }) => {
     const isProcessing = status === 'processing';
     const isFailed = status === 'failed';
     const progressValue = Number.isFinite(uploadProgress) ? Math.max(0, Math.min(100, uploadProgress)) : null;
     const displayStatus = statusLabel || (isProcessing ? 'Processing...' : isFailed ? 'Failed' : 'Ready');
+    const downloadableClips = Array.isArray(clipFiles) ? clipFiles : [];
 
     return (
         <div className={`glass rounded-3xl overflow-hidden group cursor-pointer transition-all duration-300 ${isProcessing ? 'animate-pulse' : 'hover:-translate-y-1'}`}>
@@ -47,6 +48,21 @@ const VideoCard = ({ image, title, duration, statusLabel, dateLabel, clipsGenera
                         </div>
                     )}
                 </div>
+                {!isProcessing && !isFailed && downloadableClips.length > 0 && (
+                    <div className="mt-4 flex flex-wrap gap-2">
+                        {downloadableClips.map((clip, index) => (
+                            <a
+                                key={`${clip.fileName || clip.title || 'clip'}-${index}`}
+                                href={clip.downloadUrl}
+                                download={clip.fileName || `clip-${index + 1}.mp4`}
+                                onClick={(event) => event.stopPropagation()}
+                                className="text-xs font-semibold px-2.5 py-1.5 rounded-md bg-primary/15 text-primary hover:bg-primary/25 transition-colors"
+                            >
+                                Download Clip {index + 1}
+                            </a>
+                        ))}
+                    </div>
+                )}
             </div>
         </div>
     );

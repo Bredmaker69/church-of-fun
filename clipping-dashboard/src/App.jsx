@@ -8,6 +8,7 @@ import TopNav from './components/TopNav';
 import DashboardGrid from './components/DashboardGrid';
 import VideoGrid from './components/VideoGrid';
 import MobileTabBar from './components/MobileTabBar';
+import { renderLocalClipFiles } from './lib/localClipper';
 
 function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
@@ -98,6 +99,8 @@ function App() {
           statusLabel: "Calling AI (local mode)...",
           dateLabel: "Just Now",
           clipsGenerated: 0,
+          clips: [],
+          clipFiles: [],
           uploadProgress: 100,
           videoUrl: localVideoReference
         };
@@ -112,12 +115,29 @@ function App() {
           });
           const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
           setLocalDebug(`AI returned ${generatedClips.length} clips`);
+          updateLocalVideo(localVideoId, {
+            statusLabel: `Rendering clips (0/${generatedClips.length})...`,
+            clips: generatedClips
+          });
+
+          const clipFiles = await renderLocalClipFiles({
+            sourceFile: file,
+            clips: generatedClips,
+            onProgress: ({ current, total }) => {
+              setLocalDebug(`Rendering clip ${current}/${total}...`);
+              updateLocalVideo(localVideoId, {
+                statusLabel: `Rendering clips (${current}/${total})...`
+              });
+            }
+          });
+          setLocalDebug(`Rendered ${clipFiles.length} clips`);
 
           updateLocalVideo(localVideoId, {
             status: 'processed',
             statusLabel: 'Ready',
             clips: generatedClips,
-            clipsGenerated: generatedClips.length,
+            clipFiles,
+            clipsGenerated: clipFiles.length || generatedClips.length,
             uploadProgress: 100
           });
           setLocalDebug('Done');

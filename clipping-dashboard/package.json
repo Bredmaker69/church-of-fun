@@ -15,6 +15,8 @@
     "firebase:secrets:set:openai": "firebase functions:secrets:set OPENAI_API_KEY"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
     "@tailwindcss/container-queries": "^0.1.1",
     "@tailwindcss/forms": "^0.5.11",
     "firebase": "^12.10.0",
