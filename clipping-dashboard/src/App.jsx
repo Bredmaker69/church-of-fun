@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { db, storage, functions } from './firebase';
-import { collection, addDoc, setDoc, updateDoc, serverTimestamp, query, orderBy, onSnapshot } from 'firebase/firestore';
+import { collection, addDoc, updateDoc, serverTimestamp, query, orderBy, onSnapshot } from 'firebase/firestore';
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { httpsCallable } from 'firebase/functions';
 import Sidebar from './components/Sidebar';
@@ -12,6 +12,7 @@ import MobileTabBar from './components/MobileTabBar';
 function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [videos, setVideos] = useState([]);
+  const [localVideos, setLocalVideos] = useState([]);
   const [localDebugStatus, setLocalDebugStatus] = useState('');
   const fileInputRef = useRef(null);
   const generateClips = httpsCallable(functions, 'generateClips');
@@ -44,16 +45,10 @@ function App() {
     setLocalDebugStatus(message);
     console.log(`[local-debug] ${message}`);
   };
-
-  const safeMergeDoc = async (docRef, data, context) => {
-    try {
-      await setDoc(docRef, data, { merge: true });
-      return true;
-    } catch (error) {
-      console.error(`${context} failed`, error);
-      setLocalDebug(`${context} failed: ${error.message || 'Unknown error'}`);
-      return false;
-    }
+  const updateLocalVideo = (id, patch) => {
+    setLocalVideos(prev =>
+      prev.map(video => (video.id === id ? { ...video, ...patch } : video))
+    );
   };
 
   useEffect(() => {
@@ -80,6 +75,7 @@ function App() {
   const triggerUpload = () => {
     fileInputRef.current?.click();
   };
+  const displayVideos = skipStorageUploadInLocalMode ? [...localVideos, ...videos] : videos;
 
   const handleFileChange = async (e) => {
     const file = e.target.files?.[0];
@@ -92,25 +88,21 @@ function App() {
       if (skipStorageUploadInLocalMode) {
         setLocalDebug('Local mode active');
         const localVideoReference = `local-file://${encodeURIComponent(file.name)}`;
-        setLocalDebug('Creating Firestore document...');
-        const docRef = await addDoc(collection(db, 'videos'), {
+        const localVideoId = `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const localVideo = {
+          id: localVideoId,
           title: file.name,
           status: 'processing',
           image: "https://images.unsplash.com/photo-1516280440502-a169b2752101?q=80&w=2670&auto=format&fit=crop",
           duration: "00:00",
-          statusLabel: "Analyzing video (local mode)...",
+          statusLabel: "Calling AI (local mode)...",
           dateLabel: "Just Now",
           clipsGenerated: 0,
           uploadProgress: 100,
-          videoUrl: localVideoReference,
-          createdAt: serverTimestamp()
-        });
-        setLocalDebug('Firestore document created');
-        await safeMergeDoc(docRef, {
-          status: 'processing',
-          statusLabel: 'Calling AI (local mode)...',
-          updatedAt: serverTimestamp()
-        }, 'Pre-call status update');
+          videoUrl: localVideoReference
+        };
+        setLocalVideos(prev => [localVideo, ...prev]);
+        setLocalDebug('Local card created');
 
         try {
           setLocalDebug('Calling generateClips...');
@@ -121,25 +113,23 @@ function App() {
           const generatedClips = Array.isArray(result.data?.clips) ? result.data.clips : [];
           setLocalDebug(`AI returned ${generatedClips.length} clips`);
 
-          await safeMergeDoc(docRef, {
+          updateLocalVideo(localVideoId, {
             status: 'processed',
             statusLabel: 'Ready',
             clips: generatedClips,
             clipsGenerated: generatedClips.length,
-            uploadProgress: 100,
-            updatedAt: serverTimestamp()
-          }, 'Final success update');
+            uploadProgress: 100
+          });
           setLocalDebug('Done');
         } catch (error) {
           console.error("Processing failed", error);
           setLocalDebug(`AI failed: ${error.message || 'Unknown error'}`);
-          await safeMergeDoc(docRef, {
+          updateLocalVideo(localVideoId, {
             status: 'failed',
             statusLabel: 'Processing failed',
             uploadProgress: 100,
-            errorMessage: error.message || 'Processing error',
-            updatedAt: serverTimestamp()
-          }, 'Final failure update');
+            errorMessage: error.message || 'Processing error'
+          });
         }
 
         return;
@@ -278,7 +268,7 @@ function App() {
                   View All
                 </button>
               </div>
-              <VideoGrid videos={videos} />
+              <VideoGrid videos={displayVideos} />
             </div>
           </div>
         </main>
