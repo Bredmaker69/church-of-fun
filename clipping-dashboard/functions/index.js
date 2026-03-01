@@ -797,13 +797,14 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
     const preferredLanguage = String(language || "").trim();
     const langSpec = preferredLanguage
         ? `${preferredLanguage}.*,${preferredLanguage},en.*,en,-live_chat`
-        : "en.*,en,all,-live_chat";
+        : "en.*,en,-live_chat";
 
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "yt-captions-"));
     try {
         const cookiesFromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
         const args = [
             "--no-update",
+            "--ignore-errors",
             "--skip-download",
             "--write-subs",
             "--write-auto-subs",
@@ -821,11 +822,17 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
 
         args.push(targetUrl);
 
-        await execFileAsync("yt-dlp", args, {
-            cwd: tempDir,
-            timeout: 45000,
-            maxBuffer: 20 * 1024 * 1024,
-        });
+        let execError = null;
+        try {
+            await execFileAsync("yt-dlp", args, {
+                cwd: tempDir,
+                timeout: 45000,
+                maxBuffer: 20 * 1024 * 1024,
+            });
+        } catch (error) {
+            // Some subtitle downloads can fail (e.g., rate-limited language variants) while desired files are still written.
+            execError = error;
+        }
 
         const fileNames = await fs.readdir(tempDir);
         const vttFiles = rankSubtitleFiles(
@@ -834,6 +841,9 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
         );
 
         if (vttFiles.length === 0) {
+            if (execError) {
+                throw new Error(`yt-dlp did not produce subtitle files. ${summarizeExecError(execError)}`);
+            }
             throw new Error("yt-dlp did not produce subtitle files.");
         }
 
@@ -850,6 +860,9 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
             }
         }
 
+        if (execError) {
+            throw new Error(`yt-dlp subtitle files were unreadable. ${summarizeExecError(execError)}`);
+        }
         throw new Error("yt-dlp subtitle files contained no transcript text.");
     } catch (error) {
         throw new Error(`yt-dlp provider failed: ${summarizeExecError(error)}`);
