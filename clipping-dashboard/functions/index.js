@@ -1,4 +1,5 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { YoutubeTranscript } = require("youtube-transcript");
 
 const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const TARGET_CLIP_COUNT = Number(process.env.CLIP_TARGET_COUNT || 3);
@@ -216,6 +217,31 @@ function ensureOpenAiApiKey() {
     return process.env.OPENAI_API_KEY;
 }
 
+function isLikelyYouTubeUrl(value) {
+    const url = String(value || "").toLowerCase();
+    return url.includes("youtube.com") || url.includes("youtu.be");
+}
+
+async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
+    if (!isLikelyYouTubeUrl(videoUrl)) return null;
+    if (process.env.ENABLE_YOUTUBE_TRANSCRIPT === "false") return null;
+
+    const lang = String(preferredLanguage || process.env.YOUTUBE_TRANSCRIPT_LANG || "en");
+    const transcript = await YoutubeTranscript.fetchTranscript(videoUrl, { lang });
+    const rawSegments = transcript.map((entry) => ({
+        startTimestamp: formatSecondsToTimestamp(entry.offset),
+        endTimestamp: formatSecondsToTimestamp(entry.offset + entry.duration),
+        speaker: "Caption",
+        text: entry.text,
+    }));
+
+    const segments = applyTranscriptRules(rawSegments);
+    if (segments.length === 0) {
+        throw new Error("YouTube captions were returned but no valid segments were produced.");
+    }
+    return segments;
+}
+
 exports.generateClips = onCall({ cors: true }, async (request) => {
     try {
         const { videoUrl, videoTitle, contentType } = request.data || {};
@@ -270,8 +296,7 @@ exports.generateClips = onCall({ cors: true }, async (request) => {
 
 exports.generateTranscript = onCall({ cors: true }, async (request) => {
     try {
-        const { videoUrl, videoTitle, contentType } = request.data || {};
-        const apiKey = ensureOpenAiApiKey();
+        const { videoUrl, videoTitle, contentType, transcriptLanguage } = request.data || {};
 
         if (!videoUrl) {
             throw new HttpsError("invalid-argument", "The function must be called with a 'videoUrl'.");
@@ -279,6 +304,23 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
 
         const normalizedContentType = normalizeContentType(contentType);
         const profileInstruction = CONTENT_PROFILE_INSTRUCTIONS[normalizedContentType];
+
+        try {
+            const youtubeSegments = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
+            if (youtubeSegments && youtubeSegments.length > 0) {
+                console.log(`Using YouTube transcript provider (${youtubeSegments.length} segments) for ${videoTitle || "Untitled"}`);
+                return {
+                    success: true,
+                    contentType: normalizedContentType,
+                    transcriptSource: "youtube_caption",
+                    segments: youtubeSegments,
+                };
+            }
+        } catch (youtubeError) {
+            console.warn("YouTube transcript provider failed; falling back to OpenAI transcript.", youtubeError.message);
+        }
+
+        const apiKey = ensureOpenAiApiKey();
 
         const userPrompt = [
             "You are creating a timestamped transcript index for highlight editing.",
@@ -312,6 +354,7 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
         return {
             success: true,
             contentType: normalizedContentType,
+            transcriptSource: "openai_fallback",
             segments,
         };
     } catch (error) {

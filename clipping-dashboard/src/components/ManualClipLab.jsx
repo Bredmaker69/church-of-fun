@@ -42,10 +42,45 @@ const withTimeout = async (promise, timeoutMs, errorMessage) => {
   }
 };
 
+const extractDroppedUrl = (event) => {
+  const uriList = event.dataTransfer?.getData('text/uri-list');
+  if (uriList) {
+    const first = uriList.split('\n').map((line) => line.trim()).find(Boolean);
+    if (first) return first;
+  }
+
+  const text = event.dataTransfer?.getData('text/plain');
+  if (text) {
+    const first = text.split('\n').map((line) => line.trim()).find(Boolean);
+    if (first && /^https?:\/\//i.test(first)) return first;
+  }
+
+  return null;
+};
+
+const looksLikeYouTubeUrl = (value) => {
+  const url = String(value || '').toLowerCase();
+  return url.includes('youtube.com') || url.includes('youtu.be');
+};
+
+const buildTimedUrl = (sourceUrl, seconds) => {
+  try {
+    const url = new URL(sourceUrl);
+    const value = `${Math.max(0, Math.floor(seconds))}s`;
+    url.searchParams.set('t', value);
+    return url.toString();
+  } catch {
+    return sourceUrl;
+  }
+};
+
 const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) => {
   const videoRef = useRef(null);
+  const [sourceMode, setSourceMode] = useState('file');
   const [sourceFile, setSourceFile] = useState(null);
   const [videoUrl, setVideoUrl] = useState('');
+  const [sourceUrlInput, setSourceUrlInput] = useState('');
+  const [sourceUrl, setSourceUrl] = useState('');
   const [currentTime, setCurrentTime] = useState(0);
   const [startTime, setStartTime] = useState('00:00');
   const [endTime, setEndTime] = useState('00:15');
@@ -53,6 +88,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   const [renderedClips, setRenderedClips] = useState([]);
   const [transcriptSegments, setTranscriptSegments] = useState([]);
   const [transcriptQuery, setTranscriptQuery] = useState('');
+  const [transcriptSource, setTranscriptSource] = useState('');
   const [isRendering, setIsRendering] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [status, setStatus] = useState('');
@@ -60,14 +96,58 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
 
   useEffect(() => {
     return () => {
-      if (videoUrl) {
-        URL.revokeObjectURL(videoUrl);
-      }
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
       renderedClips.forEach((clip) => {
         if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
       });
     };
   }, [videoUrl, renderedClips]);
+
+  const clearProcessingState = () => {
+    renderedClips.forEach((clip) => {
+      if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
+    });
+    setSegments([]);
+    setRenderedClips([]);
+    setTranscriptSegments([]);
+    setTranscriptQuery('');
+    setTranscriptSource('');
+    setStatus('');
+  };
+
+  const setFileSource = (file) => {
+    if (!file) return;
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    const nextVideoUrl = URL.createObjectURL(file);
+    setSourceMode('file');
+    setSourceFile(file);
+    setVideoUrl(nextVideoUrl);
+    setSourceUrl('');
+    setSourceUrlInput('');
+    setCurrentTime(0);
+    setStartTime('00:00');
+    setEndTime('00:15');
+    clearProcessingState();
+  };
+
+  const applySourceUrl = (candidateUrl) => {
+    const value = String(candidateUrl || '').trim();
+    if (!/^https?:\/\//i.test(value)) {
+      setStatus('Enter a valid http(s) URL.');
+      return;
+    }
+    if (videoUrl) URL.revokeObjectURL(videoUrl);
+    setSourceMode('url');
+    setSourceFile(null);
+    setVideoUrl('');
+    setSourceUrl(value);
+    setSourceUrlInput(value);
+    setCurrentTime(0);
+    setStartTime('00:00');
+    setEndTime('00:15');
+    clearProcessingState();
+    setStatus(`URL source ready: ${looksLikeYouTubeUrl(value) ? 'YouTube detected' : 'Direct URL'}`);
+  };
 
   const addSegmentFromRange = ({ startTimestamp, endTimestamp, title, description }) => {
     const startSeconds = parseTimestamp(startTimestamp);
@@ -94,24 +174,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
 
   const handleSelectFile = (event) => {
     const file = event.target.files?.[0];
-    if (!file) return;
-
-    if (videoUrl) URL.revokeObjectURL(videoUrl);
-    renderedClips.forEach((clip) => {
-      if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
-    });
-
-    const nextVideoUrl = URL.createObjectURL(file);
-    setSourceFile(file);
-    setVideoUrl(nextVideoUrl);
-    setCurrentTime(0);
-    setStartTime('00:00');
-    setEndTime('00:15');
-    setSegments([]);
-    setRenderedClips([]);
-    setTranscriptSegments([]);
-    setTranscriptQuery('');
-    setStatus('');
+    setFileSource(file);
     event.target.value = null;
   };
 
@@ -129,6 +192,10 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   };
 
   const setFromCurrent = (type) => {
+    if (sourceMode !== 'file') {
+      setStatus('Set-from-current is available only for local uploaded files.');
+      return;
+    }
     const value = formatTimestamp(currentTime);
     if (type === 'start') {
       setStartTime(value);
@@ -137,16 +204,41 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     }
   };
 
+  const getActiveSourceReference = () => {
+    if (sourceMode === 'file' && sourceFile) {
+      return {
+        sourceRef: `local-file://${encodeURIComponent(sourceFile.name)}`,
+        sourceTitle: sourceFile.name,
+      };
+    }
+    if (sourceMode === 'url' && sourceUrl) {
+      return {
+        sourceRef: sourceUrl,
+        sourceTitle: sourceUrl,
+      };
+    }
+    return null;
+  };
+
   const jumpToTimestamp = (timestamp) => {
     const seconds = parseTimestamp(timestamp);
-    if (!Number.isFinite(seconds) || !videoRef.current) return;
-    videoRef.current.currentTime = seconds;
-    videoRef.current.play().catch(() => {});
+    if (!Number.isFinite(seconds)) return;
+
+    if (sourceMode === 'file' && videoRef.current) {
+      videoRef.current.currentTime = seconds;
+      videoRef.current.play().catch(() => {});
+      return;
+    }
+
+    if (sourceMode === 'url' && sourceUrl) {
+      window.open(buildTimedUrl(sourceUrl, seconds), '_blank', 'noopener,noreferrer');
+    }
   };
 
   const handleGenerateTranscript = async () => {
-    if (!sourceFile) {
-      setStatus('Choose a source video first.');
+    const activeSource = getActiveSourceReference();
+    if (!activeSource) {
+      setStatus('Choose a source file or paste/drop a source URL first.');
       return;
     }
 
@@ -154,11 +246,10 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
     setStatus('Generating transcript index...');
 
     try {
-      const localVideoReference = `local-file://${encodeURIComponent(sourceFile.name)}`;
       const result = await withTimeout(
         generateTranscript({
-          videoUrl: localVideoReference,
-          videoTitle: sourceFile.name,
+          videoUrl: activeSource.sourceRef,
+          videoTitle: activeSource.sourceTitle,
           contentType: contentProfile,
         }),
         45000,
@@ -166,8 +257,10 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       );
 
       const segmentsData = Array.isArray(result.data?.segments) ? result.data.segments : [];
+      const sourceTag = result.data?.transcriptSource || 'unknown';
       setTranscriptSegments(segmentsData);
-      setStatus(`Transcript ready: ${segmentsData.length} segments.`);
+      setTranscriptSource(sourceTag);
+      setStatus(`Transcript ready: ${segmentsData.length} segments (${sourceTag}).`);
     } catch (error) {
       setStatus(`Transcript failed: ${error.message || 'Unknown error'}`);
     } finally {
@@ -177,7 +270,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
 
   const renderSegments = async () => {
     if (!sourceFile) {
-      setStatus('Select a source video first.');
+      setStatus('Rendering clips currently requires a local uploaded video file.');
       return;
     }
     if (segments.length === 0) {
@@ -230,6 +323,44 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
         </label>
       </div>
 
+      <div
+        onDragOver={(event) => event.preventDefault()}
+        onDrop={(event) => {
+          event.preventDefault();
+          const droppedUrl = extractDroppedUrl(event);
+          if (droppedUrl) {
+            applySourceUrl(droppedUrl);
+          } else {
+            setStatus('No valid URL found in dropped content.');
+          }
+        }}
+        className="border border-dashed border-primary/40 rounded-xl p-3 text-sm text-slate-600 dark:text-slate-300 bg-primary/5"
+      >
+        Drag and drop a YouTube/direct video URL here, or paste below.
+      </div>
+
+      <div className="flex flex-col md:flex-row gap-2">
+        <input
+          type="text"
+          value={sourceUrlInput}
+          onChange={(event) => setSourceUrlInput(event.target.value)}
+          placeholder="https://www.youtube.com/watch?v=..."
+          className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
+        />
+        <button
+          onClick={() => applySourceUrl(sourceUrlInput)}
+          className="bg-indigo-600 text-white px-3 py-2 rounded-lg text-sm font-semibold"
+        >
+          Use URL Source
+        </button>
+      </div>
+
+      {(sourceFile || sourceUrl) && (
+        <div className="text-xs text-slate-500 dark:text-slate-400">
+          Source: {sourceMode === 'file' ? `Local file (${sourceFile?.name})` : sourceUrl}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         <div className="flex flex-col gap-1">
           <label className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Profile</label>
@@ -246,7 +377,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
         <div className="md:col-span-2 flex items-end">
           <button
             onClick={handleGenerateTranscript}
-            disabled={isTranscribing || !sourceFile}
+            disabled={isTranscribing || (!sourceFile && !sourceUrl)}
             className="bg-indigo-600 text-white px-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
           >
             {isTranscribing ? 'Generating Transcript...' : 'Generate Transcript Index'}
@@ -315,7 +446,9 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
       </div>
 
       <div className="space-y-2">
-        <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">Transcript Search</div>
+        <div className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+          Transcript Search {transcriptSource ? `(${transcriptSource})` : ''}
+        </div>
         <input
           type="text"
           value={transcriptQuery}

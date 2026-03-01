@@ -73,6 +73,8 @@ Notes:
 - Local mode now renders real `.mp4` subclips in-browser via `ffmpeg.wasm`; the first render may take longer while ffmpeg core assets are downloaded.
 - Local mode includes a **Manual Clip Lab** with video scrubbing, manual in/out ranges, and MP4 export.
 - Manual Clip Lab can generate a transcript index, search keywords, jump to hits, and create manual clips directly from transcript matches.
+- Manual Clip Lab supports URL sources: drag/drop a YouTube URL (or paste one) and run transcript generation/search without uploading a file.
+- Rendering `.mp4` clips still requires a local uploaded file source.
 
 ## Quality checks
 
@@ -93,6 +95,12 @@ npm run build
   - `CLIP_MIN_GAP_SECONDS` (default `1`)
   - `CLIP_TARGET_COUNT` (default `3`)
 - Transcript index is available via callable function `generateTranscript`.
+- Transcript provider behavior for `generateTranscript`:
+  - For YouTube URLs, backend tries YouTube captions first.
+  - If YouTube captions are unavailable or fail, backend falls back to OpenAI transcript generation.
+  - Optional env flags in `functions/.env.local`:
+    - `ENABLE_YOUTUBE_TRANSCRIPT` (`false` to disable YouTube caption provider; default enabled)
+    - `YOUTUBE_TRANSCRIPT_LANG` (default `en`)
 
 ## Deploy Functions
 
