@@ -1,10 +1,12 @@
-const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
 const { YoutubeTranscript } = require("youtube-transcript");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const fs = require("node:fs/promises");
+const { createReadStream } = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
+const { randomUUID } = require("node:crypto");
 
 const execFileAsync = promisify(execFile);
 
@@ -19,6 +21,9 @@ const TRANSCRIPT_MAX_SEGMENT_SECONDS = Number(process.env.TRANSCRIPT_MAX_SEGMENT
 const TRANSCRIPT_MAX_SEGMENTS = Number(process.env.TRANSCRIPT_MAX_SEGMENTS || 120);
 const TRANSCRIPT_CACHE_TTL_SECONDS = Number(process.env.TRANSCRIPT_CACHE_TTL_SECONDS || 3600);
 const TRANSCRIPT_CACHE_MAX_ENTRIES = Number(process.env.TRANSCRIPT_CACHE_MAX_ENTRIES || 200);
+const RENDERED_CLIP_TTL_SECONDS = Number(process.env.RENDERED_CLIP_TTL_SECONDS || 1800);
+const MAX_RENDER_CLIPS_PER_REQUEST = Number(process.env.MAX_RENDER_CLIPS_PER_REQUEST || 8);
+const MAX_RENDER_SECONDS_PER_CLIP = Number(process.env.MAX_RENDER_SECONDS_PER_CLIP || 120);
 
 const CONTENT_PROFILE_INSTRUCTIONS = {
     generic: "Prioritize engaging moments with clear hooks, emotional spikes, and concise standalone context.",
@@ -29,6 +34,7 @@ const CONTENT_PROFILE_INSTRUCTIONS = {
 
 // Local in-memory cache for repeated YouTube transcript checks in emulator/runtime process.
 const youtubeTranscriptCache = new Map();
+const renderedClipStore = new Map();
 
 function normalizeContentType(value) {
     const text = String(value || "generic").toLowerCase().trim();
@@ -312,6 +318,92 @@ function setCachedYouTubeTranscript(cacheKey, value) {
     for (let index = 0; index < overflow; index += 1) {
         youtubeTranscriptCache.delete(entries[index][0]);
     }
+}
+
+function getProjectId() {
+    if (process.env.GCLOUD_PROJECT) return process.env.GCLOUD_PROJECT;
+    if (process.env.FIREBASE_CONFIG) {
+        try {
+            const config = JSON.parse(process.env.FIREBASE_CONFIG);
+            if (config?.projectId) return config.projectId;
+        } catch {
+            // ignore malformed FIREBASE_CONFIG
+        }
+    }
+    return "church-of-fun-ai-clipping";
+}
+
+function sanitizeFileName(value, fallback) {
+    const text = String(value || "").trim();
+    const normalized = text
+        .replace(/[^a-zA-Z0-9._-]+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    if (!normalized) return fallback;
+    return normalized.slice(0, 100);
+}
+
+function getMimeTypeFromExtension(filePath) {
+    const ext = path.extname(String(filePath || "")).toLowerCase();
+    if (ext === ".mp4" || ext === ".m4v") return "video/mp4";
+    if (ext === ".webm") return "video/webm";
+    if (ext === ".mkv") return "video/x-matroska";
+    if (ext === ".mov") return "video/quicktime";
+    return "application/octet-stream";
+}
+
+function formatSecondsForSection(totalSeconds) {
+    const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remaining = seconds % 60;
+    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+}
+
+function normalizeClipForRender(rawClip, index) {
+    const start = parseTimestampToSeconds(rawClip?.startTimestamp);
+    const end = parseTimestampToSeconds(rawClip?.endTimestamp);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        throw new Error(`Clip ${index + 1} has invalid timestamps.`);
+    }
+
+    const boundedDuration = Math.min(MAX_RENDER_SECONDS_PER_CLIP, Math.max(1, end - start));
+    const boundedEnd = start + boundedDuration;
+    return {
+        title: String(rawClip?.title || `clip-${index + 1}`),
+        startSeconds: start,
+        endSeconds: boundedEnd,
+        startTimestamp: formatSecondsToTimestamp(start),
+        endTimestamp: formatSecondsToTimestamp(boundedEnd),
+    };
+}
+
+async function cleanupExpiredRenderedClips() {
+    const now = Date.now();
+    const entries = [...renderedClipStore.entries()];
+    for (const [token, entry] of entries) {
+        if (entry.expiresAt > now) continue;
+        renderedClipStore.delete(token);
+        try {
+            await fs.rm(entry.filePath, { force: true });
+        } catch {
+            // best effort cleanup
+        }
+    }
+}
+
+function buildDownloadUrlForRequest(request, token) {
+    const host = request?.rawRequest?.get?.("host");
+    if (!host) return "";
+
+    const isLocal = /localhost|127\.0\.0\.1/.test(host);
+    const protocol = isLocal ? "http" : "https";
+    const encodedToken = encodeURIComponent(token);
+
+    if (isLocal) {
+        return `${protocol}://${host}/${getProjectId()}/us-central1/downloadRenderedClip?token=${encodedToken}`;
+    }
+    return `${protocol}://${host}/downloadRenderedClip?token=${encodedToken}`;
 }
 
 const YOUTUBE_USER_AGENT = [
@@ -624,6 +716,56 @@ function rankSubtitleFiles(fileNames, preferredLanguage) {
     });
 }
 
+async function findRenderedVideoFile(tempDir, prefix) {
+    const names = await fs.readdir(tempDir);
+    const candidates = names.filter((name) => {
+        if (!name.startsWith(prefix)) return false;
+        if (name.endsWith(".part") || name.endsWith(".ytdl")) return false;
+        if (name.endsWith(".info.json") || name.endsWith(".description")) return false;
+        return /\.(mp4|m4v|mkv|webm|mov)$/i.test(name);
+    });
+
+    if (candidates.length === 0) {
+        return null;
+    }
+
+    const filesWithSize = await Promise.all(
+        candidates.map(async (name) => {
+            const fullPath = path.join(tempDir, name);
+            const stats = await fs.stat(fullPath);
+            return { name, fullPath, size: stats.size };
+        })
+    );
+
+    filesWithSize.sort((a, b) => b.size - a.size);
+    return filesWithSize[0];
+}
+
+async function storeRenderedClipFile({ sourcePath, clipTitle, index }) {
+    const storageDir = path.join(os.tmpdir(), "church-of-fun-rendered-clips");
+    await fs.mkdir(storageDir, { recursive: true });
+
+    const token = randomUUID();
+    const extension = path.extname(sourcePath).toLowerCase() || ".mp4";
+    const safeTitle = sanitizeFileName(clipTitle, `clip-${index + 1}`);
+    const fileName = sanitizeFileName(`${safeTitle}-${index + 1}${extension}`, `clip-${index + 1}${extension}`);
+    const destinationPath = path.join(storageDir, `${token}${extension}`);
+
+    await fs.rename(sourcePath, destinationPath);
+
+    const entry = {
+        filePath: destinationPath,
+        fileName,
+        mimeType: getMimeTypeFromExtension(destinationPath),
+        expiresAt: Date.now() + Math.max(60, RENDERED_CLIP_TTL_SECONDS) * 1000,
+    };
+
+    renderedClipStore.set(token, entry);
+    await cleanupExpiredRenderedClips();
+
+    return { token, ...entry };
+}
+
 function toTranscriptResult(entries, meta) {
     const rawSegments = entries.map((entry) => ({
         startTimestamp: formatSecondsToTimestamp(entry.offset),
@@ -914,6 +1056,61 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
     }
 }
 
+async function renderYouTubeClipSegment({ videoUrl, clip, tempDir, index }) {
+    const cookiesFromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
+    const clipPrefix = `render-${Date.now()}-${index + 1}`;
+    const outputTemplate = path.join(tempDir, `${clipPrefix}.%(ext)s`);
+    const sectionRange = `${formatSecondsForSection(clip.startSeconds)}-${formatSecondsForSection(clip.endSeconds)}`;
+    const formatSelection = String(process.env.YTDLP_CLIP_FORMAT || "bv*[height<=720]+ba/b[height<=720]/best");
+
+    const args = [
+        "--no-update",
+        "--ignore-errors",
+        "--no-playlist",
+        "--download-sections",
+        `*${sectionRange}`,
+        "--force-keyframes-at-cuts",
+        "--merge-output-format",
+        "mp4",
+        "--remux-video",
+        "mp4",
+        "-f",
+        formatSelection,
+        "--output",
+        outputTemplate,
+    ];
+
+    if (cookiesFromBrowser) {
+        args.push("--cookies-from-browser", cookiesFromBrowser);
+    }
+
+    args.push(videoUrl);
+
+    let execError = null;
+    try {
+        await execFileAsync("yt-dlp", args, {
+            cwd: tempDir,
+            timeout: 300000,
+            maxBuffer: 20 * 1024 * 1024,
+        });
+    } catch (error) {
+        execError = error;
+    }
+
+    const renderedFile = await findRenderedVideoFile(tempDir, clipPrefix);
+    if (!renderedFile) {
+        if (execError) {
+            throw new Error(`Clip render command failed. ${summarizeExecError(execError)}`);
+        }
+        throw new Error("Clip render command finished without producing a video file.");
+    }
+
+    return {
+        filePath: renderedFile.fullPath,
+        warning: execError ? summarizeExecError(execError) : "",
+    };
+}
+
 async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
     const videoId = extractYouTubeVideoId(videoUrl);
     if (!videoId) return null;
@@ -1091,6 +1288,140 @@ exports.checkTranscriptAvailability = onCall(
         throw new HttpsError("internal", "An error occurred while checking transcript availability.", error.message);
     }
 });
+
+exports.downloadRenderedClip = onRequest(
+    { cors: true, timeoutSeconds: 300, memory: "1GiB" },
+    async (request, response) => {
+        try {
+            await cleanupExpiredRenderedClips();
+
+            const token = String(request.query?.token || "").trim();
+            if (!token) {
+                response.status(400).json({ error: "Missing token." });
+                return;
+            }
+
+            const entry = renderedClipStore.get(token);
+            if (!entry || entry.expiresAt <= Date.now()) {
+                if (entry) {
+                    renderedClipStore.delete(token);
+                    await fs.rm(entry.filePath, { force: true }).catch(() => {});
+                }
+                response.status(404).json({ error: "Clip not found or expired." });
+                return;
+            }
+
+            const stats = await fs.stat(entry.filePath).catch(() => null);
+            if (!stats || !stats.isFile()) {
+                renderedClipStore.delete(token);
+                response.status(404).json({ error: "Clip file is unavailable." });
+                return;
+            }
+
+            response.setHeader("Content-Type", entry.mimeType);
+            response.setHeader("Content-Disposition", `attachment; filename="${entry.fileName}"`);
+            response.setHeader("Content-Length", String(stats.size));
+            response.setHeader("Cache-Control", "private, max-age=0, no-store");
+
+            const stream = createReadStream(entry.filePath);
+            stream.on("error", (error) => {
+                console.error("Error streaming rendered clip:", error);
+                if (!response.headersSent) {
+                    response.status(500).json({ error: "Failed to read clip file." });
+                } else {
+                    response.end();
+                }
+            });
+            stream.pipe(response);
+        } catch (error) {
+            console.error("Error downloading rendered clip:", error);
+            response.status(500).json({ error: "Failed to download rendered clip." });
+        }
+    }
+);
+
+exports.renderYouTubeClips = onCall(
+    { cors: true, timeoutSeconds: 540, memory: "2GiB" },
+    async (request) => {
+        try {
+            await cleanupExpiredRenderedClips();
+
+            const { videoUrl, clips } = request.data || {};
+            if (!videoUrl || !isLikelyYouTubeUrl(videoUrl)) {
+                throw new HttpsError("invalid-argument", "A valid YouTube videoUrl is required.");
+            }
+
+            if (!Array.isArray(clips) || clips.length === 0) {
+                throw new HttpsError("invalid-argument", "At least one clip range is required.");
+            }
+
+            const limitedRawClips = clips.slice(0, Math.max(1, MAX_RENDER_CLIPS_PER_REQUEST));
+            const normalizedClips = limitedRawClips.map((clip, index) => normalizeClipForRender(clip, index));
+
+            const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "yt-render-"));
+            const rendered = [];
+            const failures = [];
+
+            try {
+                for (let index = 0; index < normalizedClips.length; index += 1) {
+                    const clip = normalizedClips[index];
+                    try {
+                        const result = await renderYouTubeClipSegment({
+                            videoUrl,
+                            clip,
+                            tempDir,
+                            index,
+                        });
+
+                        const storedClip = await storeRenderedClipFile({
+                            sourcePath: result.filePath,
+                            clipTitle: clip.title,
+                            index,
+                        });
+
+                        rendered.push({
+                            title: clip.title,
+                            startTimestamp: clip.startTimestamp,
+                            endTimestamp: clip.endTimestamp,
+                            fileName: storedClip.fileName,
+                            downloadUrl: buildDownloadUrlForRequest(request, storedClip.token),
+                            renderSource: "youtube_section_download",
+                            expiresAt: new Date(storedClip.expiresAt).toISOString(),
+                            warning: result.warning || "",
+                        });
+                    } catch (error) {
+                        failures.push({
+                            clipIndex: index + 1,
+                            title: clip.title,
+                            error: cleanYouTubeErrorMessage(error),
+                        });
+                    }
+                }
+            } finally {
+                await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+            }
+
+            if (rendered.length === 0) {
+                const detail = failures[0]?.error || "All clip renders failed.";
+                throw new HttpsError("internal", `Unable to render clips. ${detail}`);
+            }
+
+            return {
+                success: true,
+                renderedCount: rendered.length,
+                failureCount: failures.length,
+                clips: rendered,
+                failures,
+                clipsTruncated: clips.length > limitedRawClips.length,
+                maxRenderClips: Math.max(1, MAX_RENDER_CLIPS_PER_REQUEST),
+            };
+        } catch (error) {
+            console.error("Error rendering YouTube clips:", error);
+            if (error instanceof HttpsError) throw error;
+            throw new HttpsError("internal", "An error occurred while rendering YouTube clips.", error.message);
+        }
+    }
+);
 
 exports.generateTranscript = onCall({ cors: true }, async (request) => {
     try {

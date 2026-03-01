@@ -67,7 +67,7 @@ npm run dev:local
 
 Notes:
 - Firestore and Storage remain on your Firebase project.
-- Only the callable `generateClips` runs locally on your Mac.
+- Callable and HTTP functions run locally on your Mac (including transcript checks and URL clip rendering).
 - In `dev:local`, Storage upload is intentionally skipped and replaced with a local file reference so you can test processing flow without Storage auth/rules setup.
 - In dev mode, the app defaults to local function emulation and local upload bypass unless explicitly set to `VITE_USE_FUNCTIONS_EMULATOR=false` or `VITE_SKIP_STORAGE_UPLOAD=false`.
 - Local mode now renders real `.mp4` subclips in-browser via `ffmpeg.wasm`; the first render may take longer while ffmpeg core assets are downloaded.
@@ -75,7 +75,7 @@ Notes:
 - Manual Clip Lab can generate a transcript index, search keywords, jump to hits, and create manual clips directly from transcript matches.
 - Manual Clip Lab supports URL sources: drag/drop a YouTube URL (or paste one) and run transcript generation/search without uploading a file.
 - Manual Clip Lab now runs a visible YouTube caption availability check before transcript generation and exposes an explicit "Allow AI fallback" toggle to control token usage.
-- Rendering `.mp4` clips still requires a local uploaded file source.
+- Manual Clip Lab can also render clips from YouTube URLs via backend section downloads (`renderYouTubeClips` + `downloadRenderedClip`).
 
 ## Quality checks
 
@@ -110,6 +110,9 @@ npm run build
     - `YOUTUBE_TRANSCRIPT_LANG` (default `en`)
     - `TRANSCRIPT_CACHE_TTL_SECONDS` (default `3600`)
     - `TRANSCRIPT_CACHE_MAX_ENTRIES` (default `200`)
+    - `MAX_RENDER_CLIPS_PER_REQUEST` (default `8`)
+    - `MAX_RENDER_SECONDS_PER_CLIP` (default `120`)
+    - `RENDERED_CLIP_TTL_SECONDS` (default `1800`)
 
 ## Deploy Functions
 

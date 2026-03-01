@@ -101,19 +101,27 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   const [status, setStatus] = useState('');
   const generateTranscript = httpsCallable(functions, 'generateTranscript');
   const checkTranscriptAvailability = httpsCallable(functions, 'checkTranscriptAvailability');
+  const renderYouTubeClips = httpsCallable(functions, 'renderYouTubeClips');
+
+  const revokeClipDownloadUrl = (clip) => {
+    const value = String(clip?.downloadUrl || '');
+    if (value.startsWith('blob:')) {
+      URL.revokeObjectURL(value);
+    }
+  };
 
   useEffect(() => {
     return () => {
       if (videoUrl) URL.revokeObjectURL(videoUrl);
       renderedClips.forEach((clip) => {
-        if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
+        revokeClipDownloadUrl(clip);
       });
     };
   }, [videoUrl, renderedClips]);
 
   const clearProcessingState = () => {
     renderedClips.forEach((clip) => {
-      if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
+      revokeClipDownloadUrl(clip);
     });
     transcriptAvailabilityRequestRef.current += 1;
     setSegments([]);
@@ -376,22 +384,48 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
   };
 
   const renderSegments = async () => {
-    if (!sourceFile) {
-      setStatus('Rendering clips currently requires a local uploaded video file.');
-      return;
-    }
     if (segments.length === 0) {
       setStatus('Add at least one manual segment.');
       return;
     }
+    if (sourceMode === 'url' && !isYouTubeSource) {
+      setStatus('URL rendering currently supports YouTube links only.');
+      return;
+    }
+    if (sourceMode === 'file' && !sourceFile) {
+      setStatus('Select a local source video first.');
+      return;
+    }
 
     setIsRendering(true);
-    setStatus('Preparing renderer...');
+    setStatus(sourceMode === 'url' ? 'Preparing YouTube clip renders...' : 'Preparing renderer...');
 
     try {
       renderedClips.forEach((clip) => {
-        if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
+        revokeClipDownloadUrl(clip);
       });
+
+      if (sourceMode === 'url') {
+        const result = await withTimeout(
+          renderYouTubeClips({
+            videoUrl: sourceUrl,
+            clips: segments,
+          }),
+          420000,
+          'Timed out rendering YouTube clips.'
+        );
+
+        const clips = Array.isArray(result.data?.clips) ? result.data.clips : [];
+        const failures = Array.isArray(result.data?.failures) ? result.data.failures : [];
+        setRenderedClips(clips);
+
+        if (clips.length > 0 && failures.length > 0) {
+          setStatus(`Rendered ${clips.length} clips. ${failures.length} clip(s) failed.`);
+        } else {
+          setStatus(`Rendered ${clips.length} clips.`);
+        }
+        return;
+      }
 
       const clips = await renderLocalClipFiles({
         sourceFile,
@@ -669,7 +703,7 @@ const ManualClipLab = ({ contentProfile = 'generic', onContentProfileChange }) =
           disabled={isRendering}
           className="bg-emerald-600 text-white px-3 py-2 rounded-lg text-sm font-semibold disabled:opacity-50"
         >
-          {isRendering ? 'Rendering...' : 'Render Manual Clips'}
+          {isRendering ? 'Rendering...' : (sourceMode === 'url' ? 'Render URL Clips' : 'Render Manual Clips')}
         </button>
       </div>
 
