@@ -17,6 +17,21 @@ function App() {
   const skipStorageUploadInLocalMode =
     import.meta.env.DEV && import.meta.env.VITE_SKIP_STORAGE_UPLOAD === 'true';
 
+  const callGenerateClipsWithTimeout = async (payload, timeoutMs = 45000) => {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for generateClips`));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([generateClips(payload), timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
   useEffect(() => {
     const q = query(collection(db, 'videos'), orderBy('createdAt', 'desc'));
     const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -65,16 +80,18 @@ function App() {
       if (skipStorageUploadInLocalMode) {
         const localVideoReference = `local-file://${encodeURIComponent(file.name)}`;
 
-        await updateDoc(docRef, {
+        void updateDoc(docRef, {
           status: 'processing',
           statusLabel: 'Analyzing video (local mode)...',
           uploadProgress: 100,
           videoUrl: localVideoReference,
           updatedAt: serverTimestamp()
+        }).catch((error) => {
+          console.error("Failed to update local mode analysis status", error);
         });
 
         try {
-          const result = await generateClips({
+          const result = await callGenerateClipsWithTimeout({
             videoUrl: localVideoReference,
             videoTitle: file.name
           });
@@ -156,7 +173,7 @@ function App() {
               updatedAt: serverTimestamp()
             });
 
-            const result = await generateClips({
+            const result = await callGenerateClipsWithTimeout({
               videoUrl,
               videoTitle: file.name
             });
