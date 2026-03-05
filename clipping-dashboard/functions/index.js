@@ -2589,56 +2589,69 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
 async function renderYouTubeClipSegment({ videoUrl, clip, tempDir, index, timeoutMs = 300000 }) {
     const cookiesFromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
     const clipPrefix = `render-${Date.now()}-${index + 1}`;
-    const outputTemplate = path.join(tempDir, `${clipPrefix}.%(ext)s`);
     const sectionRange = `${formatSecondsForSection(clip.startSeconds)}-${formatSecondsForSection(clip.endSeconds)}`;
     const formatSelection = String(process.env.YTDLP_CLIP_FORMAT || "bv*[height<=720]+ba/b[height<=720]/best");
-
-    const args = [
-        "--no-update",
-        "--ignore-errors",
-        "--no-playlist",
-        "--download-sections",
-        `*${sectionRange}`,
-        "--force-keyframes-at-cuts",
-        "--merge-output-format",
-        "mp4",
-        "--remux-video",
-        "mp4",
-        "-f",
-        formatSelection,
-        "--output",
-        outputTemplate,
-    ];
-
-    if (cookiesFromBrowser) {
-        args.push("--cookies-from-browser", cookiesFromBrowser);
+    // Default to cookie-free render fetch for speed/reliability; optionally retry with cookies.
+    const attemptCookieModes = [""];
+    if (cookiesFromBrowser && YTDLP_TRANSCRIPT_COOKIE_FALLBACK) {
+        attemptCookieModes.push(cookiesFromBrowser);
     }
 
-    args.push(videoUrl);
+    const uniqueCookieModes = [...new Set(attemptCookieModes)];
+    const attemptErrors = [];
 
-    let execError = null;
-    try {
-        await execFileAsync("yt-dlp", args, {
-            cwd: tempDir,
-            timeout: Math.max(20000, Number(timeoutMs) || 300000),
-            maxBuffer: 20 * 1024 * 1024,
-        });
-    } catch (error) {
-        execError = error;
-    }
+    for (const cookieMode of uniqueCookieModes) {
+        const attemptDir = await fs.mkdtemp(path.join(tempDir, cookieMode ? "render-with-cookies-" : "render-no-cookies-"));
+        const outputTemplate = path.join(attemptDir, `${clipPrefix}.%(ext)s`);
+        const args = [
+            "--no-update",
+            "--ignore-errors",
+            "--no-playlist",
+            "--download-sections",
+            `*${sectionRange}`,
+            "--force-keyframes-at-cuts",
+            "--merge-output-format",
+            "mp4",
+            "--remux-video",
+            "mp4",
+            "-f",
+            formatSelection,
+            "--output",
+            outputTemplate,
+        ];
 
-    const renderedFile = await findRenderedVideoFile(tempDir, clipPrefix);
-    if (!renderedFile) {
-        if (execError) {
-            throw new Error(`Clip render command failed. ${summarizeExecError(execError)}`);
+        if (cookieMode) {
+            args.push("--cookies-from-browser", cookieMode);
         }
-        throw new Error("Clip render command finished without producing a video file.");
+
+        args.push(videoUrl);
+
+        let execError = null;
+        try {
+            await execFileAsync("yt-dlp", args, {
+                cwd: attemptDir,
+                timeout: Math.max(20000, Number(timeoutMs) || 300000),
+                maxBuffer: 20 * 1024 * 1024,
+            });
+        } catch (error) {
+            execError = error;
+        }
+
+        const renderedFile = await findRenderedVideoFile(attemptDir, clipPrefix);
+        if (renderedFile) {
+            return {
+                filePath: renderedFile.fullPath,
+                warning: execError ? summarizeExecError(execError) : "",
+            };
+        }
+
+        const reason = execError
+            ? summarizeExecError(execError)
+            : "Clip render command finished without producing a video file.";
+        attemptErrors.push(`${cookieMode ? "cookies" : "no-cookies"}: ${reason}`);
     }
 
-    return {
-        filePath: renderedFile.fullPath,
-        warning: execError ? summarizeExecError(execError) : "",
-    };
+    throw new Error(`Clip render command failed. ${attemptErrors.join(" || ").slice(0, 2000)}`);
 }
 
 async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
