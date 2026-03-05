@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev:local": "VITE_USE_FUNCTIONS_EMULATOR=true VITE_SKIP_STORAGE_UPLOAD=true vite",
+    "stable-ts:setup": "bash functions/scripts/setup_stable_ts_local.sh",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",

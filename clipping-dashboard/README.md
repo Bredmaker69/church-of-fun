@@ -78,6 +78,41 @@ Notes:
 - For YouTube URL sources, Manual Clip Lab now embeds a player in-app so you can scrub, monitor current time, and jump transcript hits without leaving the app.
 - Manual Clip Lab can also render clips from YouTube URLs via backend section downloads (`renderYouTubeClips` + `downloadRenderedClip`).
 
+### Enable High Accuracy Local Alignment (stable-ts)
+
+This enables the **High Accuracy (Local beta)** precision mode to run on your Mac instead of OpenAI.
+
+1. Run setup once:
+
+```bash
+npm run stable-ts:setup
+```
+
+What this does:
+- Creates `functions/.venv-stable-ts`
+- Installs `stable-ts` and dependencies
+- Updates `functions/.env.local` with `STABLE_TS_*` values
+- Enables `STABLE_TS_FORCE_ARM64=true` to avoid NumPy/Torch mismatch when Node runs under Rosetta on Apple Silicon
+- Enables `STABLE_TS_DISABLE_OPENAI_FALLBACK=true` so High Accuracy fails fast instead of waiting for OpenAI fallback
+- Sets `STABLE_TS_CA_BUNDLE` to the venv cert bundle for model download TLS
+
+2. Restart functions emulator:
+
+```bash
+npm run firebase:emulators:functions
+```
+
+3. Use the app precision toggle:
+- `Fast` => OpenAI baseline
+- `High Accuracy (Local beta)` => stable-ts local runtime
+- `A/B Test` => runs both and reports comparison metrics
+
+If model download fails with certificate verification errors on corporate/self-signed networks, add this to `functions/.env.local` and restart emulator:
+
+```bash
+STABLE_TS_INSECURE_MODEL_DOWNLOAD=true
+```
+
 ## Quality checks
 
 ```bash

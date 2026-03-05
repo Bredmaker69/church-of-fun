@@ -1,6 +1,6 @@
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
 const { YoutubeTranscript } = require("youtube-transcript");
-const { execFile } = require("node:child_process");
+const { execFile, execFileSync } = require("node:child_process");
 const { promisify } = require("node:util");
 const fs = require("node:fs/promises");
 const { createReadStream } = require("node:fs");
@@ -19,11 +19,41 @@ const MIN_CLIP_GAP_SECONDS = Number(process.env.CLIP_MIN_GAP_SECONDS || 1);
 const TRANSCRIPT_MIN_SEGMENT_SECONDS = Number(process.env.TRANSCRIPT_MIN_SEGMENT_SECONDS || 2);
 const TRANSCRIPT_MAX_SEGMENT_SECONDS = Number(process.env.TRANSCRIPT_MAX_SEGMENT_SECONDS || 25);
 const TRANSCRIPT_MAX_SEGMENTS = Number(process.env.TRANSCRIPT_MAX_SEGMENTS || 120);
+const TRANSCRIPT_MAX_SEGMENTS_YOUTUBE = Number(process.env.TRANSCRIPT_MAX_SEGMENTS_YOUTUBE || 6000);
+const TRANSCRIPT_MAX_SEGMENTS_OPENAI = Number(process.env.TRANSCRIPT_MAX_SEGMENTS_OPENAI || TRANSCRIPT_MAX_SEGMENTS);
 const TRANSCRIPT_CACHE_TTL_SECONDS = Number(process.env.TRANSCRIPT_CACHE_TTL_SECONDS || 3600);
 const TRANSCRIPT_CACHE_MAX_ENTRIES = Number(process.env.TRANSCRIPT_CACHE_MAX_ENTRIES || 200);
 const RENDERED_CLIP_TTL_SECONDS = Number(process.env.RENDERED_CLIP_TTL_SECONDS || 1800);
 const MAX_RENDER_CLIPS_PER_REQUEST = Number(process.env.MAX_RENDER_CLIPS_PER_REQUEST || 8);
 const MAX_RENDER_SECONDS_PER_CLIP = Number(process.env.MAX_RENDER_SECONDS_PER_CLIP || 120);
+const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe";
+const OPENAI_TRANSCRIBE_TIMEOUT_MS = Number(process.env.OPENAI_TRANSCRIBE_TIMEOUT_MS || 90000);
+const STABLE_TS_LOCAL_ENABLED = String(process.env.STABLE_TS_LOCAL_ENABLED || "true").toLowerCase() === "true";
+const STABLE_TS_PYTHON_BIN = String(process.env.STABLE_TS_PYTHON_BIN || "python3").trim() || "python3";
+const STABLE_TS_MODEL = String(process.env.STABLE_TS_MODEL || "large-v3-turbo").trim() || "large-v3-turbo";
+const STABLE_TS_TIMEOUT_MS = Number(process.env.STABLE_TS_TIMEOUT_MS || 420000);
+const STABLE_TS_DEVICE = String(process.env.STABLE_TS_DEVICE || "").trim();
+const STABLE_TS_COMPUTE_TYPE = String(process.env.STABLE_TS_COMPUTE_TYPE || "").trim();
+const STABLE_TS_FORCE_ARM64 = String(process.env.STABLE_TS_FORCE_ARM64 || "true").toLowerCase() === "true";
+const STABLE_TS_DISABLE_OPENAI_FALLBACK = String(process.env.STABLE_TS_DISABLE_OPENAI_FALLBACK || "true").toLowerCase() === "true";
+const STABLE_TS_ALIGN_SCRIPT = String(
+    process.env.STABLE_TS_ALIGN_SCRIPT || path.join(__dirname, "scripts", "stable_ts_align.py")
+).trim();
+const PRECISION_ALIGN_BUFFER_SECONDS = Number(process.env.PRECISION_ALIGN_BUFFER_SECONDS || 12);
+const PRECISION_ALIGN_MAX_WINDOW_SECONDS = Number(process.env.PRECISION_ALIGN_MAX_WINDOW_SECONDS || 120);
+const PRECISION_ALIGN_MIN_SELECTION_SECONDS = Number(process.env.PRECISION_ALIGN_MIN_SELECTION_SECONDS || 1);
+const PRECISION_ALIGN_MAX_PROMPT_CHARS = Number(process.env.PRECISION_ALIGN_MAX_PROMPT_CHARS || 1000);
+const PRECISION_ALIGN_RENDER_TIMEOUT_MS = Number(process.env.PRECISION_ALIGN_RENDER_TIMEOUT_MS || 180000);
+const MAX_TIMELINE_RENDER_ITEMS = Number(process.env.MAX_TIMELINE_RENDER_ITEMS || 100);
+const EDIT_RENDER_TARGET_WIDTH = Number(process.env.EDIT_RENDER_TARGET_WIDTH || 1280);
+const EDIT_RENDER_TARGET_HEIGHT = Number(process.env.EDIT_RENDER_TARGET_HEIGHT || 720);
+const MAX_CAPTION_CUES_PER_ITEM = Number(process.env.MAX_CAPTION_CUES_PER_ITEM || 320);
+const ALIGNMENT_PROVIDER_OPENAI = "openai_fast";
+const ALIGNMENT_PROVIDER_STABLE_TS_LOCAL = "stable_ts_local";
+const ALIGNMENT_PROVIDER_AB_COMPARE = "ab_compare";
+const ALIGNMENT_PROVIDER_DEFAULT = String(
+    process.env.ALIGNMENT_PROVIDER_DEFAULT || ALIGNMENT_PROVIDER_STABLE_TS_LOCAL
+).trim().toLowerCase();
 
 const CONTENT_PROFILE_INSTRUCTIONS = {
     generic: "Prioritize engaging moments with clear hooks, emotional spikes, and concise standalone context.",
@@ -35,6 +65,21 @@ const CONTENT_PROFILE_INSTRUCTIONS = {
 // Local in-memory cache for repeated YouTube transcript checks in emulator/runtime process.
 const youtubeTranscriptCache = new Map();
 const renderedClipStore = new Map();
+const renderedClipStorageDir = path.join(os.tmpdir(), "church-of-fun-rendered-clips");
+
+let hostSupportsArm64 = false;
+if (process.platform === "darwin") {
+    try {
+        const sysctlValue = String(execFileSync("sysctl", ["-n", "hw.optional.arm64"], { encoding: "utf8" }) || "").trim();
+        hostSupportsArm64 = sysctlValue === "1";
+    } catch {
+        hostSupportsArm64 = false;
+    }
+}
+const STABLE_TS_USE_ARCH_ARM64 =
+    STABLE_TS_FORCE_ARM64 &&
+    process.platform === "darwin" &&
+    hostSupportsArm64;
 
 function normalizeContentType(value) {
     const text = String(value || "generic").toLowerCase().trim();
@@ -78,6 +123,47 @@ function parseModelJson(text) {
         }
         return JSON.parse(match[0]);
     }
+}
+
+function parseLastJsonObjectFromText(text) {
+    const source = String(text || "").trim();
+    if (!source) return null;
+
+    const lines = source.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        try {
+            const parsed = JSON.parse(lines[index]);
+            if (parsed && typeof parsed === "object") {
+                return parsed;
+            }
+        } catch {
+            // Continue searching for JSON payload lines.
+        }
+    }
+
+    return null;
+}
+
+function summarizeStableTsStderr(text) {
+    const source = String(text || "");
+    if (!source) return "";
+
+    const normalizedLines = source
+        .replace(/\r/g, "\n")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    const filtered = normalizedLines.filter((line) => {
+        if (/^Transcribe:\s*/i.test(line)) return false;
+        if (/^\d+%\|/.test(line)) return false;
+        if (/FP16 is not supported on CPU/i.test(line)) return false;
+        if (/Cannot clamp due to missing\/no word-timestamps/i.test(line)) return false;
+        return true;
+    });
+
+    const chosen = filtered.length > 0 ? filtered : normalizedLines;
+    return chosen.slice(-8).join(" | ").slice(0, 1200);
 }
 
 async function requestStructuredJson({ apiKey, systemPrompt, userPrompt, temperature = 0.3 }) {
@@ -193,7 +279,11 @@ function normalizeTranscriptSegment(segment, index) {
     };
 }
 
-function applyTranscriptRules(rawSegments) {
+function applyTranscriptRules(rawSegments, maxSegments = TRANSCRIPT_MAX_SEGMENTS) {
+    const normalizedMaxSegments = Number.isFinite(Number(maxSegments)) && Number(maxSegments) > 0
+        ? Math.floor(Number(maxSegments))
+        : TRANSCRIPT_MAX_SEGMENTS;
+
     const normalized = rawSegments
         .map((segment, index) => normalizeTranscriptSegment(segment, index))
         .filter((segment) =>
@@ -222,10 +312,885 @@ function applyTranscriptRules(rawSegments) {
         });
         previousEnd = end;
 
-        if (shaped.length >= TRANSCRIPT_MAX_SEGMENTS) break;
+        if (shaped.length >= normalizedMaxSegments) break;
     }
 
     return shaped;
+}
+
+function normalizeMatchText(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/&nbsp;/gi, " ")
+        .replace(/[^a-z0-9' ]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function tokenizeForMatch(value) {
+    return normalizeMatchText(value).split(" ").filter(Boolean);
+}
+
+function normalizeAlignmentProvider(value) {
+    const text = String(value || ALIGNMENT_PROVIDER_DEFAULT).trim().toLowerCase();
+    if (
+        text === ALIGNMENT_PROVIDER_AB_COMPARE ||
+        text === "ab" ||
+        text === "a/b" ||
+        text === "compare"
+    ) {
+        return ALIGNMENT_PROVIDER_AB_COMPARE;
+    }
+    if (
+        text === ALIGNMENT_PROVIDER_STABLE_TS_LOCAL ||
+        text === "stable-local" ||
+        text === "stable_ts" ||
+        text === "stable-ts"
+    ) {
+        return ALIGNMENT_PROVIDER_STABLE_TS_LOCAL;
+    }
+    return ALIGNMENT_PROVIDER_OPENAI;
+}
+
+function normalizeTokenForSimilarity(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9']/g, "")
+        .replace(/'+/g, "'")
+        .trim();
+}
+
+function levenshteinDistance(a, b) {
+    const left = String(a || "");
+    const right = String(b || "");
+    if (!left) return right.length;
+    if (!right) return left.length;
+
+    const previous = new Array(right.length + 1);
+    const current = new Array(right.length + 1);
+
+    for (let index = 0; index <= right.length; index += 1) {
+        previous[index] = index;
+    }
+
+    for (let i = 1; i <= left.length; i += 1) {
+        current[0] = i;
+        for (let j = 1; j <= right.length; j += 1) {
+            const substitutionCost = left[i - 1] === right[j - 1] ? 0 : 1;
+            current[j] = Math.min(
+                previous[j] + 1, // deletion
+                current[j - 1] + 1, // insertion
+                previous[j - 1] + substitutionCost // substitution
+            );
+        }
+        for (let j = 0; j <= right.length; j += 1) {
+            previous[j] = current[j];
+        }
+    }
+
+    return previous[right.length];
+}
+
+function scoreTokenSimilarity(a, b) {
+    const left = normalizeTokenForSimilarity(a);
+    const right = normalizeTokenForSimilarity(b);
+    if (!left || !right) return 0;
+    if (left === right) return 1;
+
+    const leftCompact = left.replace(/'/g, "");
+    const rightCompact = right.replace(/'/g, "");
+    if (leftCompact && rightCompact && leftCompact === rightCompact) return 0.96;
+    if (left.startsWith(right) || right.startsWith(left)) return 0.82;
+    if (left.includes(right) || right.includes(left)) return 0.72;
+
+    const maxLength = Math.max(left.length, right.length);
+    if (maxLength <= 1) return 0;
+
+    const distance = levenshteinDistance(left, right);
+    const ratio = 1 - distance / maxLength;
+    if (ratio >= 0.92) return 0.92;
+    if (ratio >= 0.82) return 0.84;
+    if (ratio >= 0.72) return 0.74;
+    if (ratio >= 0.62) return 0.62;
+    return 0;
+}
+
+function extractTranscriptionWordTimeline(payload) {
+    const timeline = [];
+
+    const parseSeconds = (value, scale = 1) => {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) return Number.NaN;
+        return numeric * scale;
+    };
+
+    const pushWord = (wordText, startSeconds, endSeconds) => {
+        const rawTokens = tokenizeForMatch(wordText);
+        if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) return;
+        if (rawTokens.length === 0) return;
+
+        const slotDuration = Math.max(0.02, (endSeconds - startSeconds) / rawTokens.length);
+        for (let index = 0; index < rawTokens.length; index += 1) {
+            const tokenStart = startSeconds + slotDuration * index;
+            const tokenEnd = index === rawTokens.length - 1
+                ? endSeconds
+                : startSeconds + slotDuration * (index + 1);
+            timeline.push({
+                token: rawTokens[index],
+                startSeconds: tokenStart,
+                endSeconds: Math.max(tokenStart + 0.02, tokenEnd),
+            });
+        }
+    };
+
+    if (Array.isArray(payload?.words)) {
+        for (const entry of payload.words) {
+            const startSeconds = Number.isFinite(parseSeconds(entry?.start))
+                ? parseSeconds(entry?.start)
+                : Number.isFinite(parseSeconds(entry?.startSeconds))
+                    ? parseSeconds(entry?.startSeconds)
+                    : parseSeconds(entry?.start_ms, 1 / 1000);
+            const endSeconds = Number.isFinite(parseSeconds(entry?.end))
+                ? parseSeconds(entry?.end)
+                : Number.isFinite(parseSeconds(entry?.endSeconds))
+                    ? parseSeconds(entry?.endSeconds)
+                    : parseSeconds(entry?.end_ms, 1 / 1000);
+            pushWord(entry?.word || entry?.text || entry?.token, startSeconds, endSeconds);
+        }
+    }
+
+    if (timeline.length > 0) {
+        timeline.sort((a, b) => a.startSeconds - b.startSeconds);
+        return timeline;
+    }
+
+    if (Array.isArray(payload?.segments)) {
+        for (const segment of payload.segments) {
+            pushWord(segment?.text, Number(segment?.start), Number(segment?.end));
+        }
+    }
+
+    timeline.sort((a, b) => a.startSeconds - b.startSeconds);
+    return timeline;
+}
+
+function findNearestWordIndexByTime(wordTimeline, targetSeconds) {
+    if (!Array.isArray(wordTimeline) || wordTimeline.length === 0) return -1;
+    if (!Number.isFinite(targetSeconds)) return 0;
+
+    let bestIndex = 0;
+    let bestDistance = Infinity;
+    for (let index = 0; index < wordTimeline.length; index += 1) {
+        const entry = wordTimeline[index];
+        const center = (entry.startSeconds + entry.endSeconds) / 2;
+        const distance = Math.abs(center - targetSeconds);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = index;
+        }
+    }
+    return bestIndex;
+}
+
+function buildFallbackAlignment(words, safeStartIndex, safeEndIndex, confidence = 0.18) {
+    const boundedStartIndex = Math.max(0, Math.min(words.length - 1, safeStartIndex));
+    const boundedEndIndex = Math.max(
+        boundedStartIndex,
+        Math.min(words.length - 1, safeEndIndex >= boundedStartIndex ? safeEndIndex : boundedStartIndex + 1)
+    );
+    return {
+        startSeconds: words[boundedStartIndex].startSeconds,
+        endSeconds: words[boundedEndIndex].endSeconds,
+        confidence: Math.max(0, Math.min(1, Number(confidence) || 0)),
+        matchedText: words.slice(boundedStartIndex, boundedEndIndex + 1).map((entry) => entry.token).join(" "),
+        coverage: 0,
+        averageSimilarity: 0,
+        proximity: 0,
+        strategy: "fallback-window",
+    };
+}
+
+function buildFocusedWordSearchWindow(words, fallbackStartSeconds, fallbackEndSeconds) {
+    if (!Array.isArray(words) || words.length === 0) return null;
+    if (!Number.isFinite(fallbackStartSeconds) || !Number.isFinite(fallbackEndSeconds)) return null;
+
+    const selectionSpan = Math.max(1, fallbackEndSeconds - fallbackStartSeconds);
+    const radiusSeconds = Math.max(20, Math.min(110, selectionSpan * 6));
+    const windowStart = Math.max(0, fallbackStartSeconds - radiusSeconds);
+    const windowEnd = fallbackEndSeconds + radiusSeconds;
+
+    let startIndex = -1;
+    let endIndex = -1;
+    for (let index = 0; index < words.length; index += 1) {
+        const word = words[index];
+        if (!Number.isFinite(word.startSeconds) || !Number.isFinite(word.endSeconds)) continue;
+        if (startIndex < 0 && word.endSeconds >= windowStart) {
+            startIndex = index;
+        }
+        if (word.startSeconds <= windowEnd) {
+            endIndex = index;
+        }
+    }
+
+    if (startIndex < 0 || endIndex < startIndex) return null;
+    return { startIndex, endIndex };
+}
+
+function runSmithWatermanAlignment({
+    words,
+    selectedTokens,
+    fallbackStartSeconds,
+    strategy,
+}) {
+    if (!Array.isArray(words) || words.length === 0) return null;
+    if (!Array.isArray(selectedTokens) || selectedTokens.length === 0) return null;
+
+    const rowCount = selectedTokens.length + 1;
+    const colCount = words.length + 1;
+    const matrixSize = rowCount * colCount;
+
+    const scores = new Float32Array(matrixSize);
+    const directions = new Uint8Array(matrixSize); // 0 stop, 1 diag, 2 up, 3 left
+
+    const getIndex = (row, col) => row * colCount + col;
+
+    let bestScore = 0;
+    let bestRow = 0;
+    let bestCol = 0;
+
+    for (let row = 1; row < rowCount; row += 1) {
+        const token = selectedTokens[row - 1];
+        for (let col = 1; col < colCount; col += 1) {
+            const similarity = scoreTokenSimilarity(words[col - 1].token, token);
+            const matchScore = similarity >= 0.58
+                ? 2 + similarity * 2
+                : -1.3 + similarity;
+            const diagonal = scores[getIndex(row - 1, col - 1)] + matchScore;
+            const up = scores[getIndex(row - 1, col)] - 0.85;
+            const left = scores[getIndex(row, col - 1)] - 0.70;
+
+            let cellScore = 0;
+            let direction = 0;
+            if (diagonal > cellScore) {
+                cellScore = diagonal;
+                direction = 1;
+            }
+            if (up > cellScore) {
+                cellScore = up;
+                direction = 2;
+            }
+            if (left > cellScore) {
+                cellScore = left;
+                direction = 3;
+            }
+
+            const matrixIndex = getIndex(row, col);
+            scores[matrixIndex] = cellScore;
+            directions[matrixIndex] = direction;
+
+            if (cellScore > bestScore) {
+                bestScore = cellScore;
+                bestRow = row;
+                bestCol = col;
+            }
+        }
+    }
+
+    if (bestScore <= 0 || bestRow === 0 || bestCol === 0) return null;
+
+    let row = bestRow;
+    let col = bestCol;
+    let matchedTokenCount = 0;
+    let similaritySum = 0;
+    let minWordIndex = Infinity;
+    let maxWordIndex = -1;
+
+    while (row > 0 && col > 0) {
+        const matrixIndex = getIndex(row, col);
+        const score = scores[matrixIndex];
+        const direction = directions[matrixIndex];
+        if (score <= 0 || direction === 0) break;
+
+        if (direction === 1) {
+            const similarity = scoreTokenSimilarity(words[col - 1].token, selectedTokens[row - 1]);
+            if (similarity >= 0.58) {
+                matchedTokenCount += 1;
+                similaritySum += similarity;
+                minWordIndex = Math.min(minWordIndex, col - 1);
+                maxWordIndex = Math.max(maxWordIndex, col - 1);
+            }
+            row -= 1;
+            col -= 1;
+            continue;
+        }
+
+        if (direction === 2) {
+            row -= 1;
+            continue;
+        }
+
+        col -= 1;
+    }
+
+    if (!Number.isFinite(minWordIndex) || maxWordIndex < minWordIndex) return null;
+
+    const coverage = matchedTokenCount / selectedTokens.length;
+    const averageSimilarity = matchedTokenCount > 0 ? similaritySum / matchedTokenCount : 0;
+    const startSeconds = words[minWordIndex].startSeconds;
+    const endSeconds = words[maxWordIndex].endSeconds;
+    const proximity = Number.isFinite(fallbackStartSeconds)
+        ? Math.max(0, 1 - Math.min(1, Math.abs(startSeconds - fallbackStartSeconds) / 30))
+        : 0.8;
+    const confidence = Math.max(
+        0,
+        Math.min(1, coverage * 0.62 + averageSimilarity * 0.28 + proximity * 0.10)
+    );
+    const qualityScore = bestScore + coverage * 4 + averageSimilarity * 2 + proximity;
+
+    return {
+        startSeconds,
+        endSeconds,
+        confidence,
+        matchedText: words.slice(minWordIndex, maxWordIndex + 1).map((entry) => entry.token).join(" "),
+        coverage,
+        averageSimilarity,
+        proximity,
+        qualityScore,
+        strategy,
+    };
+}
+
+function findBestAlignmentWindow({
+    wordTimeline,
+    selectedText,
+    fallbackStartSeconds,
+    fallbackEndSeconds,
+}) {
+    const words = Array.isArray(wordTimeline) ? wordTimeline : [];
+    if (words.length === 0) return null;
+
+    const fallbackStartIndex = findNearestWordIndexByTime(words, fallbackStartSeconds);
+    const fallbackEndIndex = findNearestWordIndexByTime(words, fallbackEndSeconds);
+    const safeFallbackStartIndex = Math.max(0, fallbackStartIndex);
+    const safeFallbackEndIndex = Math.max(
+        safeFallbackStartIndex,
+        Math.min(words.length - 1, fallbackEndIndex >= safeFallbackStartIndex ? fallbackEndIndex : safeFallbackStartIndex + 1)
+    );
+
+    const selectedTokens = tokenizeForMatch(selectedText);
+    if (selectedTokens.length === 0) {
+        return buildFallbackAlignment(words, safeFallbackStartIndex, safeFallbackEndIndex, 0.16);
+    }
+
+    const searchWindows = [{
+        strategy: "global-search",
+        startIndex: 0,
+        endIndex: words.length - 1,
+    }];
+    const focusedWindow = buildFocusedWordSearchWindow(words, fallbackStartSeconds, fallbackEndSeconds);
+    if (
+        focusedWindow &&
+        (focusedWindow.startIndex > 0 || focusedWindow.endIndex < words.length - 1)
+    ) {
+        searchWindows.unshift({
+            strategy: "focused-search",
+            startIndex: focusedWindow.startIndex,
+            endIndex: focusedWindow.endIndex,
+        });
+    }
+
+    const candidates = [];
+    for (const window of searchWindows) {
+        const slice = words.slice(window.startIndex, window.endIndex + 1);
+        if (slice.length === 0) continue;
+        const candidate = runSmithWatermanAlignment({
+            words: slice,
+            selectedTokens,
+            fallbackStartSeconds,
+            strategy: window.strategy,
+        });
+        if (!candidate) continue;
+
+        candidates.push({
+            ...candidate,
+            startSeconds: candidate.startSeconds,
+            endSeconds: candidate.endSeconds,
+            matchedText: candidate.matchedText,
+        });
+    }
+
+    if (candidates.length === 0) {
+        return buildFallbackAlignment(words, safeFallbackStartIndex, safeFallbackEndIndex, 0.2);
+    }
+
+    candidates.sort((a, b) => b.qualityScore - a.qualityScore);
+    const best = candidates[0];
+    const minimumMatchedTokens = Math.max(2, Math.min(selectedTokens.length, 4));
+    const matchedTokensEstimate = Math.round(best.coverage * selectedTokens.length);
+
+    if (
+        best.coverage < 0.38 ||
+        best.averageSimilarity < 0.58 ||
+        matchedTokensEstimate < minimumMatchedTokens ||
+        !(best.endSeconds > best.startSeconds)
+    ) {
+        return buildFallbackAlignment(words, safeFallbackStartIndex, safeFallbackEndIndex, 0.24);
+    }
+
+    return {
+        startSeconds: best.startSeconds,
+        endSeconds: best.endSeconds,
+        confidence: best.confidence,
+        matchedText: best.matchedText,
+        coverage: best.coverage,
+        averageSimilarity: best.averageSimilarity,
+        proximity: best.proximity,
+        strategy: best.strategy,
+    };
+}
+
+function buildAlignmentOutcomeFromTranscription({
+    transcription,
+    selectedText,
+    fallbackStartSeconds,
+    fallbackEndSeconds,
+    providerId,
+    providerLabel,
+}) {
+    const wordTimeline = extractTranscriptionWordTimeline(transcription);
+    if (!Array.isArray(wordTimeline) || wordTimeline.length === 0) {
+        throw new Error(`${providerLabel} transcription returned no usable word timeline.`);
+    }
+
+    const alignment = findBestAlignmentWindow({
+        wordTimeline,
+        selectedText,
+        fallbackStartSeconds,
+        fallbackEndSeconds,
+    });
+    if (!alignment) {
+        throw new Error(`${providerLabel} alignment did not return a valid word window.`);
+    }
+
+    const confidence = Number(alignment.confidence || 0);
+    const coverage = Number(alignment.coverage || 0);
+    const similarity = Number(alignment.averageSimilarity || 0);
+    const weightedScore = (
+        (Number.isFinite(confidence) ? confidence : 0) * 0.62 +
+        (Number.isFinite(coverage) ? coverage : 0) * 0.28 +
+        (Number.isFinite(similarity) ? similarity : 0) * 0.10
+    );
+
+    return {
+        providerId,
+        providerLabel,
+        transcription,
+        wordTimeline,
+        alignment,
+        metrics: {
+            confidence: Number.isFinite(confidence) ? confidence : 0,
+            coverage: Number.isFinite(coverage) ? coverage : 0,
+            similarity: Number.isFinite(similarity) ? similarity : 0,
+            proximity: Number(alignment.proximity || 0),
+            strategy: String(alignment.strategy || "unknown"),
+            weightedScore,
+        },
+        timedWordCount: Number(transcription?._timedWordCount || countValidTimedWords(transcription)),
+        modelUsed: String(transcription?._modelUsed || ""),
+    };
+}
+
+async function extractAudioTrackForTranscription({ sourceVideoPath, tempDir }) {
+    const outputPath = path.join(tempDir, `precision-audio-${Date.now()}.mp3`);
+    await execFileAsync("ffmpeg", [
+        "-y",
+        "-i", sourceVideoPath,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "libmp3lame",
+        "-b:a", "64k",
+        outputPath,
+    ], {
+        timeout: 5 * 60 * 1000,
+        maxBuffer: 20 * 1024 * 1024,
+    });
+
+    const stats = await fs.stat(outputPath).catch(() => null);
+    if (!stats || !stats.isFile() || stats.size <= 0) {
+        throw new Error("Audio extraction failed for precision alignment.");
+    }
+    return outputPath;
+}
+
+async function extractWaveformPeaks({ audioFilePath, targetBins = 1400 }) {
+    const durationSeconds = await getMediaDurationSeconds(audioFilePath);
+    const sampleRate = 16000;
+    const { stdout } = await execFileAsync("ffmpeg", [
+        "-v", "error",
+        "-i", audioFilePath,
+        "-ac", "1",
+        "-ar", String(sampleRate),
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "pipe:1",
+    ], {
+        encoding: "buffer",
+        timeout: 2 * 60 * 1000,
+        maxBuffer: 32 * 1024 * 1024,
+    });
+
+    const byteLength = Buffer.isBuffer(stdout) ? stdout.length : 0;
+    const sampleCount = Math.floor(byteLength / 2);
+    if (!sampleCount) {
+        return {
+            sampleRate,
+            durationSeconds,
+            binDurationSeconds: durationSeconds,
+            bins: [],
+        };
+    }
+
+    const samples = new Int16Array(stdout.buffer, stdout.byteOffset, sampleCount);
+    const binCount = Math.max(64, Math.min(Number(targetBins) || 1400, sampleCount));
+    const bins = [];
+
+    for (let index = 0; index < binCount; index += 1) {
+        const start = Math.floor((index * sampleCount) / binCount);
+        const end = Math.max(start + 1, Math.floor(((index + 1) * sampleCount) / binCount));
+        let peak = 0;
+        for (let cursor = start; cursor < end && cursor < sampleCount; cursor += 1) {
+            const normalized = Math.abs(samples[cursor]) / 32768;
+            if (normalized > peak) peak = normalized;
+        }
+        bins.push(Number(peak.toFixed(4)));
+    }
+
+    return {
+        sampleRate,
+        durationSeconds: Number(durationSeconds.toFixed(3)),
+        binDurationSeconds: Number((durationSeconds / binCount).toFixed(6)),
+        bins,
+    };
+}
+
+function parseTimedWordEntry(entry) {
+    const text = String(entry?.word || entry?.text || entry?.token || "").trim();
+    const parseCandidate = (candidate, scale = 1) => {
+        const numeric = Number(candidate);
+        return Number.isFinite(numeric) ? numeric * scale : Number.NaN;
+    };
+
+    const startCandidates = [entry?.start, entry?.startSeconds];
+    const endCandidates = [entry?.end, entry?.endSeconds];
+
+    let startSeconds = Number.NaN;
+    let endSeconds = Number.NaN;
+
+    for (const candidate of startCandidates) {
+        const parsed = parseCandidate(candidate);
+        if (Number.isFinite(parsed)) {
+            startSeconds = parsed;
+            break;
+        }
+    }
+    if (!Number.isFinite(startSeconds)) {
+        const parsedMs = parseCandidate(entry?.start_ms, 1 / 1000);
+        if (Number.isFinite(parsedMs)) startSeconds = parsedMs;
+    }
+
+    for (const candidate of endCandidates) {
+        const parsed = parseCandidate(candidate);
+        if (Number.isFinite(parsed)) {
+            endSeconds = parsed;
+            break;
+        }
+    }
+    if (!Number.isFinite(endSeconds)) {
+        const parsedMs = parseCandidate(entry?.end_ms, 1 / 1000);
+        if (Number.isFinite(parsedMs)) endSeconds = parsedMs;
+    }
+
+    return {
+        text,
+        startSeconds,
+        endSeconds,
+    };
+}
+
+function countValidTimedWords(payload) {
+    if (!Array.isArray(payload?.words)) return 0;
+    return payload.words.filter((entry) => {
+        const parsed = parseTimedWordEntry(entry);
+        return (
+            parsed.text.length > 0 &&
+            Number.isFinite(parsed.startSeconds) &&
+            Number.isFinite(parsed.endSeconds) &&
+            parsed.endSeconds > parsed.startSeconds
+        );
+    }).length;
+}
+
+async function requestOpenAiAudioTranscription({
+    apiKey,
+    audioFilePath,
+    selectedText,
+    language,
+}) {
+    const audioBuffer = await fs.readFile(audioFilePath);
+    const fileName = path.basename(audioFilePath) || "audio.mp3";
+    const normalizedPrompt = String(selectedText || "").trim().slice(0, Math.max(0, PRECISION_ALIGN_MAX_PROMPT_CHARS));
+    const normalizedLanguage = String(language || "").trim();
+    const modelCandidates = [...new Set([
+        String(OPENAI_TRANSCRIBE_MODEL || "").trim(),
+        "gpt-4o-transcribe",
+        "gpt-4o-mini-transcribe",
+        "whisper-1",
+    ].filter(Boolean))];
+    const requestedTokenCount = tokenizeForMatch(selectedText).length;
+    const minimumTimedWords = requestedTokenCount > 0
+        ? Math.max(2, Math.min(40, Math.floor(requestedTokenCount * 0.55)))
+        : 6;
+
+    const shouldRetryWithoutGranularity = (message) => {
+        return /timestamp_granularities|verbose_json|word/i.test(String(message || ""));
+    };
+
+    const assertTranscriptionQuality = (payload, modelName) => {
+        const timedWordCount = countValidTimedWords(payload);
+        const transcriptTextLength = String(payload?.text || "").trim().length;
+        if (timedWordCount < minimumTimedWords) {
+            throw new Error(
+                `${modelName} returned insufficient word timestamps (${timedWordCount}, expected at least ${minimumTimedWords}).`
+            );
+        }
+        if (transcriptTextLength < 8) {
+            throw new Error(`${modelName} returned empty transcript text.`);
+        }
+    };
+
+    const runRequest = async ({ includeTimestampGranularity, modelName }) => {
+        const form = new FormData();
+        form.append("file", new Blob([audioBuffer], { type: "audio/mpeg" }), fileName);
+        form.append("model", modelName);
+        form.append("response_format", "verbose_json");
+
+        if (normalizedPrompt) {
+            form.append("prompt", normalizedPrompt);
+        }
+        if (normalizedLanguage) {
+            form.append("language", normalizedLanguage);
+        }
+        if (includeTimestampGranularity) {
+            form.append("timestamp_granularities[]", "segment");
+            form.append("timestamp_granularities[]", "word");
+        }
+
+        const controller = new AbortController();
+        const timeoutMs = Math.max(10000, OPENAI_TRANSCRIBE_TIMEOUT_MS);
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+            },
+            body: form,
+            signal: controller.signal,
+        }).catch((error) => {
+            if (error?.name === "AbortError") {
+                throw new Error(`OpenAI audio transcription timed out after ${timeoutMs}ms`);
+            }
+            throw error;
+        }).finally(() => {
+            clearTimeout(timeoutId);
+        });
+
+        const responseText = await response.text();
+        if (!response.ok) {
+            throw new Error(`OpenAI audio transcription failed (${response.status}): ${responseText.slice(0, 600)}`);
+        }
+
+        try {
+            const parsed = JSON.parse(responseText);
+            if (parsed && typeof parsed === "object") {
+                parsed._modelUsed = modelName;
+                parsed._timedWordCount = countValidTimedWords(parsed);
+            }
+            return parsed;
+        } catch {
+            throw new Error("OpenAI audio transcription returned non-JSON content.");
+        }
+    };
+
+    const failures = [];
+    for (const modelName of modelCandidates) {
+        try {
+            try {
+                const withGranularity = await runRequest({ includeTimestampGranularity: true, modelName });
+                assertTranscriptionQuality(withGranularity, modelName);
+                return withGranularity;
+            } catch (firstError) {
+                const message = String(firstError?.message || "");
+                if (!shouldRetryWithoutGranularity(message)) {
+                    throw firstError;
+                }
+                const withoutGranularity = await runRequest({ includeTimestampGranularity: false, modelName });
+                assertTranscriptionQuality(withoutGranularity, modelName);
+                return withoutGranularity;
+            }
+        } catch (error) {
+            failures.push(`${modelName}: ${String(error?.message || error).slice(0, 220)}`);
+        }
+    }
+
+    throw new Error(`OpenAI audio transcription failed across models. Attempts: ${failures.join(" | ")}`.slice(0, 3000));
+}
+
+async function requestStableTsAudioTranscription({
+    audioFilePath,
+    language,
+    selectedText,
+}) {
+    if (!STABLE_TS_LOCAL_ENABLED) {
+        throw new Error("stable-ts local provider is disabled (STABLE_TS_LOCAL_ENABLED=false).");
+    }
+
+    const scriptPath = String(STABLE_TS_ALIGN_SCRIPT || "").trim();
+    if (!scriptPath) {
+        throw new Error("Missing stable-ts alignment script path.");
+    }
+
+    const scriptStats = await fs.stat(scriptPath).catch(() => null);
+    if (!scriptStats || !scriptStats.isFile()) {
+        throw new Error(`stable-ts alignment script not found at ${scriptPath}`);
+    }
+
+    const args = [
+        scriptPath,
+        "--audio-path", audioFilePath,
+        "--model", STABLE_TS_MODEL,
+    ];
+    const normalizedLanguage = String(language || "").trim();
+    if (normalizedLanguage) {
+        args.push("--language", normalizedLanguage);
+    }
+    if (STABLE_TS_DEVICE) {
+        args.push("--device", STABLE_TS_DEVICE);
+    }
+    if (STABLE_TS_COMPUTE_TYPE) {
+        args.push("--compute-type", STABLE_TS_COMPUTE_TYPE);
+    }
+    const promptHint = String(selectedText || "").trim().slice(0, Math.max(0, PRECISION_ALIGN_MAX_PROMPT_CHARS));
+    if (promptHint) {
+        args.push("--prompt", promptHint);
+    }
+
+    const command = STABLE_TS_USE_ARCH_ARM64 ? "arch" : STABLE_TS_PYTHON_BIN;
+    const commandArgs = STABLE_TS_USE_ARCH_ARM64
+        ? ["-arm64", STABLE_TS_PYTHON_BIN, ...args]
+        : args;
+
+    let stdoutText = "";
+    try {
+        const result = await execFileAsync(command, commandArgs, {
+            timeout: Math.max(30000, STABLE_TS_TIMEOUT_MS),
+            maxBuffer: 12 * 1024 * 1024,
+            cwd: __dirname,
+            env: {
+                ...process.env,
+                PYTHONUNBUFFERED: "1",
+            },
+        });
+        stdoutText = String(result?.stdout || "").trim();
+    } catch (error) {
+        const stderrText = String(error?.stderr || "");
+        const stdoutFallback = String(error?.stdout || "");
+        const parsedStdoutPayload = parseLastJsonObjectFromText(stdoutFallback);
+        const payloadError = String(parsedStdoutPayload?.error || "").trim();
+        const stderrSummary = summarizeStableTsStderr(stderrText);
+        const processMeta = [
+            Number.isFinite(Number(error?.code)) ? `exit=${Number(error.code)}` : "",
+            error?.signal ? `signal=${String(error.signal)}` : "",
+            error?.killed ? "killed=true" : "",
+        ].filter(Boolean).join(", ");
+
+        let combined = (payloadError || stderrSummary || String(error?.message || "Unknown stable-ts error.")).trim();
+        if (processMeta) {
+            combined = `${combined} (${processMeta})`;
+        }
+
+        if (/killed=true/i.test(processMeta) || /signal=SIGKILL/i.test(processMeta)) {
+            combined = `${combined} Likely memory pressure while running local model. Try STABLE_TS_MODEL=small or base, then restart emulator.`;
+        }
+        if (
+            /stable_whisper import failed/i.test(combined) ||
+            /no module named ['"]stable_whisper['"]/i.test(combined) ||
+            /no module named ['"]torch['"]/i.test(combined)
+        ) {
+            combined = `${combined} Setup hint: run "npm run stable-ts:setup" from project root and restart the Functions emulator.`;
+        }
+        if (/spawn .* ENOENT/i.test(combined) || /no such file or directory/i.test(combined)) {
+            combined = `${combined} Verify STABLE_TS_PYTHON_BIN points to a real Python executable.`;
+        }
+        if (/numpy C-extensions failed/i.test(combined) || /Importing the numpy C-extensions failed/i.test(combined)) {
+            combined = `${combined} Setup hint: this is usually an architecture mismatch. On Apple Silicon, keep STABLE_TS_FORCE_ARM64=true and restart the Functions emulator.`;
+        }
+        throw new Error(`stable-ts alignment failed: ${combined.slice(0, 1800)}`);
+    }
+
+    if (!stdoutText) {
+        throw new Error("stable-ts alignment produced no output.");
+    }
+
+    const candidateLines = stdoutText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    let parsed = null;
+    for (let index = candidateLines.length - 1; index >= 0; index -= 1) {
+        const line = candidateLines[index];
+        try {
+            parsed = JSON.parse(line);
+            break;
+        } catch {
+            // continue scanning lines for JSON payload.
+        }
+    }
+    if (!parsed || typeof parsed !== "object") {
+        throw new Error("stable-ts alignment returned non-JSON output.");
+    }
+    if (parsed.success === false) {
+        throw new Error(String(parsed.error || "stable-ts alignment returned an error."));
+    }
+
+    const normalizedWords = Array.isArray(parsed.words)
+        ? parsed.words
+            .map((word) => {
+                const parsedWord = parseTimedWordEntry(word);
+                if (!parsedWord.text || !Number.isFinite(parsedWord.startSeconds) || !Number.isFinite(parsedWord.endSeconds)) {
+                    return null;
+                }
+                if (parsedWord.endSeconds <= parsedWord.startSeconds) return null;
+                return {
+                    word: parsedWord.text,
+                    start: Number(parsedWord.startSeconds.toFixed(4)),
+                    end: Number(parsedWord.endSeconds.toFixed(4)),
+                };
+            })
+            .filter(Boolean)
+        : [];
+
+    const transcriptText = String(parsed.text || "").trim();
+    const response = {
+        text: transcriptText,
+        words: normalizedWords,
+        segments: Array.isArray(parsed.segments) ? parsed.segments : [],
+        _modelUsed: String(parsed.modelUsed || STABLE_TS_MODEL),
+        _timedWordCount: normalizedWords.length,
+        _provider: ALIGNMENT_PROVIDER_STABLE_TS_LOCAL,
+    };
+
+    if (response._timedWordCount <= 0) {
+        throw new Error("stable-ts alignment returned no valid timed words.");
+    }
+    return response;
 }
 
 function ensureOpenAiApiKey() {
@@ -360,6 +1325,387 @@ function formatSecondsForSection(totalSeconds) {
     return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
 }
 
+function clampNumber(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+}
+
+function extractRenderedClipToken(value) {
+    const text = String(value || "").trim();
+    if (!text) return "";
+
+    try {
+        const parsed = new URL(text);
+        return String(parsed.searchParams.get("token") || "").trim();
+    } catch {
+        // not a URL
+    }
+
+    if (/^[0-9a-fA-F-]{36}$/.test(text)) {
+        return text;
+    }
+
+    return "";
+}
+
+async function getMediaDurationSeconds(filePath) {
+    const { stdout } = await execFileAsync("ffprobe", [
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        filePath,
+    ], {
+        timeout: 60 * 1000,
+        maxBuffer: 5 * 1024 * 1024,
+    });
+
+    const duration = Number(String(stdout || "").trim());
+    if (!Number.isFinite(duration) || duration <= 0) {
+        throw new Error("Unable to determine media duration.");
+    }
+    return duration;
+}
+
+function normalizeEffectsPreset(value) {
+    const text = String(value || "none").toLowerCase().trim();
+    if (["none", "cinematic", "vivid", "noir", "dream"].includes(text)) return text;
+    return "none";
+}
+
+function normalizeCaptionStylePreset(value) {
+    const text = String(value || "reel-bold").toLowerCase().trim();
+    if (["reel-bold", "clean-lower", "minimal", "pop-punch", "paint-reveal"].includes(text)) return text;
+    return "reel-bold";
+}
+
+function escapeDrawtextText(value) {
+    return String(value || "")
+        .replace(/\\/g, "\\\\")
+        .replace(/:/g, "\\:")
+        .replace(/,/g, "\\,")
+        .replace(/'/g, "\\'")
+        .replace(/%/g, "\\%")
+        .replace(/\[/g, "\\[")
+        .replace(/\]/g, "\\]")
+        .replace(/\n/g, "\\n")
+        .trim();
+}
+
+function normalizeCaptionCuesForRender(cues, clipDurationSeconds) {
+    if (!Array.isArray(cues)) return [];
+    const maxDuration = Number.isFinite(clipDurationSeconds) && clipDurationSeconds > 0
+        ? clipDurationSeconds
+        : Infinity;
+
+    return cues
+        .slice(0, Math.max(1, MAX_CAPTION_CUES_PER_ITEM))
+        .map((cue, index) => {
+            const text = String(cue?.text || "").replace(/\s+/g, " ").trim();
+            const startSeconds = Number(cue?.startSeconds);
+            const endSeconds = Number(cue?.endSeconds);
+            if (!text || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds)) return null;
+
+            const start = clampNumber(startSeconds, 0, maxDuration);
+            const end = clampNumber(endSeconds, start + 0.05, maxDuration);
+            if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+
+            return {
+                id: String(cue?.id || `cue-${index + 1}`),
+                text,
+                startSeconds: Number(start.toFixed(2)),
+                endSeconds: Number(end.toFixed(2)),
+            };
+        })
+        .filter(Boolean);
+}
+
+function splitCaptionWords(text) {
+    return String(text || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .split(" ")
+        .filter(Boolean)
+        .slice(0, 24);
+}
+
+function splitCaptionWindows(words, cueStart, cueEnd, maxWordsPerWindow = 5) {
+    const safeWords = Array.isArray(words) ? words.filter(Boolean) : [];
+    if (safeWords.length === 0) return [];
+    if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart) return [];
+
+    const normalizedWindowSize = Math.max(1, Math.floor(Number(maxWordsPerWindow) || 5));
+    const totalDuration = Math.max(0.12, cueEnd - cueStart);
+    const perWordDuration = totalDuration / safeWords.length;
+    const windows = [];
+
+    for (let startIndex = 0; startIndex < safeWords.length; startIndex += normalizedWindowSize) {
+        const endIndex = Math.min(safeWords.length, startIndex + normalizedWindowSize);
+        const windowStart = cueStart + perWordDuration * startIndex;
+        const rawWindowEnd = cueStart + perWordDuration * endIndex;
+        const windowEnd = endIndex >= safeWords.length ? cueEnd : Math.min(cueEnd, Math.max(windowStart + 0.08, rawWindowEnd));
+        windows.push({
+            words: safeWords.slice(startIndex, endIndex),
+            startSeconds: windowStart,
+            endSeconds: windowEnd,
+            perWordDuration,
+        });
+    }
+
+    return windows;
+}
+
+function buildTwoRowCaptionText(words, maxWords = 5) {
+    const safeWords = Array.isArray(words)
+        ? words.filter(Boolean).slice(0, Math.max(1, Math.floor(Number(maxWords) || 5)))
+        : [];
+    if (safeWords.length === 0) return "";
+    const splitIndex = Math.ceil(safeWords.length / 2);
+    const topRow = safeWords.slice(0, splitIndex).join(" ");
+    const bottomRow = safeWords.slice(splitIndex).join(" ");
+    return bottomRow ? `${topRow}\n${bottomRow}` : topRow;
+}
+
+function buildEffectFilters({ effectsPreset, effectsIntensity }) {
+    const preset = normalizeEffectsPreset(effectsPreset);
+    if (preset === "none") return [];
+
+    const intensity = clampNumber(Number(effectsIntensity) || 100, 0, 100) / 100;
+    if (preset === "cinematic") {
+        return [
+            `eq=contrast=${(1 + 0.16 * intensity).toFixed(3)}:saturation=${(1 + 0.12 * intensity).toFixed(3)}:brightness=${(0.015 * intensity).toFixed(3)}`,
+            `unsharp=5:5:${(0.35 + 0.55 * intensity).toFixed(3)}:5:5:0.000`,
+        ];
+    }
+    if (preset === "vivid") {
+        return [
+            `eq=contrast=${(1 + 0.12 * intensity).toFixed(3)}:saturation=${(1 + 0.28 * intensity).toFixed(3)}:gamma=${(1 + 0.04 * intensity).toFixed(3)}`,
+        ];
+    }
+    if (preset === "noir") {
+        return [
+            "hue=s=0",
+            `eq=contrast=${(1 + 0.2 * intensity).toFixed(3)}:brightness=${(0.02 * intensity).toFixed(3)}`,
+        ];
+    }
+    if (preset === "dream") {
+        return [
+            `gblur=sigma=${(0.4 + 1.6 * intensity).toFixed(3)}`,
+            `eq=brightness=${(0.025 * intensity).toFixed(3)}:saturation=${(1 + 0.08 * intensity).toFixed(3)}`,
+        ];
+    }
+    return [];
+}
+
+function buildCaptionDrawtextFilters({ captionCues, captionStylePreset }) {
+    const normalizedStyle = normalizeCaptionStylePreset(captionStylePreset);
+    let styleArgs = "fontcolor=white:fontsize=42:x=(w-text_w)/2:y=h-(text_h*2.2):line_spacing=8:box=1:boxcolor=black@0.58:boxborderw=16";
+    if (normalizedStyle === "clean-lower") {
+        styleArgs = "fontcolor=white:fontsize=34:x=(w-text_w)/2:y=h-(text_h*1.8):line_spacing=7:box=1:boxcolor=black@0.45:boxborderw=10";
+    } else if (normalizedStyle === "minimal") {
+        styleArgs = "fontcolor=white:fontsize=30:x=(w-text_w)/2:y=h-(text_h*1.6):line_spacing=6:box=1:boxcolor=black@0.3:boxborderw=6";
+    }
+    if (normalizedStyle === "pop-punch") {
+        const popStyleArgs = "fontcolor=white:fontsize=46:x=(w-text_w)/2:y=h-(text_h*2.1):line_spacing=8:box=1:boxcolor=0x7c3aed@0.78:boxborderw=14:borderw=2:bordercolor=white@0.95";
+        const settleStyleArgs = "fontcolor=white:fontsize=38:x=(w-text_w)/2:y=h-(text_h*2.1):line_spacing=8:box=1:boxcolor=black@0.62:boxborderw=12:borderw=1:bordercolor=white@0.42";
+        return captionCues
+            .flatMap((cue) => {
+                const cueStart = Number(cue.startSeconds);
+                const cueEnd = Number(cue.endSeconds);
+                const words = splitCaptionWords(cue.text);
+                const windows = splitCaptionWindows(words, cueStart, cueEnd, 5);
+                const filters = [];
+
+                for (const window of windows) {
+                    const localPerWord = window.perWordDuration;
+                    for (let index = 0; index < window.words.length; index += 1) {
+                        const stepStart = window.startSeconds + localPerWord * index;
+                        const rawStepEnd = index === window.words.length - 1
+                            ? window.endSeconds
+                            : window.startSeconds + localPerWord * (index + 1);
+                        const stepEnd = Math.min(window.endSeconds, Math.max(stepStart + 0.06, rawStepEnd));
+                        if (stepEnd <= stepStart) continue;
+
+                        const progressiveText = escapeDrawtextText(
+                            buildTwoRowCaptionText(window.words.slice(0, index + 1), 5)
+                        );
+                        if (!progressiveText) continue;
+
+                        const popEnd = Math.min(stepEnd, stepStart + Math.min(0.16, Math.max(0.08, (stepEnd - stepStart) * 0.8)));
+                        const settleStart = Math.min(stepEnd, stepStart + 0.05);
+                        filters.push(
+                            `drawtext=text='${progressiveText}':${popStyleArgs}:enable='between(t,${stepStart.toFixed(2)},${popEnd.toFixed(2)})'`
+                        );
+                        if (stepEnd - settleStart > 0.03) {
+                            filters.push(
+                                `drawtext=text='${progressiveText}':${settleStyleArgs}:enable='between(t,${settleStart.toFixed(2)},${stepEnd.toFixed(2)})'`
+                            );
+                        }
+                    }
+                }
+                return filters;
+            })
+            .filter(Boolean);
+    }
+    if (normalizedStyle === "paint-reveal") {
+        const paintStyleArgs = "fontcolor=white:fontsize=36:x=(w-text_w)/2:y=h-(text_h*2.1):line_spacing=8:box=1:boxcolor=0x111827@0.62:boxborderw=12:borderw=1:bordercolor=0x22d3ee@0.78";
+        return captionCues
+            .flatMap((cue) => {
+                const cueStart = Number(cue.startSeconds);
+                const cueEnd = Number(cue.endSeconds);
+                const words = splitCaptionWords(cue.text);
+                const windows = splitCaptionWindows(words, cueStart, cueEnd, 5);
+                const filters = [];
+
+                for (const window of windows) {
+                    const localPerWord = window.perWordDuration;
+                    for (let index = 0; index < window.words.length; index += 1) {
+                        const stepStart = window.startSeconds + localPerWord * index;
+                        const rawStepEnd = index === window.words.length - 1
+                            ? window.endSeconds
+                            : window.startSeconds + localPerWord * (index + 1);
+                        const stepEnd = Math.min(window.endSeconds, Math.max(stepStart + 0.06, rawStepEnd));
+                        if (stepEnd <= stepStart) continue;
+
+                        const progressiveText = escapeDrawtextText(
+                            buildTwoRowCaptionText(window.words.slice(0, index + 1), 5)
+                        );
+                        if (!progressiveText) continue;
+                        filters.push(
+                            `drawtext=text='${progressiveText}':${paintStyleArgs}:enable='between(t,${stepStart.toFixed(2)},${stepEnd.toFixed(2)})'`
+                        );
+                    }
+                }
+                return filters;
+            })
+            .filter(Boolean);
+    }
+
+    return captionCues
+        .map((cue) => {
+            const text = escapeDrawtextText(cue.text);
+            if (!text) return null;
+            return `drawtext=text='${text}':${styleArgs}:enable='between(t,${Number(cue.startSeconds).toFixed(2)},${Number(cue.endSeconds).toFixed(2)})'`;
+        })
+        .filter(Boolean);
+}
+
+function buildEditVideoFilter({ effectsPreset, effectsIntensity, captionCues, captionStylePreset }) {
+    const filters = [
+        `scale=${EDIT_RENDER_TARGET_WIDTH}:${EDIT_RENDER_TARGET_HEIGHT}:force_original_aspect_ratio=decrease`,
+        `pad=${EDIT_RENDER_TARGET_WIDTH}:${EDIT_RENDER_TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+        ...buildEffectFilters({ effectsPreset, effectsIntensity }),
+        ...buildCaptionDrawtextFilters({
+            captionCues: Array.isArray(captionCues) ? captionCues : [],
+            captionStylePreset,
+        }),
+        "format=yuv420p",
+    ];
+    return filters.join(",");
+}
+
+async function renderEditedClipSegment({
+    sourcePath,
+    trimStartSeconds,
+    trimEndSeconds,
+    tempDir,
+    index,
+    effectsPreset,
+    effectsIntensity,
+    captionCues,
+    captionStylePreset,
+}) {
+    const sourceDuration = await getMediaDurationSeconds(sourcePath);
+    const maxStart = Math.max(0, sourceDuration - 0.1);
+    const start = clampNumber(Number(trimStartSeconds) || 0, 0, maxStart);
+    const requestedEnd = Number(trimEndSeconds);
+    const end = Number.isFinite(requestedEnd)
+        ? clampNumber(requestedEnd, start + 0.1, sourceDuration)
+        : sourceDuration;
+    const clipDurationSeconds = Math.max(0.1, end - start);
+    const normalizedCaptionCues = normalizeCaptionCuesForRender(captionCues, clipDurationSeconds);
+
+    const outputPath = path.join(tempDir, `timeline-edit-${index + 1}.mp4`);
+    const args = [
+        "-y",
+        "-ss", start.toFixed(3),
+        "-to", end.toFixed(3),
+        "-i", sourcePath,
+        "-vf", buildEditVideoFilter({
+            effectsPreset,
+            effectsIntensity,
+            captionCues: normalizedCaptionCues,
+            captionStylePreset,
+        }),
+        "-r", "30",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-ac", "2",
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        outputPath,
+    ];
+
+    await execFileAsync("ffmpeg", args, {
+        timeout: 10 * 60 * 1000,
+        maxBuffer: 20 * 1024 * 1024,
+    });
+
+    const stats = await fs.stat(outputPath).catch(() => null);
+    if (!stats || !stats.isFile() || stats.size <= 0) {
+        throw new Error("Edited clip render produced no output file.");
+    }
+
+    return {
+        filePath: outputPath,
+        startSeconds: start,
+        endSeconds: end,
+    };
+}
+
+async function concatEditedClipFiles({ clipPaths, tempDir }) {
+    const validPaths = clipPaths.filter(Boolean);
+    if (validPaths.length === 0) {
+        throw new Error("No clip files available for montage rendering.");
+    }
+
+    if (validPaths.length === 1) {
+        return validPaths[0];
+    }
+
+    const concatListPath = path.join(tempDir, "timeline-concat-list.txt");
+    const concatListContents = validPaths
+        .map((clipPath) => `file '${clipPath.replace(/'/g, "'\\''")}'`)
+        .join("\n");
+    await fs.writeFile(concatListPath, concatListContents, "utf8");
+
+    const outputPath = path.join(tempDir, "timeline-montage.mp4");
+    await execFileAsync("ffmpeg", [
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concatListPath,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-c:a", "aac",
+        "-ac", "2",
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        outputPath,
+    ], {
+        timeout: 12 * 60 * 1000,
+        maxBuffer: 20 * 1024 * 1024,
+    });
+
+    const stats = await fs.stat(outputPath).catch(() => null);
+    if (!stats || !stats.isFile() || stats.size <= 0) {
+        throw new Error("Montage render produced no output file.");
+    }
+
+    return outputPath;
+}
+
 function normalizeClipForRender(rawClip, index) {
     const start = parseTimestampToSeconds(rawClip?.startTimestamp);
     const end = parseTimestampToSeconds(rawClip?.endTimestamp);
@@ -378,16 +1724,120 @@ function normalizeClipForRender(rawClip, index) {
     };
 }
 
+function getRenderedClipMetadataPath(token) {
+    return path.join(renderedClipStorageDir, `${token}.json`);
+}
+
+function normalizeRenderedClipEntry(value) {
+    if (!value || typeof value !== "object") return null;
+
+    const filePath = String(value.filePath || "").trim();
+    const fileName = String(value.fileName || "").trim();
+    const mimeType = String(value.mimeType || "").trim() || getMimeTypeFromExtension(filePath);
+    const expiresAt = Number(value.expiresAt);
+
+    if (!filePath || !fileName || !Number.isFinite(expiresAt)) {
+        return null;
+    }
+
+    return {
+        filePath,
+        fileName,
+        mimeType,
+        expiresAt,
+    };
+}
+
+async function removeRenderedClipArtifacts(token, entry = null) {
+    renderedClipStore.delete(token);
+
+    const normalized = normalizeRenderedClipEntry(entry);
+    if (normalized?.filePath) {
+        await fs.rm(normalized.filePath, { force: true }).catch(() => {});
+    }
+
+    const metadataPath = getRenderedClipMetadataPath(token);
+    await fs.rm(metadataPath, { force: true }).catch(() => {});
+}
+
+async function writeRenderedClipMetadata(token, entry) {
+    await fs.mkdir(renderedClipStorageDir, { recursive: true });
+    const metadataPath = getRenderedClipMetadataPath(token);
+    const payload = JSON.stringify({ token, ...entry });
+    await fs.writeFile(metadataPath, payload, "utf8");
+}
+
+async function loadRenderedClipEntry(token) {
+    const now = Date.now();
+    const cached = renderedClipStore.get(token);
+    if (cached && cached.expiresAt > now) {
+        return cached;
+    }
+
+    const metadataPath = getRenderedClipMetadataPath(token);
+    const rawMetadata = await fs.readFile(metadataPath, "utf8").catch(() => null);
+    if (!rawMetadata) {
+        renderedClipStore.delete(token);
+        return null;
+    }
+
+    let parsedMetadata;
+    try {
+        parsedMetadata = JSON.parse(rawMetadata);
+    } catch {
+        await removeRenderedClipArtifacts(token, null);
+        return null;
+    }
+
+    const entry = normalizeRenderedClipEntry(parsedMetadata);
+    if (!entry) {
+        await removeRenderedClipArtifacts(token, null);
+        return null;
+    }
+
+    if (entry.expiresAt <= now) {
+        await removeRenderedClipArtifacts(token, entry);
+        return null;
+    }
+
+    const stats = await fs.stat(entry.filePath).catch(() => null);
+    if (!stats || !stats.isFile()) {
+        await removeRenderedClipArtifacts(token, entry);
+        return null;
+    }
+
+    renderedClipStore.set(token, entry);
+    return entry;
+}
+
 async function cleanupExpiredRenderedClips() {
     const now = Date.now();
     const entries = [...renderedClipStore.entries()];
     for (const [token, entry] of entries) {
         if (entry.expiresAt > now) continue;
-        renderedClipStore.delete(token);
+        await removeRenderedClipArtifacts(token, entry);
+    }
+
+    const metadataNames = await fs.readdir(renderedClipStorageDir).catch(() => []);
+    for (const metadataName of metadataNames) {
+        if (!metadataName.endsWith(".json")) continue;
+
+        const metadataPath = path.join(renderedClipStorageDir, metadataName);
+        const token = metadataName.replace(/\.json$/, "");
+        const rawMetadata = await fs.readFile(metadataPath, "utf8").catch(() => null);
+        if (!rawMetadata) continue;
+
+        let parsedMetadata;
         try {
-            await fs.rm(entry.filePath, { force: true });
+            parsedMetadata = JSON.parse(rawMetadata);
         } catch {
-            // best effort cleanup
+            await removeRenderedClipArtifacts(token, null);
+            continue;
+        }
+
+        const entry = normalizeRenderedClipEntry(parsedMetadata);
+        if (!entry || entry.expiresAt <= now) {
+            await removeRenderedClipArtifacts(token, entry);
         }
     }
 }
@@ -794,14 +2244,13 @@ async function findRenderedVideoFile(tempDir, prefix) {
 }
 
 async function storeRenderedClipFile({ sourcePath, clipTitle, index }) {
-    const storageDir = path.join(os.tmpdir(), "church-of-fun-rendered-clips");
-    await fs.mkdir(storageDir, { recursive: true });
+    await fs.mkdir(renderedClipStorageDir, { recursive: true });
 
     const token = randomUUID();
     const extension = path.extname(sourcePath).toLowerCase() || ".mp4";
     const safeTitle = sanitizeFileName(clipTitle, `clip-${index + 1}`);
     const fileName = sanitizeFileName(`${safeTitle}-${index + 1}${extension}`, `clip-${index + 1}${extension}`);
-    const destinationPath = path.join(storageDir, `${token}${extension}`);
+    const destinationPath = path.join(renderedClipStorageDir, `${token}${extension}`);
 
     await fs.rename(sourcePath, destinationPath);
 
@@ -813,6 +2262,7 @@ async function storeRenderedClipFile({ sourcePath, clipTitle, index }) {
     };
 
     renderedClipStore.set(token, entry);
+    await writeRenderedClipMetadata(token, entry);
     await cleanupExpiredRenderedClips();
 
     return { token, ...entry };
@@ -833,7 +2283,7 @@ function toTranscriptResult(entries, meta) {
         text: entry.text,
     }));
 
-    const segments = applyTranscriptRules(rawSegments);
+    const segments = applyTranscriptRules(rawSegments, TRANSCRIPT_MAX_SEGMENTS_YOUTUBE);
     if (segments.length === 0) {
         throw new Error("Caption track returned no valid segments.");
     }
@@ -1115,7 +2565,7 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
     }
 }
 
-async function renderYouTubeClipSegment({ videoUrl, clip, tempDir, index }) {
+async function renderYouTubeClipSegment({ videoUrl, clip, tempDir, index, timeoutMs = 300000 }) {
     const cookiesFromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
     const clipPrefix = `render-${Date.now()}-${index + 1}`;
     const outputTemplate = path.join(tempDir, `${clipPrefix}.%(ext)s`);
@@ -1149,7 +2599,7 @@ async function renderYouTubeClipSegment({ videoUrl, clip, tempDir, index }) {
     try {
         await execFileAsync("yt-dlp", args, {
             cwd: tempDir,
-            timeout: 300000,
+            timeout: Math.max(20000, Number(timeoutMs) || 300000),
             maxBuffer: 20 * 1024 * 1024,
         });
     } catch (error) {
@@ -1360,19 +2810,15 @@ exports.downloadRenderedClip = onRequest(
                 return;
             }
 
-            const entry = renderedClipStore.get(token);
-            if (!entry || entry.expiresAt <= Date.now()) {
-                if (entry) {
-                    renderedClipStore.delete(token);
-                    await fs.rm(entry.filePath, { force: true }).catch(() => {});
-                }
+            const entry = await loadRenderedClipEntry(token);
+            if (!entry) {
                 response.status(404).json({ error: "Clip not found or expired." });
                 return;
             }
 
             const stats = await fs.stat(entry.filePath).catch(() => null);
             if (!stats || !stats.isFile()) {
-                renderedClipStore.delete(token);
+                await removeRenderedClipArtifacts(token, entry);
                 response.status(404).json({ error: "Clip file is unavailable." });
                 return;
             }
@@ -1482,6 +2928,466 @@ exports.renderYouTubeClips = onCall(
     }
 );
 
+exports.alignTranscriptSelection = onCall(
+    { cors: true, timeoutSeconds: 540, memory: "2GiB" },
+    async (request) => {
+        try {
+            const {
+                videoUrl,
+                startTimestamp,
+                endTimestamp,
+                selectedText,
+                transcriptLanguage,
+                bufferSeconds,
+                alignmentProvider,
+            } = request.data || {};
+
+            if (!videoUrl || !isLikelyYouTubeUrl(videoUrl)) {
+                throw new HttpsError("invalid-argument", "A valid YouTube videoUrl is required for precision alignment.");
+            }
+
+            const startSeconds = parseTimestampToSeconds(startTimestamp);
+            const endSeconds = parseTimestampToSeconds(endTimestamp);
+            if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) {
+                throw new HttpsError("invalid-argument", "Valid startTimestamp and endTimestamp are required.");
+            }
+
+            const alignmentProviderRequested = normalizeAlignmentProvider(alignmentProvider);
+            let alignmentProviderUsed = ALIGNMENT_PROVIDER_OPENAI;
+            let alignmentProviderFallbackMessage = "";
+            const normalizedBuffer = clampNumber(
+                Number.isFinite(Number(bufferSeconds)) ? Number(bufferSeconds) : PRECISION_ALIGN_BUFFER_SECONDS,
+                3,
+                45
+            );
+            const maxWindowSeconds = Math.max(
+                20,
+                Math.min(PRECISION_ALIGN_MAX_WINDOW_SECONDS, MAX_RENDER_SECONDS_PER_CLIP)
+            );
+            const minSelectionLength = Math.max(0.5, PRECISION_ALIGN_MIN_SELECTION_SECONDS);
+
+            const selectionStart = Math.max(0, startSeconds);
+            const selectionEnd = Math.max(selectionStart + minSelectionLength, endSeconds);
+            const selectionDuration = selectionEnd - selectionStart;
+
+            let windowStart = Math.max(0, selectionStart - normalizedBuffer);
+            let windowEnd = selectionEnd + normalizedBuffer;
+            if (windowEnd - windowStart > maxWindowSeconds) {
+                const center = (selectionStart + selectionEnd) / 2;
+                const halfWindow = maxWindowSeconds / 2;
+                windowStart = Math.max(0, center - halfWindow);
+                windowEnd = windowStart + maxWindowSeconds;
+            }
+            if (windowEnd - windowStart < selectionDuration + 1) {
+                windowEnd = windowStart + selectionDuration + 1;
+            }
+
+            const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "precision-align-"));
+            try {
+                const clip = normalizeClipForRender({
+                    title: "precision-align",
+                    startTimestamp: formatSecondsToTimestamp(windowStart),
+                    endTimestamp: formatSecondsToTimestamp(windowEnd),
+                }, 0);
+
+                const renderedWindow = await renderYouTubeClipSegment({
+                    videoUrl,
+                    clip,
+                    tempDir,
+                    index: 0,
+                    timeoutMs: PRECISION_ALIGN_RENDER_TIMEOUT_MS,
+                });
+                const audioPath = await extractAudioTrackForTranscription({
+                    sourceVideoPath: renderedWindow.filePath,
+                    tempDir,
+                });
+                let waveform = null;
+                try {
+                    const waveformPeaks = await extractWaveformPeaks({
+                        audioFilePath: audioPath,
+                        targetBins: 1400,
+                    });
+                    waveform = {
+                        ...waveformPeaks,
+                        windowStartSeconds: Number(clip.startSeconds.toFixed(3)),
+                        windowEndSeconds: Number(clip.endSeconds.toFixed(3)),
+                        windowStartTimestamp: formatSecondsToTimestamp(clip.startSeconds),
+                        windowEndTimestamp: formatSecondsToTimestamp(clip.endSeconds),
+                    };
+                } catch (waveformError) {
+                    console.warn("Unable to compute waveform peaks for precision alignment:", cleanYouTubeErrorMessage(waveformError));
+                }
+                const fallbackStartInWindow = Math.max(0, selectionStart - clip.startSeconds);
+                const fallbackEndInWindow = Math.max(
+                    fallbackStartInWindow + minSelectionLength,
+                    selectionEnd - clip.startSeconds
+                );
+                let stableOutcome = null;
+                let stableFailureReason = "";
+                const shouldTryStable = (
+                    alignmentProviderRequested === ALIGNMENT_PROVIDER_STABLE_TS_LOCAL ||
+                    alignmentProviderRequested === ALIGNMENT_PROVIDER_AB_COMPARE
+                );
+                if (shouldTryStable) {
+                    try {
+                        const stableTranscription = await requestStableTsAudioTranscription({
+                            audioFilePath: audioPath,
+                            language: transcriptLanguage,
+                            selectedText,
+                        });
+                        stableOutcome = buildAlignmentOutcomeFromTranscription({
+                            transcription: stableTranscription,
+                            selectedText,
+                            fallbackStartSeconds: fallbackStartInWindow,
+                            fallbackEndSeconds: fallbackEndInWindow,
+                            providerId: ALIGNMENT_PROVIDER_STABLE_TS_LOCAL,
+                            providerLabel: "stable-ts local",
+                        });
+                    } catch (stableError) {
+                        stableFailureReason = String(stableError?.message || stableError || "").trim();
+                        console.warn("stable-ts local alignment attempt failed:", stableFailureReason);
+                    }
+                }
+
+                let baselineOpenAiOutcome = null;
+                const strictStableOnlyMode = (
+                    alignmentProviderRequested === ALIGNMENT_PROVIDER_STABLE_TS_LOCAL &&
+                    STABLE_TS_DISABLE_OPENAI_FALLBACK
+                );
+                const shouldRunOpenAi = (
+                    alignmentProviderRequested === ALIGNMENT_PROVIDER_OPENAI ||
+                    alignmentProviderRequested === ALIGNMENT_PROVIDER_AB_COMPARE ||
+                    (!stableOutcome && !strictStableOnlyMode)
+                );
+                if (shouldRunOpenAi) {
+                    const apiKey = ensureOpenAiApiKey();
+                    const openAiTranscription = await requestOpenAiAudioTranscription({
+                        apiKey,
+                        audioFilePath: audioPath,
+                        selectedText,
+                        language: transcriptLanguage,
+                    });
+                    baselineOpenAiOutcome = buildAlignmentOutcomeFromTranscription({
+                        transcription: openAiTranscription,
+                        selectedText,
+                        fallbackStartSeconds: fallbackStartInWindow,
+                        fallbackEndSeconds: fallbackEndInWindow,
+                        providerId: ALIGNMENT_PROVIDER_OPENAI,
+                        providerLabel: "OpenAI fast",
+                    });
+                }
+
+                if (strictStableOnlyMode && !stableOutcome) {
+                    const reason = stableFailureReason || "stable-ts local runtime unavailable.";
+                    throw new Error(`High Accuracy (Local) failed with no OpenAI fallback. Reason: ${reason}`.slice(0, 1800));
+                }
+
+                if (!baselineOpenAiOutcome && !stableOutcome) {
+                    throw new Error("No alignment provider produced a valid result.");
+                }
+
+                let selectedOutcome = baselineOpenAiOutcome || stableOutcome;
+                if (alignmentProviderRequested === ALIGNMENT_PROVIDER_STABLE_TS_LOCAL) {
+                    if (stableOutcome) {
+                        selectedOutcome = stableOutcome;
+                        alignmentProviderUsed = ALIGNMENT_PROVIDER_STABLE_TS_LOCAL;
+                    } else if (baselineOpenAiOutcome) {
+                        selectedOutcome = baselineOpenAiOutcome;
+                        alignmentProviderUsed = ALIGNMENT_PROVIDER_OPENAI;
+                        const reason = stableFailureReason || "stable-ts local runtime unavailable.";
+                        alignmentProviderFallbackMessage = `High Accuracy (Local) unavailable. Used Fast OpenAI alignment instead. Reason: ${reason}`.slice(0, 600);
+                    }
+                } else if (alignmentProviderRequested === ALIGNMENT_PROVIDER_AB_COMPARE) {
+                    if (baselineOpenAiOutcome && stableOutcome) {
+                        selectedOutcome = stableOutcome.metrics.weightedScore >= baselineOpenAiOutcome.metrics.weightedScore
+                            ? stableOutcome
+                            : baselineOpenAiOutcome;
+                        alignmentProviderUsed = selectedOutcome.providerId;
+                    } else if (baselineOpenAiOutcome) {
+                        selectedOutcome = baselineOpenAiOutcome;
+                        alignmentProviderUsed = ALIGNMENT_PROVIDER_OPENAI;
+                        const reason = stableFailureReason || "stable-ts local runtime unavailable.";
+                        alignmentProviderFallbackMessage = `A/B compare used Fast OpenAI baseline only. High Accuracy local unavailable. Reason: ${reason}`.slice(0, 600);
+                    } else if (stableOutcome) {
+                        selectedOutcome = stableOutcome;
+                        alignmentProviderUsed = ALIGNMENT_PROVIDER_STABLE_TS_LOCAL;
+                    }
+                } else {
+                    selectedOutcome = baselineOpenAiOutcome || stableOutcome;
+                    alignmentProviderUsed = selectedOutcome?.providerId || ALIGNMENT_PROVIDER_OPENAI;
+                    if (alignmentProviderUsed === ALIGNMENT_PROVIDER_STABLE_TS_LOCAL && !baselineOpenAiOutcome) {
+                        alignmentProviderFallbackMessage = "Fast OpenAI alignment unavailable. Used local stable-ts output.";
+                    }
+                }
+
+                if (!selectedOutcome || !selectedOutcome.alignment || !Array.isArray(selectedOutcome.wordTimeline)) {
+                    throw new Error("Selected alignment outcome is invalid.");
+                }
+                const alignment = selectedOutcome.alignment;
+                const wordTimeline = selectedOutcome.wordTimeline;
+
+                const alignedStartSeconds = clampNumber(
+                    clip.startSeconds + alignment.startSeconds,
+                    clip.startSeconds,
+                    clip.endSeconds - minSelectionLength
+                );
+                const alignedEndSeconds = clampNumber(
+                    clip.startSeconds + alignment.endSeconds,
+                    alignedStartSeconds + minSelectionLength,
+                    clip.endSeconds
+                );
+                const alignedStartInWindow = Math.max(0, alignedStartSeconds - clip.startSeconds);
+                const alignedEndInWindow = Math.max(alignedStartInWindow + 0.02, alignedEndSeconds - clip.startSeconds);
+
+                const alignedWordCues = wordTimeline
+                    .map((word, index) => {
+                        const text = String(word?.token || "").trim();
+                        if (!text) return null;
+
+                        const rawWordStart = Number(word?.startSeconds);
+                        const rawWordEnd = Number(word?.endSeconds);
+                        if (!Number.isFinite(rawWordStart) || !Number.isFinite(rawWordEnd)) return null;
+
+                        const windowStart = Math.max(alignedStartInWindow, rawWordStart);
+                        const windowEnd = Math.min(alignedEndInWindow, rawWordEnd);
+                        if (!Number.isFinite(windowStart) || !Number.isFinite(windowEnd) || windowEnd <= windowStart) return null;
+
+                        const sourceStartSeconds = clip.startSeconds + windowStart;
+                        const sourceEndSeconds = clip.startSeconds + windowEnd;
+                        const relativeStart = sourceStartSeconds - alignedStartSeconds;
+                        const relativeEnd = sourceEndSeconds - alignedStartSeconds;
+                        if (!Number.isFinite(relativeStart) || !Number.isFinite(relativeEnd) || relativeEnd <= relativeStart) return null;
+
+                        return {
+                            id: `word-${index + 1}`,
+                            text,
+                            startSeconds: Number(relativeStart.toFixed(3)),
+                            endSeconds: Number(relativeEnd.toFixed(3)),
+                            sourceStartSeconds: Number(sourceStartSeconds.toFixed(3)),
+                            sourceEndSeconds: Number(sourceEndSeconds.toFixed(3)),
+                        };
+                    })
+                    .filter(Boolean)
+                    .slice(0, Math.max(50, MAX_CAPTION_CUES_PER_ITEM));
+
+                const alignmentComparison = {
+                    mode: alignmentProviderRequested,
+                    baseline: baselineOpenAiOutcome
+                        ? {
+                            provider: ALIGNMENT_PROVIDER_OPENAI,
+                            confidence: Number(baselineOpenAiOutcome.metrics.confidence || 0),
+                            coverage: Number(baselineOpenAiOutcome.metrics.coverage || 0),
+                            similarity: Number(baselineOpenAiOutcome.metrics.similarity || 0),
+                            strategy: String(baselineOpenAiOutcome.metrics.strategy || "unknown"),
+                            model: String(baselineOpenAiOutcome.modelUsed || OPENAI_TRANSCRIBE_MODEL),
+                            timedWordCount: Number(baselineOpenAiOutcome.timedWordCount || 0),
+                        }
+                        : null,
+                    candidate: alignmentProviderRequested === ALIGNMENT_PROVIDER_AB_COMPARE
+                        ? (
+                            stableOutcome
+                                ? {
+                                    provider: ALIGNMENT_PROVIDER_STABLE_TS_LOCAL,
+                                    available: true,
+                                    confidence: Number(stableOutcome.metrics.confidence || 0),
+                                    coverage: Number(stableOutcome.metrics.coverage || 0),
+                                    similarity: Number(stableOutcome.metrics.similarity || 0),
+                                    strategy: String(stableOutcome.metrics.strategy || "unknown"),
+                                    model: String(stableOutcome.modelUsed || STABLE_TS_MODEL),
+                                    timedWordCount: Number(stableOutcome.timedWordCount || 0),
+                                }
+                                : {
+                                    provider: ALIGNMENT_PROVIDER_STABLE_TS_LOCAL,
+                                    available: false,
+                                    reason: stableFailureReason ? "stable_ts_local_error" : "stable_ts_local_not_configured",
+                                    message: String(stableFailureReason || "stable-ts local unavailable"),
+                                }
+                        )
+                        : null,
+                    bestProvider: String(selectedOutcome.providerId || ALIGNMENT_PROVIDER_OPENAI),
+                };
+
+                return {
+                    success: true,
+                    provider: selectedOutcome.providerId === ALIGNMENT_PROVIDER_STABLE_TS_LOCAL
+                        ? "stable_ts_local_transcription"
+                        : "openai_audio_transcription",
+                    model: String(
+                        selectedOutcome.modelUsed ||
+                        (selectedOutcome.providerId === ALIGNMENT_PROVIDER_STABLE_TS_LOCAL ? STABLE_TS_MODEL : OPENAI_TRANSCRIBE_MODEL)
+                    ),
+                    timedWordCount: Number(selectedOutcome.timedWordCount || 0),
+                    alignmentProviderRequested,
+                    alignmentProviderUsed,
+                    alignmentProviderFallbackMessage,
+                    alignmentComparison,
+                    alignedStartSeconds,
+                    alignedEndSeconds,
+                    alignedStartTimestamp: formatSecondsToTimestamp(alignedStartSeconds),
+                    alignedEndTimestamp: formatSecondsToTimestamp(alignedEndSeconds),
+                    matchConfidence: Number(selectedOutcome.metrics.confidence || 0),
+                    matchCoverage: Number(selectedOutcome.metrics.coverage || 0),
+                    matchAverageSimilarity: Number(selectedOutcome.metrics.similarity || 0),
+                    matchProximity: Number(selectedOutcome.metrics.proximity || 0),
+                    matchStrategy: String(selectedOutcome.metrics.strategy || "unknown"),
+                    matchedText: String(alignment.matchedText || "").slice(0, 400),
+                    wordCount: wordTimeline.length,
+                    windowStartSeconds: clip.startSeconds,
+                    windowEndSeconds: clip.endSeconds,
+                    windowStartTimestamp: formatSecondsToTimestamp(clip.startSeconds),
+                    windowEndTimestamp: formatSecondsToTimestamp(clip.endSeconds),
+                    alignedWordCues,
+                    alignedWordCount: alignedWordCues.length,
+                    waveform,
+                };
+            } finally {
+                await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+            }
+        } catch (error) {
+            console.error("Error aligning transcript selection:", error);
+            if (error instanceof HttpsError) throw error;
+            throw new HttpsError("internal", "An error occurred while aligning transcript selection.", error.message);
+        }
+    }
+);
+
+exports.renderTimelineEdits = onCall(
+    { cors: true, timeoutSeconds: 540, memory: "2GiB" },
+    async (request) => {
+        try {
+            await cleanupExpiredRenderedClips();
+
+            const { mode, items, montageTitle } = request.data || {};
+            const normalizedMode = String(mode || "individual").toLowerCase() === "group" ? "group" : "individual";
+
+            if (!Array.isArray(items) || items.length === 0) {
+                throw new HttpsError("invalid-argument", "At least one timeline clip item is required.");
+            }
+
+            const limitedItems = items.slice(0, Math.max(1, MAX_TIMELINE_RENDER_ITEMS));
+            if (normalizedMode === "group" && limitedItems.length < 2) {
+                throw new HttpsError("invalid-argument", "At least 2 timeline clip items are required for group render.");
+            }
+            const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "timeline-edit-"));
+            const failures = [];
+            const renderedSegments = [];
+
+            try {
+                for (let index = 0; index < limitedItems.length; index += 1) {
+                    const item = limitedItems[index];
+                    const clipTitle = String(item?.title || `Edited Clip ${index + 1}`).trim() || `Edited Clip ${index + 1}`;
+
+                    try {
+                        const token = extractRenderedClipToken(item?.token || item?.downloadUrl || item?.url);
+                        if (!token) {
+                            throw new Error("Item does not reference a valid rendered clip token.");
+                        }
+
+                        const sourceEntry = await loadRenderedClipEntry(token);
+                        if (!sourceEntry) {
+                            throw new Error("Source clip not found or expired. Re-render the source clip first.");
+                        }
+
+                        const rendered = await renderEditedClipSegment({
+                            sourcePath: sourceEntry.filePath,
+                            trimStartSeconds: Number(item?.trimStartSeconds) || 0,
+                            trimEndSeconds: item?.trimEndSeconds,
+                            effectsPreset: item?.effectsPreset,
+                            effectsIntensity: item?.effectsIntensity,
+                            captionCues: item?.captionEnabled === false ? [] : item?.captionCues,
+                            captionStylePreset: item?.captionStylePreset,
+                            tempDir,
+                            index,
+                        });
+
+                        renderedSegments.push({
+                            ...rendered,
+                            title: clipTitle,
+                        });
+                    } catch (error) {
+                        failures.push({
+                            clipIndex: index + 1,
+                            title: clipTitle,
+                            error: String(error?.message || "Timeline render item failed."),
+                        });
+                    }
+                }
+
+                if (renderedSegments.length === 0) {
+                    const detail = failures[0]?.error || "No clips could be rendered.";
+                    throw new HttpsError("internal", `Unable to render edits. ${detail}`);
+                }
+
+                if (normalizedMode === "group") {
+                    const montagePath = await concatEditedClipFiles({
+                        clipPaths: renderedSegments.map((entry) => entry.filePath),
+                        tempDir,
+                    });
+
+                    const storedMontage = await storeRenderedClipFile({
+                        sourcePath: montagePath,
+                        clipTitle: String(montageTitle || "Montage").trim() || "Montage",
+                        index: 0,
+                    });
+
+                    return {
+                        success: true,
+                        mode: "group",
+                        montage: {
+                            fileName: storedMontage.fileName,
+                            downloadUrl: buildDownloadUrlForRequest(request, storedMontage.token),
+                            expiresAt: new Date(storedMontage.expiresAt).toISOString(),
+                            clipCount: renderedSegments.length,
+                        },
+                        renderedCount: renderedSegments.length,
+                        failureCount: failures.length,
+                        failures,
+                        clipsTruncated: items.length > limitedItems.length,
+                        maxTimelineRenderItems: Math.max(1, MAX_TIMELINE_RENDER_ITEMS),
+                    };
+                }
+
+                const clips = [];
+                for (let index = 0; index < renderedSegments.length; index += 1) {
+                    const segment = renderedSegments[index];
+                    const storedClip = await storeRenderedClipFile({
+                        sourcePath: segment.filePath,
+                        clipTitle: `${segment.title}-edited`,
+                        index,
+                    });
+
+                    clips.push({
+                        title: segment.title,
+                        startTimestamp: formatSecondsToTimestamp(segment.startSeconds),
+                        endTimestamp: formatSecondsToTimestamp(segment.endSeconds),
+                        fileName: storedClip.fileName,
+                        downloadUrl: buildDownloadUrlForRequest(request, storedClip.token),
+                        renderSource: "timeline_edit",
+                        expiresAt: new Date(storedClip.expiresAt).toISOString(),
+                    });
+                }
+
+                return {
+                    success: true,
+                    mode: "individual",
+                    clips,
+                    renderedCount: clips.length,
+                    failureCount: failures.length,
+                    failures,
+                    clipsTruncated: items.length > limitedItems.length,
+                    maxTimelineRenderItems: Math.max(1, MAX_TIMELINE_RENDER_ITEMS),
+                };
+            } finally {
+                await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+            }
+        } catch (error) {
+            console.error("Error rendering timeline edits:", error);
+            if (error instanceof HttpsError) throw error;
+            throw new HttpsError("internal", "An error occurred while rendering timeline edits.", error.message);
+        }
+    }
+);
+
 exports.generateTranscript = onCall({ cors: true }, async (request) => {
     try {
         const {
@@ -1490,6 +3396,7 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
             contentType,
             transcriptLanguage,
             allowOpenAiFallback,
+            forceOpenAiTranscript,
         } = request.data || {};
 
         if (!videoUrl) {
@@ -1499,37 +3406,42 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
         const normalizedContentType = normalizeContentType(contentType);
         const profileInstruction = CONTENT_PROFILE_INSTRUCTIONS[normalizedContentType];
         const canUseOpenAiFallback = allowOpenAiFallback !== false;
+        const shouldForceOpenAiTranscript = forceOpenAiTranscript === true;
         let youtubeFailureReason = "";
 
-        try {
-            const youtubeTranscript = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
-            if (youtubeTranscript && youtubeTranscript.segments.length > 0) {
-                console.log(
-                    `Using YouTube transcript provider ${youtubeTranscript.providerUsed} (${youtubeTranscript.segments.length} segments, ${youtubeTranscript.languageUsed}${youtubeTranscript.cacheHit ? ", cache hit" : ""}) for ${videoTitle || "Untitled"}`
-                );
-                return {
-                    success: true,
-                    contentType: normalizedContentType,
-                    transcriptSource: "youtube_caption",
-                    transcriptProviderUsed: youtubeTranscript.providerUsed,
-                    transcriptLanguageUsed: youtubeTranscript.languageUsed,
-                    cacheHit: Boolean(youtubeTranscript.cacheHit),
-                    segments: youtubeTranscript.segments,
-                };
+        if (!shouldForceOpenAiTranscript) {
+            try {
+                const youtubeTranscript = await tryGetYouTubeTranscript(videoUrl, transcriptLanguage);
+                if (youtubeTranscript && youtubeTranscript.segments.length > 0) {
+                    console.log(
+                        `Using YouTube transcript provider ${youtubeTranscript.providerUsed} (${youtubeTranscript.segments.length} segments, ${youtubeTranscript.languageUsed}${youtubeTranscript.cacheHit ? ", cache hit" : ""}) for ${videoTitle || "Untitled"}`
+                    );
+                    return {
+                        success: true,
+                        contentType: normalizedContentType,
+                        transcriptSource: "youtube_caption",
+                        transcriptProviderUsed: youtubeTranscript.providerUsed,
+                        transcriptLanguageUsed: youtubeTranscript.languageUsed,
+                        cacheHit: Boolean(youtubeTranscript.cacheHit),
+                        segments: youtubeTranscript.segments,
+                    };
+                }
+            } catch (youtubeError) {
+                youtubeFailureReason = youtubeError.message || "Unknown YouTube caption error.";
+                console.warn("YouTube transcript provider failed.", youtubeError.message);
             }
-        } catch (youtubeError) {
-            youtubeFailureReason = youtubeError.message || "Unknown YouTube caption error.";
-            console.warn("YouTube transcript provider failed.", youtubeError.message);
         }
 
-        if (!canUseOpenAiFallback && isLikelyYouTubeUrl(videoUrl)) {
+        if (!canUseOpenAiFallback && isLikelyYouTubeUrl(videoUrl) && !shouldForceOpenAiTranscript) {
             throw new HttpsError(
                 "failed-precondition",
                 `YouTube captions were not available and AI fallback is disabled. ${youtubeFailureReason}`.trim()
             );
         }
 
-        if (isLikelyYouTubeUrl(videoUrl)) {
+        if (shouldForceOpenAiTranscript) {
+            console.log(`Using forced OpenAI transcript mode for ${videoTitle || "Untitled"}.`);
+        } else if (isLikelyYouTubeUrl(videoUrl)) {
             console.log(`Falling back to OpenAI transcript for ${videoTitle || "Untitled"} because YouTube captions were unavailable.`);
         }
 
@@ -1556,7 +3468,7 @@ exports.generateTranscript = onCall({ cors: true }, async (request) => {
         });
 
         const rawSegments = Array.isArray(parsed.segments) ? parsed.segments : [];
-        const segments = applyTranscriptRules(rawSegments);
+        const segments = applyTranscriptRules(rawSegments, TRANSCRIPT_MAX_SEGMENTS_OPENAI);
 
         if (segments.length === 0) {
             throw new Error("No valid transcript segments returned by model.");
