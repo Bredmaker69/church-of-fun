@@ -26,6 +26,8 @@ const TRANSCRIPT_CACHE_MAX_ENTRIES = Number(process.env.TRANSCRIPT_CACHE_MAX_ENT
 const RENDERED_CLIP_TTL_SECONDS = Number(process.env.RENDERED_CLIP_TTL_SECONDS || 1800);
 const MAX_RENDER_CLIPS_PER_REQUEST = Number(process.env.MAX_RENDER_CLIPS_PER_REQUEST || 8);
 const MAX_RENDER_SECONDS_PER_CLIP = Number(process.env.MAX_RENDER_SECONDS_PER_CLIP || 120);
+const YTDLP_TRANSCRIPT_COOKIE_FALLBACK =
+    String(process.env.YTDLP_TRANSCRIPT_COOKIE_FALLBACK || "true").toLowerCase() !== "false";
 const OPENAI_TRANSCRIBE_MODEL = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-transcribe";
 const OPENAI_TRANSCRIBE_TIMEOUT_MS = Number(process.env.OPENAI_TRANSCRIBE_TIMEOUT_MS || 90000);
 const STABLE_TS_LOCAL_ENABLED = String(process.env.STABLE_TS_LOCAL_ENABLED || "true").toLowerCase() === "true";
@@ -2496,68 +2498,87 @@ async function fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, language) {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "yt-captions-"));
     try {
         const cookiesFromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || "").trim();
-        const args = [
-            "--no-update",
-            "--ignore-errors",
-            "--skip-download",
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-format",
-            "vtt",
-            "--sub-langs",
-            langSpec,
-            "--output",
-            "%(id)s.%(ext)s",
-        ];
-
-        if (cookiesFromBrowser) {
-            args.push("--cookies-from-browser", cookiesFromBrowser);
+        // Default to cookie-free transcript fetch for speed/reliability.
+        // Optionally retry with browser cookies only as fallback.
+        const attemptCookieModes = [""];
+        if (cookiesFromBrowser && YTDLP_TRANSCRIPT_COOKIE_FALLBACK) {
+            attemptCookieModes.push(cookiesFromBrowser);
         }
 
-        args.push(targetUrl);
+        const uniqueCookieModes = [...new Set(attemptCookieModes)];
+        const attemptErrors = [];
 
-        let execError = null;
-        try {
-            await execFileAsync("yt-dlp", args, {
-                cwd: tempDir,
-                timeout: 45000,
-                maxBuffer: 20 * 1024 * 1024,
-            });
-        } catch (error) {
-            // Some subtitle downloads can fail (e.g., rate-limited language variants) while desired files are still written.
-            execError = error;
-        }
+        for (const cookieMode of uniqueCookieModes) {
+            const args = [
+                "--no-update",
+                "--ignore-config",
+                "--ignore-errors",
+                "--no-playlist",
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--sub-format",
+                "vtt",
+                "--sub-langs",
+                langSpec,
+                "--output",
+                "%(id)s.%(ext)s",
+            ];
 
-        const fileNames = await fs.readdir(tempDir);
-        const vttFiles = rankSubtitleFiles(
-            fileNames.filter((name) => name.toLowerCase().endsWith(".vtt")),
-            preferredLanguage
-        );
-
-        if (vttFiles.length === 0) {
-            if (execError) {
-                throw new Error(`yt-dlp did not produce subtitle files. ${summarizeExecError(execError)}`);
+            if (cookieMode) {
+                args.push("--cookies-from-browser", cookieMode);
             }
-            throw new Error("yt-dlp did not produce subtitle files.");
-        }
 
-        for (const fileName of vttFiles) {
-            const body = await fs.readFile(path.join(tempDir, fileName), "utf8");
-            const entries = parseVttTranscript(body, inferLanguageFromSubtitleFileName(fileName));
-            if (entries.length > 0) {
-                return toTranscriptResult(entries, {
-                    videoId,
-                    languageUsed: inferLanguageFromSubtitleFileName(fileName),
-                    provider: "yt-dlp-vtt",
-                    attemptMode: preferredLanguage ? "language" : "auto",
+            args.push(targetUrl);
+
+            const attemptDir = await fs.mkdtemp(path.join(tempDir, cookieMode ? "with-cookies-" : "without-cookies-"));
+
+            let execError = null;
+            try {
+                await execFileAsync("yt-dlp", args, {
+                    cwd: attemptDir,
+                    timeout: 45000,
+                    maxBuffer: 20 * 1024 * 1024,
                 });
+            } catch (error) {
+                // Some subtitle downloads can fail (e.g., rate-limited language variants) while desired files are still written.
+                execError = error;
             }
+
+            const fileNames = await fs.readdir(attemptDir);
+            const vttFiles = rankSubtitleFiles(
+                fileNames.filter((name) => name.toLowerCase().endsWith(".vtt")),
+                preferredLanguage
+            );
+
+            if (vttFiles.length === 0) {
+                const reason = execError
+                    ? `yt-dlp did not produce subtitle files. ${summarizeExecError(execError)}`
+                    : "yt-dlp did not produce subtitle files.";
+                attemptErrors.push(`${cookieMode ? "cookies" : "no-cookies"}: ${reason}`);
+                continue;
+            }
+
+            for (const fileName of vttFiles) {
+                const body = await fs.readFile(path.join(attemptDir, fileName), "utf8");
+                const entries = parseVttTranscript(body, inferLanguageFromSubtitleFileName(fileName));
+                if (entries.length > 0) {
+                    return toTranscriptResult(entries, {
+                        videoId,
+                        languageUsed: inferLanguageFromSubtitleFileName(fileName),
+                        provider: "yt-dlp-vtt",
+                        attemptMode: preferredLanguage ? "language" : "auto",
+                    });
+                }
+            }
+
+            const reason = execError
+                ? `yt-dlp subtitle files were unreadable. ${summarizeExecError(execError)}`
+                : "yt-dlp subtitle files contained no transcript text.";
+            attemptErrors.push(`${cookieMode ? "cookies" : "no-cookies"}: ${reason}`);
         }
 
-        if (execError) {
-            throw new Error(`yt-dlp subtitle files were unreadable. ${summarizeExecError(execError)}`);
-        }
-        throw new Error("yt-dlp subtitle files contained no transcript text.");
+        throw new Error(attemptErrors.join(" || ").slice(0, 2000) || "yt-dlp subtitle files contained no transcript text.");
     } catch (error) {
         throw new Error(`yt-dlp provider failed: ${summarizeExecError(error)}`);
     } finally {
@@ -2649,15 +2670,19 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
         langAttempts.push("en");
     }
 
-    const providerAttempts = [
-        { name: "yt-dlp", run: (lang) => fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, lang) },
-    ];
+    const providerAttempts = [];
 
-    // Optional legacy providers if yt-dlp fails and this flag is explicitly enabled.
-    if (process.env.ENABLE_LEGACY_YOUTUBE_PROVIDERS === "true") {
+    // Try direct caption providers first to avoid yt-dlp JS challenge regressions.
+    if (process.env.ENABLE_LEGACY_YOUTUBE_PROVIDERS !== "false") {
         providerAttempts.push(
             { name: "youtube-transcript", run: (lang) => fetchYouTubeTranscriptWithLibrary(videoId, lang) },
             { name: "watch-page", run: (lang) => fetchYouTubeTranscriptViaWatchPage(videoId, lang) }
+        );
+    }
+
+    if (process.env.ENABLE_YTDLP_TRANSCRIPT !== "false") {
+        providerAttempts.push(
+            { name: "yt-dlp", run: (lang) => fetchYouTubeTranscriptViaYtDlp(videoId, videoUrl, lang) }
         );
     }
 
@@ -2679,12 +2704,14 @@ async function tryGetYouTubeTranscript(videoUrl, preferredLanguage) {
                 setCachedYouTubeTranscript(cacheKey, result);
                 return result;
             } catch (error) {
-                errors.push(`${provider.name}:${lang || "auto"}: ${cleanYouTubeErrorMessage(error)}`);
+                const summary = cleanYouTubeErrorMessage(error).slice(0, 220);
+                errors.push(`${provider.name}:${lang || "auto"}: ${summary}`);
             }
         }
     }
 
-    throw new Error(`No usable YouTube captions found. Attempts: ${errors.join(" | ")}`.slice(0, 3000));
+    const compactErrors = errors.slice(0, 12).join(" | ");
+    throw new Error(`No usable YouTube captions found. Attempts: ${compactErrors}`.slice(0, 3000));
 }
 
 exports.generateClips = onCall({ cors: true }, async (request) => {
