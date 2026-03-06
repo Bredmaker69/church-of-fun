@@ -83,12 +83,9 @@ const Sidebar = ({
                 </div>
 
                 <div className="text-xs text-slate-500 dark:text-slate-400">
-                    Shortcuts: <span className="font-semibold">I</span> mark start, <span className="font-semibold">O</span> mark end.
+                    Shortcuts: <span className="font-semibold">Ctrl+T</span> cut at playhead, <span className="font-semibold">I</span> mark start, <span className="font-semibold">O</span> mark end.
                 </div>
             </section>
-
-            <div className="h-px bg-slate-200 dark:bg-slate-800" />
-
             <nav className="flex flex-col gap-2 flex-1">
                 <div className="text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-2 px-4">Workspace</div>
                 <button
@@ -115,41 +112,7 @@ const Sidebar = ({
                     <span className="material-symbols-outlined text-[20px]">inventory_2</span>
                     Clip Vault
                 </button>
-
-                <div className="text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider mt-3 mb-1 px-4">Library</div>
-                <a href="#" className="flex items-center gap-3 px-4 py-3 rounded-xl text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50 transition-colors">
-                    <span className="material-symbols-outlined text-[20px]">movie</span>
-                    Source Videos
-                </a>
-                <a href="#" className="flex items-center gap-3 px-4 py-3 rounded-xl text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50 transition-colors">
-                    <span className="material-symbols-outlined text-[20px]">content_cut</span>
-                    Clips <span className="ml-auto bg-primary/20 text-primary text-xs px-2 py-0.5 rounded-full font-bold">12</span>
-                </a>
-                <a href="#" className="flex items-center gap-3 px-4 py-3 rounded-xl text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50 transition-colors">
-                    <span className="material-symbols-outlined text-[20px]">analytics</span>
-                    Analytics
-                </a>
-                <a href="#" className="flex items-center gap-3 px-4 py-3 rounded-xl text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50 transition-colors">
-                    <span className="material-symbols-outlined text-[20px]">settings</span>
-                    Settings
-                </a>
             </nav>
-
-            <div className="mt-auto">
-                <div className="glass rounded-2xl p-4 relative overflow-hidden group">
-                    <div className="absolute inset-0 bg-gradient-to-br from-primary/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
-                    <div className="flex items-center gap-3 relative z-10">
-                        <span className="material-symbols-outlined text-accent-neon">bolt</span>
-                        <div className="flex flex-col">
-                            <span className="text-sm font-bold text-slate-800 dark:text-slate-200">Pro Plan</span>
-                            <span className="text-xs text-slate-500">24/100 hrs used</span>
-                        </div>
-                    </div>
-                    <div className="w-full bg-slate-200 dark:bg-slate-800 h-1.5 rounded-full mt-3 overflow-hidden">
-                        <div className="bg-gradient-to-r from-primary to-accent-neon h-full w-[24%]" />
-                    </div>
-                </div>
-            </div>
         </aside>
     );
 };

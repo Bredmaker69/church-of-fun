@@ -5,12 +5,9 @@ import { functions } from '../firebase';
 const DND_PAYLOAD_KEY = 'application/x-clip-vault';
 const MEDIA_BIN_MIN_WIDTH = 240;
 const MEDIA_BIN_MAX_WIDTH = 520;
-const INSPECTOR_MIN_WIDTH = 260;
-const INSPECTOR_MAX_WIDTH = 560;
 const MONITOR_MIN_HEIGHT = 240;
 const MONITOR_MAX_HEIGHT = 760;
 const TRIM_MIN_GAP_SECONDS = 0.1;
-const TRIM_NUDGE_SECONDS = 0.25;
 const TRIM_HANDLE_WIDTH_PX = 10;
 const MAX_TIMELINE_RENDER_ITEMS = 100;
 const TIMELINE_BASE_PX_PER_SECOND = 24;
@@ -18,22 +15,6 @@ const TIMELINE_MIN_PX_PER_SECOND = 8;
 const TIMELINE_MAX_PX_PER_SECOND = 260;
 const TIMELINE_ROW_HEIGHT_PX = 94;
 const TIMELINE_RULER_HEIGHT_PX = 28;
-
-const EFFECT_PRESETS = [
-  { value: 'none', label: 'None' },
-  { value: 'cinematic', label: 'Cinematic' },
-  { value: 'vivid', label: 'Vivid' },
-  { value: 'noir', label: 'Noir' },
-  { value: 'dream', label: 'Dream' },
-];
-
-const CAPTION_STYLE_PRESETS = [
-  { value: 'reel-bold', label: 'Reel Bold' },
-  { value: 'clean-lower', label: 'Clean Lower Third' },
-  { value: 'minimal', label: 'Minimal' },
-  { value: 'pop-punch', label: 'Pop On Punch' },
-  { value: 'paint-reveal', label: 'Paint On Reveal' },
-];
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -60,131 +41,6 @@ const formatCaptionTwoRows = (words, maxWords = 5) => {
   const topRow = safeWords.slice(0, splitIndex).join(' ');
   const bottomRow = safeWords.slice(splitIndex).join(' ');
   return bottomRow ? `${topRow}\n${bottomRow}` : topRow;
-};
-
-const toAssTimecode = (secondsRaw) => {
-  const total = Math.max(0, Number(secondsRaw) || 0);
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const seconds = total % 60;
-  return `${hours}:${String(minutes).padStart(2, '0')}:${seconds.toFixed(2).padStart(5, '0')}`;
-};
-
-const escapeAssText = (value) => {
-  return String(value || '')
-    .replace(/\\/g, '\\\\')
-    .replace(/{/g, '\\{')
-    .replace(/}/g, '\\}')
-    .replace(/\r?\n/g, '\\N')
-    .trim();
-};
-
-const splitCueIntoKaraokeWords = (cue) => {
-  const words = splitCaptionWords(cue?.text || '');
-  const cueStart = Number(cue?.startSeconds);
-  const cueEnd = Number(cue?.endSeconds);
-  if (words.length === 0 || !Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart) {
-    return [];
-  }
-  const perWord = (cueEnd - cueStart) / words.length;
-  return words.map((word, index) => {
-    const startSeconds = cueStart + perWord * index;
-    const endSeconds = index === words.length - 1 ? cueEnd : cueStart + perWord * (index + 1);
-    return {
-      text: word,
-      startSeconds,
-      endSeconds: Math.max(startSeconds + 0.03, endSeconds),
-    };
-  });
-};
-
-const buildWordWindowsFromCues = (cues, maxWordsPerWindow = 5) => {
-  const words = Array.isArray(cues)
-    ? cues
-      .flatMap((cue) => splitCueIntoKaraokeWords(cue))
-      .filter((word) => Number.isFinite(word.startSeconds) && Number.isFinite(word.endSeconds) && word.endSeconds > word.startSeconds)
-      .sort((left, right) => left.startSeconds - right.startSeconds)
-    : [];
-  if (words.length === 0) return [];
-
-  const windows = [];
-  for (let index = 0; index < words.length; index += maxWordsPerWindow) {
-    const chunk = words.slice(index, index + maxWordsPerWindow);
-    if (chunk.length === 0) continue;
-    windows.push({
-      startSeconds: chunk[0].startSeconds,
-      endSeconds: chunk[chunk.length - 1].endSeconds,
-      words: chunk,
-    });
-  }
-  return windows;
-};
-
-const getAssStyleDefinition = (stylePreset) => {
-  const preset = String(stylePreset || '').trim();
-  if (preset === 'pop-punch') {
-    return 'ReelPop,Arial Black,72,&H00FFFFFF,&H0000FF00,&H00222222,&H00000000,1,0,0,0,100,100,0,0,1,4,0,2,60,60,70,1';
-  }
-  if (preset === 'paint-reveal') {
-    return 'ReelPop,Montserrat,64,&H00E6F7FF,&H00FFD36E,&H00141414,&H00000000,1,0,0,0,100,100,0,0,1,4,0,2,60,60,70,1';
-  }
-  if (preset === 'clean-lower') {
-    return 'ReelPop,Arial,56,&H00FFFFFF,&H0000FFFF,&H00111111,&H00000000,0,0,0,0,100,100,0,0,1,3,0,2,50,50,50,1';
-  }
-  if (preset === 'minimal') {
-    return 'ReelPop,Arial,52,&H00FFFFFF,&H00D0D0D0,&H00111111,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,50,50,50,1';
-  }
-  return 'ReelPop,Arial Bold,64,&H00FFFFFF,&H0000FF00,&H00202020,&H00000000,1,0,0,0,100,100,0,0,1,4,0,2,50,50,60,1';
-};
-
-const buildAssFromCaptionPayload = ({ title, captionPayload }) => {
-  const cues = Array.isArray(captionPayload?.cues) ? captionPayload.cues : [];
-  if (cues.length === 0) return '';
-
-  const windows = buildWordWindowsFromCues(cues, 5);
-  if (windows.length === 0) return '';
-
-  const styleDefinition = getAssStyleDefinition(captionPayload?.stylePreset);
-  const header = [
-    '[Script Info]',
-    `Title: ${String(title || 'Clip Captions')}`,
-    'ScriptType: v4.00+',
-    'WrapStyle: 2',
-    'PlayResX: 1080',
-    'PlayResY: 1920',
-    '',
-    '[V4+ Styles]',
-    'Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding',
-    `Style: ${styleDefinition}`,
-    '',
-    '[Events]',
-    'Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text',
-  ];
-
-  const lines = windows.map((window) => {
-    const karaokeText = window.words
-      .map((word) => {
-        const durationCs = Math.max(1, Math.round((word.endSeconds - word.startSeconds) * 100));
-        return `{\\k${durationCs}}${escapeAssText(word.text)}`;
-      })
-      .join(' ');
-    return `Dialogue: 0,${toAssTimecode(window.startSeconds)},${toAssTimecode(window.endSeconds)},ReelPop,,0,0,0,,${karaokeText}`;
-  });
-
-  return `${header.join('\n')}\n${lines.join('\n')}\n`;
-};
-
-const downloadTextFile = ({ fileName, content, mimeType = 'text/plain;charset=utf-8' }) => {
-  const blob = new Blob([String(content || '')], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = String(fileName || 'captions.ass');
-  anchor.style.display = 'none';
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
 };
 
 const parseTimestampToSeconds = (value) => {
@@ -472,7 +328,6 @@ const ClipVaultWorkspace = ({
   onAddClipToProject,
   onMoveTimelineItem,
   onUpdateTimelineItem,
-  onSplitTimelineItem,
   mediaStats = { totalBytes: 0, clipCount: 0 },
 }) => {
   const previewRef = useRef(null);
@@ -492,14 +347,11 @@ const ClipVaultWorkspace = ({
   const [selectedTimelineItemId, setSelectedTimelineItemId] = useState('');
   const [currentPreviewTime, setCurrentPreviewTime] = useState(0);
   const [mediaBinWidth, setMediaBinWidth] = useState(300);
-  const [inspectorWidth, setInspectorWidth] = useState(320);
   const [monitorHeight, setMonitorHeight] = useState(360);
   const [isMediaBinCollapsed, setIsMediaBinCollapsed] = useState(false);
-  const [isInspectorCollapsed, setIsInspectorCollapsed] = useState(false);
   const [previewMode, setPreviewMode] = useState('selected');
   const [isTimelinePlaying, setIsTimelinePlaying] = useState(false);
   const [playbackTimelineItemId, setPlaybackTimelineItemId] = useState('');
-  const [isRenderingEditedSelection, setIsRenderingEditedSelection] = useState(false);
   const [isRenderingEditedGroup, setIsRenderingEditedGroup] = useState(false);
   const [renderedEditDownloads, setRenderedEditDownloads] = useState([]);
   const [timelineZoom, setTimelineZoom] = useState(1.25);
@@ -647,46 +499,6 @@ const ClipVaultWorkspace = ({
     });
   }, [mediaSearchQuery, projectScopedVaultClips]);
 
-  const selectedClip = selectedTimelineEntry?.clip || null;
-  const selectedTimelineItem = selectedTimelineEntry?.item || null;
-
-  const selectedClipDuration = useMemo(() => {
-    if (!selectedClip) return null;
-    return getClipDurationSeconds(selectedClip);
-  }, [selectedClip]);
-  const selectedEffectsPreset = String(selectedTimelineItem?.effectsPreset || 'none');
-  const selectedEffectsIntensity = clamp(Number(selectedTimelineItem?.effectsIntensity) || 100, 0, 100);
-  const selectedCaptionEnabled = selectedTimelineItem?.captionEnabled !== false;
-  const selectedCaptionStylePreset = String(
-    selectedTimelineItem?.captionStylePreset || selectedClip?.captionStylePreset || 'reel-bold'
-  );
-  const selectedCaptionTextOverride = String(selectedTimelineItem?.captionTextOverride || '');
-  const selectedCaptionConfirmationStatus = String(selectedTimelineItem?.captionConfirmationStatus || 'pending');
-  const selectedCaptionConfirmedText = normalizeCaptionText(selectedTimelineItem?.captionConfirmedText || '');
-  const selectedCaptionPayload = useMemo(() => {
-    if (!selectedTimelineEntry) return { enabled: false, stylePreset: 'reel-bold', cues: [] };
-    return buildCaptionPayloadForEntry(selectedTimelineEntry);
-  }, [selectedTimelineEntry]);
-  const selectedCaptionCueCount = selectedCaptionPayload?.cues?.length || 0;
-  const selectedAutoCaptionText = useMemo(() => {
-    if (!selectedTimelineEntry) return '';
-    const payload = buildCaptionPayloadForEntry(selectedTimelineEntry, { preferOverride: false });
-    const uniqueParts = [];
-    const seen = new Set();
-    payload.cues.forEach((cue) => {
-      const text = normalizeCaptionText(cue?.text || '');
-      if (!text || seen.has(text)) return;
-      seen.add(text);
-      uniqueParts.push(text);
-    });
-    const fallback = normalizeCaptionText(
-      selectedTimelineEntry.clip?.transcriptSelectedText
-      || selectedTimelineEntry.clip?.transcriptSnippet
-      || selectedTimelineEntry.clip?.description
-      || ''
-    );
-    return normalizeCaptionText(uniqueParts.join(' ') || fallback);
-  }, [selectedTimelineEntry]);
   const renderableTimelineItemCount = useMemo(() => {
     return timelineEntries.reduce((count, entry) => (
       extractRenderedClipToken(getClipRenderUrl(entry?.clip)) ? count + 1 : count
@@ -1003,148 +815,6 @@ const ClipVaultWorkspace = ({
     };
   }, []);
 
-  const confirmSelectedCaptionText = useCallback(() => {
-    if (!selectedProjectId || !selectedTimelineEntry) {
-      setLocalStatus('Select a timeline clip to confirm text.');
-      return;
-    }
-
-    const payload = buildCaptionPayloadForEntry(selectedTimelineEntry, { preferOverride: false });
-    const uniqueTexts = [];
-    const seen = new Set();
-    payload.cues.forEach((cue) => {
-      const text = normalizeCaptionText(cue?.text || '');
-      if (!text || seen.has(text)) return;
-      seen.add(text);
-      uniqueTexts.push(text);
-    });
-
-    const fallbackText = normalizeCaptionText(
-      selectedTimelineEntry.item?.captionTextOverride
-      || selectedTimelineEntry.clip?.transcriptSelectedText
-      || selectedTimelineEntry.clip?.transcriptSnippet
-      || selectedTimelineEntry.clip?.description
-      || ''
-    );
-    const confirmedText = normalizeCaptionText(uniqueTexts.join(' ') || fallbackText);
-
-    if (!confirmedText) {
-      setLocalStatus('No caption text could be confirmed for this range.');
-      return;
-    }
-
-    onUpdateTimelineItem?.(selectedProjectId, selectedTimelineEntry.item.id, {
-      captionConfirmationStatus: 'confirmed',
-      captionConfirmedText: confirmedText,
-      captionConfirmedAt: new Date().toISOString(),
-    });
-    setLocalStatus('Caption text confirmed for this trimmed range.');
-  }, [onUpdateTimelineItem, selectedProjectId, selectedTimelineEntry]);
-
-  const downloadSelectedCaptionAss = useCallback(() => {
-    if (!selectedTimelineEntry) {
-      setLocalStatus('Select a timeline clip first.');
-      return;
-    }
-    if (!selectedCaptionEnabled) {
-      setLocalStatus('Captions are disabled for this timeline item.');
-      return;
-    }
-
-    const assContent = buildAssFromCaptionPayload({
-      title: String(selectedClip?.title || selectedTimelineEntry?.clip?.title || 'Clip Captions'),
-      captionPayload: selectedCaptionPayload,
-    });
-    if (!assContent) {
-      setLocalStatus('No caption cues available for ASS export in this trim range.');
-      return;
-    }
-
-    const safeBaseName = String(selectedClip?.title || 'clip-captions')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      || 'clip-captions';
-    const fileName = `${safeBaseName}.ass`;
-    downloadTextFile({
-      fileName,
-      content: assContent,
-      mimeType: 'text/x-ass;charset=utf-8',
-    });
-    setLocalStatus(`Downloaded caption ASS: ${fileName}`);
-  }, [selectedCaptionEnabled, selectedCaptionPayload, selectedClip?.title, selectedTimelineEntry]);
-
-  const nudgeSelectedTrim = useCallback((key, delta) => {
-    if (!selectedProjectId || !selectedTimelineItem) return;
-
-    const currentStart = Number.isFinite(Number(selectedTimelineItem.trimStartSeconds))
-      ? Number(selectedTimelineItem.trimStartSeconds)
-      : 0;
-    const currentEnd = Number.isFinite(Number(selectedTimelineItem.trimEndSeconds))
-      ? Number(selectedTimelineItem.trimEndSeconds)
-      : (Number.isFinite(selectedClipDuration) ? selectedClipDuration : currentStart + 6);
-
-    if (key === 'trimStartSeconds') {
-      const maxStart = Math.max(0, currentEnd - TRIM_MIN_GAP_SECONDS);
-      const nextStart = clamp(currentStart + delta, 0, maxStart);
-      onUpdateTimelineItem?.(
-        selectedProjectId,
-        selectedTimelineItem.id,
-        buildTrimUpdatePatch({ trimStartSeconds: Number(nextStart.toFixed(2)) })
-      );
-      return;
-    }
-
-    let maxEnd = Infinity;
-    if (Number.isFinite(selectedClipDuration)) {
-      maxEnd = selectedClipDuration;
-    }
-    const nextEnd = clamp(currentEnd + delta, currentStart + TRIM_MIN_GAP_SECONDS, maxEnd);
-    onUpdateTimelineItem?.(
-      selectedProjectId,
-      selectedTimelineItem.id,
-      buildTrimUpdatePatch({ trimEndSeconds: Number(nextEnd.toFixed(2)) })
-    );
-  }, [buildTrimUpdatePatch, onUpdateTimelineItem, selectedClipDuration, selectedProjectId, selectedTimelineItem]);
-
-  const setSelectedTrimToPlayhead = useCallback((key) => {
-    if (!selectedProjectId || !selectedTimelineItem) return;
-
-    const playhead = Number(currentPreviewTime);
-    if (!Number.isFinite(playhead)) return;
-
-    const currentStart = Number.isFinite(Number(selectedTimelineItem.trimStartSeconds))
-      ? Number(selectedTimelineItem.trimStartSeconds)
-      : 0;
-    const currentEnd = Number.isFinite(Number(selectedTimelineItem.trimEndSeconds))
-      ? Number(selectedTimelineItem.trimEndSeconds)
-      : (Number.isFinite(selectedClipDuration) ? selectedClipDuration : currentStart + 6);
-
-    if (key === 'trimStartSeconds') {
-      const maxStart = Math.max(0, currentEnd - TRIM_MIN_GAP_SECONDS);
-      const nextStart = clamp(playhead, 0, maxStart);
-      onUpdateTimelineItem?.(
-        selectedProjectId,
-        selectedTimelineItem.id,
-        buildTrimUpdatePatch({ trimStartSeconds: Number(nextStart.toFixed(2)) })
-      );
-      setLocalStatus(`Trim in set to ${formatSecondsLabel(nextStart)}.`);
-      return;
-    }
-
-    let maxEnd = Infinity;
-    if (Number.isFinite(selectedClipDuration)) {
-      maxEnd = selectedClipDuration;
-    }
-    const nextEnd = clamp(playhead, currentStart + TRIM_MIN_GAP_SECONDS, maxEnd);
-    onUpdateTimelineItem?.(
-      selectedProjectId,
-      selectedTimelineItem.id,
-      buildTrimUpdatePatch({ trimEndSeconds: Number(nextEnd.toFixed(2)) })
-    );
-    setLocalStatus(`Trim out set to ${formatSecondsLabel(nextEnd)}.`);
-  }, [buildTrimUpdatePatch, currentPreviewTime, onUpdateTimelineItem, selectedClipDuration, selectedProjectId, selectedTimelineItem]);
-
   const handleSelectTimelineItem = useCallback((timelineItemId) => {
     setSelectedTimelineItemId(timelineItemId);
     if (previewMode === 'timeline') {
@@ -1191,56 +861,6 @@ const ClipVaultWorkspace = ({
     setLocalStatus('Playing selected clip preview.');
   }, [handleSelectTimelineItem, stopTimelinePlayback, timelineEntryById]);
 
-  const cutSelectedAtPlayhead = useCallback(() => {
-    if (!selectedProjectId || !selectedTimelineItem || !selectedTimelineEntry) {
-      setLocalStatus('Select a clip on the timeline before cutting.');
-      return;
-    }
-
-    const playhead = Number(currentPreviewTime);
-    if (!Number.isFinite(playhead)) {
-      setLocalStatus('Move the playhead to where you want to cut.');
-      return;
-    }
-
-    const range = getTimelineEntryTrimRange(selectedTimelineEntry);
-    const cutPoint = clamp(
-      playhead,
-      range.start + TRIM_MIN_GAP_SECONDS,
-      range.end - TRIM_MIN_GAP_SECONDS
-    );
-
-    if (!Number.isFinite(cutPoint)) {
-      setLocalStatus('Unable to determine a valid cut point for this clip.');
-      return;
-    }
-
-    if (range.end - range.start <= TRIM_MIN_GAP_SECONDS * 2) {
-      setLocalStatus('Clip is too short to cut at the current trim range.');
-      return;
-    }
-
-    const split = onSplitTimelineItem?.(
-      selectedProjectId,
-      selectedTimelineItem.id,
-      Number(cutPoint.toFixed(2))
-    );
-    if (!split?.rightId) {
-      setLocalStatus('Unable to cut this timeline clip.');
-      return;
-    }
-
-    handleSelectTimelineItem(split.rightId);
-    setLocalStatus(`Clip cut at ${formatSecondsLabel(cutPoint)}.`);
-  }, [
-    currentPreviewTime,
-    handleSelectTimelineItem,
-    onSplitTimelineItem,
-    selectedProjectId,
-    selectedTimelineEntry,
-    selectedTimelineItem,
-  ]);
-
   const buildRenderableItemFromEntry = useCallback((entry, index) => {
     const renderUrl = getClipRenderUrl(entry?.clip);
     const token = extractRenderedClipToken(renderUrl);
@@ -1269,39 +889,6 @@ const ClipVaultWorkspace = ({
         : [],
     };
   }, []);
-
-  const renderEditedSelection = useCallback(async () => {
-    if (!selectedTimelineEntry) {
-      setLocalStatus('Select a timeline clip first.');
-      return;
-    }
-
-    const item = buildRenderableItemFromEntry(selectedTimelineEntry, 0);
-    if (!item) {
-      setLocalStatus('Selected clip is not server-rendered. Only rendered clips with download tokens can be re-rendered right now.');
-      return;
-    }
-
-    setIsRenderingEditedSelection(true);
-    try {
-      const result = await renderTimelineEdits({
-        mode: 'individual',
-        items: [item],
-      });
-      const clips = Array.isArray(result.data?.clips) ? result.data.clips : [];
-      if (clips.length === 0) {
-        setLocalStatus('No edited output was produced for the selected clip.');
-        return;
-      }
-
-      setRenderedEditDownloads((previous) => [...clips, ...previous].slice(0, 25));
-      setLocalStatus('Rendered selected clip edit.');
-    } catch (error) {
-      setLocalStatus(`Selected render failed: ${error.message || 'Unknown error'}`);
-    } finally {
-      setIsRenderingEditedSelection(false);
-    }
-  }, [buildRenderableItemFromEntry, renderTimelineEdits, selectedTimelineEntry]);
 
   const renderEditedGroup = useCallback(async () => {
     const allItems = timelineEntries
@@ -1509,16 +1096,6 @@ const ClipVaultWorkspace = ({
         return;
       }
 
-      if (resizeState.type === 'inspector') {
-        const nextWidth = clamp(
-          resizeState.startWidth + (resizeState.startX - event.clientX),
-          INSPECTOR_MIN_WIDTH,
-          INSPECTOR_MAX_WIDTH
-        );
-        setInspectorWidth(nextWidth);
-        return;
-      }
-
       if (resizeState.type === 'monitor') {
         const nextHeight = clamp(
           resizeState.startHeight + (event.clientY - resizeState.startY),
@@ -1637,23 +1214,22 @@ const ClipVaultWorkspace = ({
     event.preventDefault();
 
     if (type === 'media' && isMediaBinCollapsed) return;
-    if (type === 'inspector' && isInspectorCollapsed) return;
 
     paneResizeStateRef.current = {
       type,
       startX: event.clientX,
       startY: event.clientY,
-      startWidth: type === 'media' ? mediaBinWidth : inspectorWidth,
+      startWidth: mediaBinWidth,
       startHeight: monitorHeight,
     };
 
     document.body.style.cursor = type === 'monitor' ? 'row-resize' : 'col-resize';
     document.body.style.userSelect = 'none';
-  }, [inspectorWidth, isInspectorCollapsed, isMediaBinCollapsed, mediaBinWidth, monitorHeight]);
+  }, [isMediaBinCollapsed, mediaBinWidth, monitorHeight]);
 
   return (
     <section className="glass rounded-3xl p-5 lg:p-6 space-y-4">
-      {(isMediaBinCollapsed || isInspectorCollapsed) && (
+      {isMediaBinCollapsed && (
         <div className="flex flex-wrap items-center gap-2">
           {isMediaBinCollapsed && (
             <button
@@ -1663,16 +1239,6 @@ const ClipVaultWorkspace = ({
             >
               <span className="material-symbols-outlined text-[16px]">chevron_right</span>
               Show Media Bin
-            </button>
-          )}
-          {isInspectorCollapsed && (
-            <button
-              type="button"
-              onClick={() => setIsInspectorCollapsed(false)}
-              className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-            >
-              <span className="material-symbols-outlined text-[16px]">chevron_left</span>
-              Show Inspector
             </button>
           )}
         </div>
@@ -2203,298 +1769,6 @@ const ClipVaultWorkspace = ({
           </section>
         </div>
 
-        {!isInspectorCollapsed && (
-          <button
-            type="button"
-            onMouseDown={startPaneResize('inspector')}
-            aria-label="Resize inspector pane"
-            className="hidden lg:block w-1.5 mx-1 cursor-col-resize bg-transparent hover:bg-primary/30 transition-colors"
-          />
-        )}
-
-        {!isInspectorCollapsed && (
-          <aside
-            className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 space-y-4 lg:shrink-0"
-            style={{ width: `min(100%, ${inspectorWidth}px)` }}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Inspector</div>
-              <button
-                type="button"
-                onClick={() => setIsInspectorCollapsed(true)}
-                className="inline-flex items-center justify-center rounded-md p-1.5 text-slate-500 hover:bg-slate-200/70 dark:hover:bg-slate-800/70"
-                aria-label="Collapse inspector pane"
-                title="Collapse inspector pane"
-              >
-                <span className="material-symbols-outlined text-[18px]">right_panel_close</span>
-              </button>
-            </div>
-
-            {!selectedTimelineEntry ? (
-              <div className="text-sm text-slate-500 dark:text-slate-400">
-                Select a clip on the timeline to edit trim values and inspect metadata.
-              </div>
-            ) : (
-              <>
-                <div className="space-y-1">
-                  <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Clip</div>
-                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100 line-clamp-2">
-                    {selectedClip?.title || 'Untitled Clip'}
-                  </div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400 break-all line-clamp-2">
-                    {selectedClip?.sourceTitle || 'Unknown source'}
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-slate-300/70 dark:border-slate-700/70 px-3 py-2 text-xs text-slate-600 dark:text-slate-300 space-y-1">
-                  <div>
-                    Trim In: <span className="font-semibold">{formatSecondsLabel(getTimelineEntryTrimRange(selectedTimelineEntry).start)}</span>
-                  </div>
-                  <div>
-                    Trim Out: <span className="font-semibold">{formatSecondsLabel(getTimelineEntryTrimRange(selectedTimelineEntry).end)}</span>
-                  </div>
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Drag the left/right edges of the timeline card to trim with the mouse.
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-slate-300/70 dark:border-slate-700/70 px-3 py-3 space-y-3">
-                  <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Fine Tune With Playhead</div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400">
-                    Current playhead: <span className="font-semibold">{formatSecondsLabel(currentPreviewTime)}</span>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={renderEditedSelection}
-                    disabled={isRenderingEditedSelection}
-                    className="w-full inline-flex items-center justify-center gap-1 rounded-md bg-emerald-600 text-white px-2 py-2 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <span className="material-symbols-outlined text-[14px]">download</span>
-                    {isRenderingEditedSelection ? 'Rendering Selected...' : 'Render Selected Edit'}
-                  </button>
-
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedTrimToPlayhead('trimStartSeconds')}
-                      className="rounded-md bg-slate-200 dark:bg-slate-800 px-2 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      Set In @ Playhead
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedTrimToPlayhead('trimEndSeconds')}
-                      className="rounded-md bg-slate-200 dark:bg-slate-800 px-2 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      Set Out @ Playhead
-                    </button>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={cutSelectedAtPlayhead}
-                    className="w-full rounded-md bg-amber-600 text-white px-2 py-2 text-xs font-semibold hover:bg-amber-500 transition-colors"
-                  >
-                    Cut At Playhead
-                  </button>
-
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => nudgeSelectedTrim('trimStartSeconds', -TRIM_NUDGE_SECONDS)}
-                      className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      In -0.25s
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => nudgeSelectedTrim('trimStartSeconds', TRIM_NUDGE_SECONDS)}
-                      className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      In +0.25s
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => nudgeSelectedTrim('trimEndSeconds', -TRIM_NUDGE_SECONDS)}
-                      className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      Out -0.25s
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => nudgeSelectedTrim('trimEndSeconds', TRIM_NUDGE_SECONDS)}
-                      className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      Out +0.25s
-                    </button>
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-slate-300/70 dark:border-slate-700/70 px-3 py-3 space-y-3">
-                  <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Effects</div>
-
-                  <div className="space-y-1">
-                    <label htmlFor="effect-preset" className="text-[11px] uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                      Preset
-                    </label>
-                    <select
-                      id="effect-preset"
-                      name="effectPreset"
-                      value={selectedEffectsPreset}
-                      onChange={(event) => {
-                        if (!selectedProjectId || !selectedTimelineItem) return;
-                        onUpdateTimelineItem?.(selectedProjectId, selectedTimelineItem.id, {
-                          effectsPreset: event.target.value,
-                        });
-                      }}
-                      className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg px-2.5 py-2 text-xs"
-                    >
-                      {EFFECT_PRESETS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="space-y-1">
-                    <div className="flex items-center justify-between text-[11px] uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                      <span>Intensity</span>
-                      <span>{Math.round(selectedEffectsIntensity)}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      step="1"
-                      value={selectedEffectsIntensity}
-                      onChange={(event) => {
-                        if (!selectedProjectId || !selectedTimelineItem) return;
-                        onUpdateTimelineItem?.(selectedProjectId, selectedTimelineItem.id, {
-                          effectsIntensity: Number(event.target.value),
-                        });
-                      }}
-                      className="w-full accent-primary"
-                    />
-                  </div>
-                </div>
-
-                <div className="rounded-xl border border-slate-300/70 dark:border-slate-700/70 px-3 py-3 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Captions</div>
-                    <label className="inline-flex items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
-                      <input
-                        type="checkbox"
-                        checked={selectedCaptionEnabled}
-                        onChange={(event) => {
-                          if (!selectedProjectId || !selectedTimelineItem) return;
-                          onUpdateTimelineItem?.(selectedProjectId, selectedTimelineItem.id, {
-                            captionEnabled: event.target.checked,
-                          });
-                        }}
-                        className="accent-primary"
-                      />
-                      Enabled
-                    </label>
-                  </div>
-
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Synced cues in current trim: <span className="font-semibold">{selectedCaptionCueCount}</span>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label htmlFor="caption-style-preset" className="text-[11px] uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                      Caption Style
-                    </label>
-                    <select
-                      id="caption-style-preset"
-                      name="captionStylePreset"
-                      value={selectedCaptionStylePreset}
-                      onChange={(event) => {
-                        if (!selectedProjectId || !selectedTimelineItem) return;
-                        onUpdateTimelineItem?.(selectedProjectId, selectedTimelineItem.id, {
-                          captionStylePreset: event.target.value,
-                        });
-                      }}
-                      className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg px-2.5 py-2 text-xs"
-                    >
-                      {CAPTION_STYLE_PRESETS.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="space-y-1">
-                    <label htmlFor="caption-text-override" className="text-[11px] uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                      Caption Text Override (optional)
-                    </label>
-                    <textarea
-                      id="caption-text-override"
-                      name="captionTextOverride"
-                      value={selectedCaptionTextOverride}
-                      onChange={(event) => {
-                        if (!selectedProjectId || !selectedTimelineItem) return;
-                        onUpdateTimelineItem?.(selectedProjectId, selectedTimelineItem.id, {
-                          captionTextOverride: event.target.value,
-                          captionConfirmationStatus: 'pending',
-                          captionConfirmedText: '',
-                          captionConfirmedAt: '',
-                        });
-                      }}
-                      rows={3}
-                      placeholder="Leave empty to use synced transcript cues."
-                      className="w-full bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg px-2.5 py-2 text-xs resize-y"
-                    />
-                  </div>
-
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Auto text in range:
-                    {' '}
-                    <span className="font-medium text-slate-700 dark:text-slate-200">
-                      {selectedAutoCaptionText || 'No transcript text available for this trim.'}
-                    </span>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={confirmSelectedCaptionText}
-                    className="w-full rounded-md bg-primary text-white px-2 py-2 text-xs font-semibold hover:opacity-90 transition-opacity"
-                  >
-                    Confirm Included Text
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={downloadSelectedCaptionAss}
-                    className="w-full rounded-md border border-emerald-400/60 text-emerald-700 dark:text-emerald-300 dark:border-emerald-500/50 px-2 py-2 text-xs font-semibold hover:bg-emerald-50 dark:hover:bg-emerald-500/10 transition-colors"
-                  >
-                    Download Pop Captions (.ass)
-                  </button>
-
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Confirmation:
-                    {' '}
-                    <span className="font-semibold text-slate-700 dark:text-slate-200">
-                      {selectedCaptionConfirmationStatus === 'confirmed' ? 'Confirmed' : 'Pending'}
-                    </span>
-                  </div>
-                  {selectedCaptionConfirmedText && (
-                    <div className="text-[11px] text-slate-600 dark:text-slate-300 rounded-md bg-slate-100 dark:bg-slate-800 px-2 py-1.5">
-                      {selectedCaptionConfirmedText}
-                    </div>
-                  )}
-                </div>
-
-                <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 px-3 py-2 text-xs text-slate-500 dark:text-slate-400">
-                  Audio lane + soundtrack controls (next pass)
-                </div>
-              </>
-            )}
-          </aside>
-        )}
       </div>
 
       {renderedEditDownloads.length > 0 && (

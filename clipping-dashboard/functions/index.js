@@ -115,6 +115,29 @@ function formatSecondsToTimestamp(totalSeconds) {
     return `${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
 }
 
+function formatSecondsToTimestampPrecise(totalSeconds, fractionDigits = 3) {
+    const safeDigits = Math.max(0, Math.min(3, Math.floor(Number(fractionDigits) || 0)));
+    if (safeDigits === 0) {
+        return formatSecondsToTimestamp(totalSeconds);
+    }
+
+    const scale = 10 ** safeDigits;
+    let scaled = Math.round(Math.max(0, Number(totalSeconds) || 0) * scale);
+
+    const hours = Math.floor(scaled / (3600 * scale));
+    scaled -= hours * 3600 * scale;
+    const minutes = Math.floor(scaled / (60 * scale));
+    scaled -= minutes * 60 * scale;
+    const wholeSeconds = Math.floor(scaled / scale);
+    const fraction = scaled % scale;
+    const secondText = `${String(wholeSeconds).padStart(2, "0")}.${String(fraction).padStart(safeDigits, "0")}`;
+
+    if (hours > 0) {
+        return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${secondText}`;
+    }
+    return `${String(minutes).padStart(2, "0")}:${secondText}`;
+}
+
 function parseModelJson(text) {
     try {
         return JSON.parse(text);
@@ -1320,11 +1343,7 @@ function getMimeTypeFromExtension(filePath) {
 }
 
 function formatSecondsForSection(totalSeconds) {
-    const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const remaining = seconds % 60;
-    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+    return formatSecondsToTimestampPrecise(totalSeconds, 3);
 }
 
 function clampNumber(value, min, max) {
@@ -1721,8 +1740,8 @@ function normalizeClipForRender(rawClip, index) {
         title: String(rawClip?.title || `clip-${index + 1}`),
         startSeconds: start,
         endSeconds: boundedEnd,
-        startTimestamp: formatSecondsToTimestamp(start),
-        endTimestamp: formatSecondsToTimestamp(boundedEnd),
+        startTimestamp: formatSecondsToTimestampPrecise(start, 3),
+        endTimestamp: formatSecondsToTimestampPrecise(boundedEnd, 3),
     };
 }
 
@@ -3026,8 +3045,8 @@ exports.alignTranscriptSelection = onCall(
             try {
                 const clip = normalizeClipForRender({
                     title: "precision-align",
-                    startTimestamp: formatSecondsToTimestamp(windowStart),
-                    endTimestamp: formatSecondsToTimestamp(windowEnd),
+                    startTimestamp: formatSecondsToTimestampPrecise(windowStart, 3),
+                    endTimestamp: formatSecondsToTimestampPrecise(windowEnd, 3),
                 }, 0);
 
                 const renderedWindow = await renderYouTubeClipSegment({
@@ -3051,8 +3070,8 @@ exports.alignTranscriptSelection = onCall(
                         ...waveformPeaks,
                         windowStartSeconds: Number(clip.startSeconds.toFixed(3)),
                         windowEndSeconds: Number(clip.endSeconds.toFixed(3)),
-                        windowStartTimestamp: formatSecondsToTimestamp(clip.startSeconds),
-                        windowEndTimestamp: formatSecondsToTimestamp(clip.endSeconds),
+                        windowStartTimestamp: formatSecondsToTimestampPrecise(clip.startSeconds, 3),
+                        windowEndTimestamp: formatSecondsToTimestampPrecise(clip.endSeconds, 3),
                     };
                 } catch (waveformError) {
                     console.warn("Unable to compute waveform peaks for precision alignment:", cleanYouTubeErrorMessage(waveformError));
@@ -3263,8 +3282,8 @@ exports.alignTranscriptSelection = onCall(
                     alignmentComparison,
                     alignedStartSeconds,
                     alignedEndSeconds,
-                    alignedStartTimestamp: formatSecondsToTimestamp(alignedStartSeconds),
-                    alignedEndTimestamp: formatSecondsToTimestamp(alignedEndSeconds),
+                    alignedStartTimestamp: formatSecondsToTimestampPrecise(alignedStartSeconds, 3),
+                    alignedEndTimestamp: formatSecondsToTimestampPrecise(alignedEndSeconds, 3),
                     matchConfidence: Number(selectedOutcome.metrics.confidence || 0),
                     matchCoverage: Number(selectedOutcome.metrics.coverage || 0),
                     matchAverageSimilarity: Number(selectedOutcome.metrics.similarity || 0),
@@ -3274,8 +3293,8 @@ exports.alignTranscriptSelection = onCall(
                     wordCount: wordTimeline.length,
                     windowStartSeconds: clip.startSeconds,
                     windowEndSeconds: clip.endSeconds,
-                    windowStartTimestamp: formatSecondsToTimestamp(clip.startSeconds),
-                    windowEndTimestamp: formatSecondsToTimestamp(clip.endSeconds),
+                    windowStartTimestamp: formatSecondsToTimestampPrecise(clip.startSeconds, 3),
+                    windowEndTimestamp: formatSecondsToTimestampPrecise(clip.endSeconds, 3),
                     alignedWordCues,
                     alignedWordCount: alignedWordCues.length,
                     waveform,
