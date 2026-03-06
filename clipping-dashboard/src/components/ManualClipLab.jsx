@@ -343,6 +343,27 @@ const buildFocusedTrimWindow = ({ clipStartSeconds, clipEndSeconds, mediaDuratio
   };
 };
 
+const extractRenderedClipToken = (value) => {
+  const text = String(value || '').trim();
+  if (!text) return '';
+
+  try {
+    const parsed = new URL(text);
+    return String(parsed.searchParams.get('token') || '').trim();
+  } catch {
+    // Not a URL.
+  }
+
+  return /^[0-9a-fA-F-]{36}$/.test(text) ? text : '';
+};
+
+const createStudioRegionId = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `studio-region-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+};
+
 const getCallableErrorMessage = (error) => {
   const detailText = (
     error?.details && typeof error.details === 'string'
@@ -440,11 +461,13 @@ const ManualClipLab = ({
   const [stagedClipDraft, setStagedClipDraft] = useState(null);
   const [trimViewportRange, setTrimViewportRange] = useState(null);
   const [manualViewportStartSeconds, setManualViewportStartSeconds] = useState(null);
+  const [clipEditRegions, setClipEditRegions] = useState([]);
+  const [selectedEditRegionId, setSelectedEditRegionId] = useState('');
   const [isTimelineScrubbing, setIsTimelineScrubbing] = useState(false);
   const [isAuditioningClip, setIsAuditioningClip] = useState(false);
   const [isLoopPlayback, setIsLoopPlayback] = useState(false);
+  const [isTrimEditMode, setIsTrimEditMode] = useState(false);
   const [trimZoomLevel, setTrimZoomLevel] = useState(1);
-  const [nextScrubCutTarget, setNextScrubCutTarget] = useState('start');
   const [transcriptSegments, setTranscriptSegments] = useState([]);
   const [transcriptQuery, setTranscriptQuery] = useState('');
   const [transcriptAvailability, setTranscriptAvailability] = useState(null);
@@ -479,6 +502,10 @@ const ManualClipLab = ({
   );
   const renderYouTubeClips = useMemo(
     () => httpsCallable(functions, 'renderYouTubeClips'),
+    []
+  );
+  const renderTimelineEdits = useMemo(
+    () => httpsCallable(functions, 'renderTimelineEdits'),
     []
   );
   const alignTranscriptSelection = useMemo(
@@ -673,6 +700,8 @@ const ManualClipLab = ({
     setStagedClipDraft(null);
     setTrimViewportRange(null);
     setManualViewportStartSeconds(null);
+    setClipEditRegions([]);
+    setSelectedEditRegionId('');
     setIsAuditioningClip(false);
     setIsLoopPlayback(false);
     setTrimZoomLevel(1);
@@ -789,6 +818,7 @@ const ManualClipLab = ({
     title,
     description,
     selectedText = '',
+    selectedFragments = [],
   }) => {
     const startSeconds = parseTimestamp(startTimestamp);
     const endSeconds = parseTimestamp(endTimestamp);
@@ -816,22 +846,40 @@ const ManualClipLab = ({
 
     clipCounterRef.current += 1;
     const normalizedSelectedText = cleanTitleText(selectedText || '');
+    const selectionFragmentRows = (Array.isArray(selectedFragments) ? selectedFragments : [])
+      .map((fragment) => {
+        const text = cleanTitleText(fragment?.text || '');
+        const startSeconds = Number(fragment?.startSeconds);
+        const endSeconds = Number(fragment?.endSeconds);
+        if (!text || !isFiniteNumber(startSeconds) || !isFiniteNumber(endSeconds) || endSeconds <= startSeconds) {
+          return null;
+        }
+        return {
+          text,
+          startSeconds,
+          endSeconds,
+        };
+      })
+      .filter(Boolean);
 
     const collectTranscriptRowsForRange = (rangeStart, rangeEnd) => {
-      return transcriptSegments
-        .map((segment) => {
-          const segmentStart = parseTimestamp(segment.startTimestamp);
-          const segmentEnd = parseTimestamp(segment.endTimestamp);
-          const normalizedStart = isFiniteNumber(segmentStart) ? segmentStart : null;
-          const normalizedEnd = isFiniteNumber(segmentEnd) && segmentEnd > segmentStart
-            ? segmentEnd
-            : (isFiniteNumber(segmentStart) ? segmentStart + 2 : null);
-          return {
-            text: cleanTitleText(segment.text || ''),
-            startSeconds: normalizedStart,
-            endSeconds: normalizedEnd,
-          };
-        })
+      const rowSource = selectionFragmentRows.length > 0
+        ? selectionFragmentRows
+        : transcriptSegments
+          .map((segment) => {
+            const segmentStart = parseTimestamp(segment.startTimestamp);
+            const segmentEnd = parseTimestamp(segment.endTimestamp);
+            const normalizedStart = isFiniteNumber(segmentStart) ? segmentStart : null;
+            const normalizedEnd = isFiniteNumber(segmentEnd) && segmentEnd > segmentStart
+              ? segmentEnd
+              : (isFiniteNumber(segmentStart) ? segmentStart + 2 : null);
+            return {
+              text: cleanTitleText(segment.text || ''),
+              startSeconds: normalizedStart,
+              endSeconds: normalizedEnd,
+            };
+          });
+      return rowSource
         .filter((segment) => (
           isFiniteNumber(segment.startSeconds)
           && isFiniteNumber(segment.endSeconds)
@@ -1234,7 +1282,194 @@ const ManualClipLab = ({
     return snippet.slice(0, 260);
   }, [transcriptSegments]);
 
+  const findTranscriptSnippetForRegions = useCallback((regions) => {
+    const normalizedRegions = (Array.isArray(regions) ? regions : [])
+      .map((region) => {
+        const startSeconds = Number(region?.startSeconds);
+        const endSeconds = Number(region?.endSeconds);
+        if (!isFiniteNumber(startSeconds) || !isFiniteNumber(endSeconds) || endSeconds <= startSeconds) return null;
+        return {
+          startSeconds,
+          endSeconds,
+        };
+      })
+      .filter(Boolean);
+    if (normalizedRegions.length === 0) return '';
+
+    const parts = [];
+    transcriptSegments.forEach((segment) => {
+      const segmentStart = parseTimestamp(segment.startTimestamp);
+      const segmentEnd = parseTimestamp(segment.endTimestamp);
+      if (!isFiniteNumber(segmentStart) || !isFiniteNumber(segmentEnd) || segmentEnd <= segmentStart) return;
+      const overlaps = normalizedRegions.some((region) => segmentStart < region.endSeconds && segmentEnd > region.startSeconds);
+      if (overlaps) {
+        const text = cleanTitleText(segment.text || '');
+        if (text) parts.push(text);
+      }
+    });
+
+    return cleanTitleText(parts.join(' ')).slice(0, 400);
+  }, [transcriptSegments]);
+
+  async function renderEditedRegionSequence() {
+    if (!hasRegionEditSource || !precisionPreviewToken) {
+      setStatus('Create a precision preview clip before using split-region render.');
+      return false;
+    }
+
+    const orderedRegions = clipEditRegionsSorted;
+    if (orderedRegions.length === 0) {
+      setStatus('No kept regions are available to render.');
+      return false;
+    }
+
+    const baseStart = isFiniteNumber(precisionPreviewWindowStart) ? precisionPreviewWindowStart : orderedRegions[0].startSeconds;
+    const stylePreset = alignedPreviewWordCues.length > 0 ? 'pop-punch' : 'reel-bold';
+    const titleSeed = stagedClipDraft?.title || findTranscriptSnippetForRegions(orderedRegions) || `Edited Clip ${clipCounterRef.current + 1}`;
+    const descriptionSeed = stagedClipDraft?.description || findTranscriptSnippetForRegions(orderedRegions) || 'Edited selection';
+    const combinedTranscriptText = findTranscriptSnippetForRegions(orderedRegions);
+
+    const renderItems = orderedRegions.map((region, index) => {
+      const captionCues = sourceClipPreviewWordCues
+        .filter((cue) => cue.startSeconds < region.endSeconds && cue.endSeconds > region.startSeconds)
+        .map((cue, cueIndex) => {
+          const clippedStart = Math.max(region.startSeconds, cue.startSeconds);
+          const clippedEnd = Math.min(region.endSeconds, cue.endSeconds);
+          const localStart = clippedStart - region.startSeconds;
+          const localEnd = clippedEnd - region.startSeconds;
+          if (!(localEnd > localStart)) return null;
+          return {
+            id: `studio-render-${index + 1}-${cueIndex + 1}`,
+            text: cue.text,
+            startSeconds: Number(localStart.toFixed(3)),
+            endSeconds: Number(localEnd.toFixed(3)),
+          };
+        })
+        .filter(Boolean);
+
+      const item = {
+        token: precisionPreviewToken,
+        title: `${cleanTitleText(titleSeed) || 'Edited Clip'} ${index + 1}`,
+        trimStartSeconds: Number((region.startSeconds - baseStart).toFixed(3)),
+        trimEndSeconds: Number((region.endSeconds - baseStart).toFixed(3)),
+        captionEnabled: true,
+        captionStylePreset: stylePreset,
+        captionCues,
+      };
+      return item;
+    });
+
+    const outputCaptionCues = [];
+    let accumulatedOffset = 0;
+    orderedRegions.forEach((region, index) => {
+      const regionDuration = Math.max(effectiveMinClipSeconds, region.endSeconds - region.startSeconds);
+      sourceClipPreviewWordCues
+        .filter((cue) => cue.startSeconds < region.endSeconds && cue.endSeconds > region.startSeconds)
+        .forEach((cue, cueIndex) => {
+          const clippedStart = Math.max(region.startSeconds, cue.startSeconds);
+          const clippedEnd = Math.min(region.endSeconds, cue.endSeconds);
+          const localStart = clippedStart - region.startSeconds;
+          const localEnd = clippedEnd - region.startSeconds;
+          if (!(localEnd > localStart)) return;
+          outputCaptionCues.push({
+            id: `studio-output-${index + 1}-${cueIndex + 1}`,
+            text: cue.text,
+            startSeconds: Number((accumulatedOffset + localStart).toFixed(3)),
+            endSeconds: Number((accumulatedOffset + localEnd).toFixed(3)),
+          });
+        });
+      accumulatedOffset += regionDuration;
+    });
+
+    setIsRendering(true);
+    setStatus(`Rendering edited clip from ${orderedRegions.length} kept region${orderedRegions.length === 1 ? '' : 's'}...`);
+
+    try {
+      const mode = orderedRegions.length > 1 ? 'group' : 'individual';
+      const result = await withTimeout(
+        renderTimelineEdits({
+          mode,
+          montageTitle: cleanTitleText(titleSeed) || 'Edited Clip',
+          items: renderItems,
+        }),
+        420000,
+        'Timed out rendering edited clip.'
+      );
+
+      let renderedClip = null;
+      if (mode === 'group') {
+        const montage = result.data?.montage || null;
+        if (!montage?.downloadUrl) {
+          throw new Error('Edited render did not return a montage download URL.');
+        }
+        renderedClip = {
+          title: cleanTitleText(titleSeed) || 'Edited Clip',
+          fileName: montage.fileName,
+          downloadUrl: montage.downloadUrl,
+          expiresAt: montage.expiresAt,
+          renderSource: 'timeline_edit_group',
+        };
+      } else {
+        const clips = Array.isArray(result.data?.clips) ? result.data.clips : [];
+        if (clips.length === 0) {
+          throw new Error('Edited render did not return a clip download URL.');
+        }
+        renderedClip = {
+          ...clips[0],
+          title: cleanTitleText(titleSeed) || clips[0].title || 'Edited Clip',
+        };
+      }
+
+      const firstRegion = orderedRegions[0];
+      const lastRegion = orderedRegions[orderedRegions.length - 1];
+      const enrichedClip = {
+        ...renderedClip,
+        startTimestamp: formatTimestampPrecise(firstRegion.startSeconds),
+        endTimestamp: formatTimestampPrecise(lastRegion.endSeconds),
+        transcriptSourceText: combinedTranscriptText,
+        transcriptSnippet: combinedTranscriptText.slice(0, 260),
+        transcriptSelectedText: combinedTranscriptText,
+        transcriptProvider: String(transcriptAvailability?.providerUsed || '').trim() || 'precision-preview',
+        transcriptLanguage: String(transcriptAvailability?.languageUsed || '').trim() || 'unknown',
+        selectionStartSeconds: Number(firstRegion.startSeconds.toFixed(3)),
+        selectionEndSeconds: Number(lastRegion.endSeconds.toFixed(3)),
+        captionCues: outputCaptionCues,
+        captionStylePreset: stylePreset,
+        captionConfirmationStatus: 'pending',
+        captionConfirmedText: '',
+        captionConfirmedAt: '',
+        description: descriptionSeed,
+      };
+
+      onClipsRendered?.([enrichedClip], {
+        sourceRef: sourceReference,
+        sourceTitle,
+        sourceType: 'youtube-url',
+        contentProfile,
+        origin: 'render-studio-region-edit',
+        projectNameHint: sourceTitle,
+      });
+      setStatus('Edited clip rendered and sent to Clip Vault.');
+      return true;
+    } catch (error) {
+      setStatus(`Edited render failed: ${error.message || 'Unknown error'}`);
+      return false;
+    } finally {
+      setIsRendering(false);
+    }
+  }
+
   const addSegment = () => {
+    if (hasRegionEditSource) {
+      void (async () => {
+        const success = await renderEditedRegionSequence();
+        if (success) {
+          setStagedClipDraft(null);
+        }
+      })();
+      return;
+    }
+
     const transcriptSnippet = findTranscriptSnippetForRange(startTime, endTime);
     const nextManualIndex = clipCounterRef.current + 1;
     const nextTitle = stagedClipDraft?.title || transcriptSnippet || `Manual Clip ${nextManualIndex}`;
@@ -1247,6 +1482,9 @@ const ManualClipLab = ({
         title: nextTitle,
         description: nextDescription,
         selectedText: stagedClipDraft?.origin === 'transcript-selection' ? nextDescription : '',
+        selectedFragments: stagedClipDraft?.origin === 'transcript-selection'
+          ? stagedClipDraft?.selectionFragments
+          : [],
       });
       if (success) {
         setStagedClipDraft(null);
@@ -1448,6 +1686,7 @@ const ManualClipLab = ({
       pausePreview();
       setIsAuditioningClip(false);
       setIsLoopPlayback(false);
+      const initialRegionId = createStudioRegionId();
       setPrecisionPreviewClip({
         downloadUrl: String(renderedClip.downloadUrl || ''),
         fileName: String(renderedClip.fileName || ''),
@@ -1456,8 +1695,14 @@ const ManualClipLab = ({
         windowStartSeconds: Number(nextWindowStart.toFixed(3)),
         windowEndSeconds: Number(nextWindowEnd.toFixed(3)),
       });
+      setClipEditRegions([{
+        id: initialRegionId,
+        startSeconds: Number(nextWindowStart.toFixed(3)),
+        endSeconds: Number(nextWindowEnd.toFixed(3)),
+      }]);
+      setSelectedEditRegionId(initialRegionId);
       seekToSeconds(rangeStart, { allowExternalOpen: false });
-      setStatus('Precision preview ready from exact trim range. You are now trimming against rendered video (no YouTube polling jitter).');
+      setStatus('Preview clip ready. Ctrl+T splits at the playhead, Ctrl+[ / Ctrl+] trim the selected region, Delete removes a region, and Ctrl+J joins adjacent regions.');
     } catch (error) {
       setStatus(`Precision preview failed: ${getCallableErrorMessage(error)}`);
     } finally {
@@ -1611,6 +1856,144 @@ const ManualClipLab = ({
       };
     });
   }, [transcriptSegments]);
+  const activeTranscriptCueRows = useMemo(() => {
+    if (stagedClipDraft?.origin !== 'transcript-selection') return transcriptRows;
+    const fragments = Array.isArray(stagedClipDraft?.selectionFragments)
+      ? stagedClipDraft.selectionFragments
+      : [];
+    if (fragments.length === 0) return transcriptRows;
+    return fragments
+      .map((fragment) => {
+        const text = cleanTitleText(fragment?.text || '');
+        const startSeconds = Number(fragment?.startSeconds);
+        const endSeconds = Number(fragment?.endSeconds);
+        if (!text || !isFiniteNumber(startSeconds) || !isFiniteNumber(endSeconds) || endSeconds <= startSeconds) {
+          return null;
+        }
+        return {
+          text,
+          startSeconds,
+          endSeconds,
+          startTimestamp: formatTimestampPrecise(startSeconds, 3),
+          endTimestamp: formatTimestampPrecise(endSeconds, 3),
+        };
+      })
+      .filter(Boolean);
+  }, [stagedClipDraft, transcriptRows]);
+
+  const buildTranscriptSelectionFromRange = useCallback((range) => {
+    if (!range || range.collapsed || !transcriptPaneRef.current) return null;
+
+    const resolveTranscriptIndex = (node) => {
+      const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+      const transcriptRow = element?.closest?.('[data-transcript-index]');
+      if (!transcriptRow) return null;
+      const indexValue = Number(transcriptRow.getAttribute('data-transcript-index'));
+      return Number.isInteger(indexValue) ? indexValue : null;
+    };
+
+    const getTextOffsetWithinElement = (element, node, offset) => {
+      if (!element || !node) return null;
+      try {
+        const offsetRange = document.createRange();
+        offsetRange.selectNodeContents(element);
+        offsetRange.setEnd(node, offset);
+        return offsetRange.toString().length;
+      } catch {
+        return null;
+      }
+    };
+
+    const rangeStartIndex = resolveTranscriptIndex(range.startContainer);
+    const rangeEndIndex = resolveTranscriptIndex(range.endContainer);
+    if (!isFiniteNumber(rangeStartIndex) || !isFiniteNumber(rangeEndIndex)) return null;
+
+    const startIndex = Math.min(rangeStartIndex, rangeEndIndex);
+    const endIndex = Math.max(rangeStartIndex, rangeEndIndex);
+    const fragments = [];
+    const estimateBoundarySeconds = (row, charOffset) => {
+      const rowStartSeconds = Number(row?.startSeconds);
+      const rowEndSeconds = Number(row?.endSeconds);
+      const rowText = String(row?.text || '');
+      if (!isFiniteNumber(rowStartSeconds) || !isFiniteNumber(rowEndSeconds) || rowEndSeconds <= rowStartSeconds) {
+        return rowStartSeconds;
+      }
+      const totalChars = Math.max(1, rowText.length);
+      const ratio = clampNumber(charOffset / totalChars, 0, 1);
+      return clampNumber(
+        rowStartSeconds + ((rowEndSeconds - rowStartSeconds) * ratio),
+        rowStartSeconds,
+        rowEndSeconds
+      );
+    };
+
+    for (let index = startIndex; index <= endIndex; index += 1) {
+      const row = transcriptRows[index];
+      const rowElement = transcriptRowRefs.current[index];
+      const rowText = String(row?.text || '');
+      if (!row || !rowElement || !rowText) continue;
+
+      const rawStartOffset = index === rangeStartIndex
+        ? getTextOffsetWithinElement(rowElement, range.startContainer, range.startOffset)
+        : 0;
+      const rawEndOffset = index === rangeEndIndex
+        ? getTextOffsetWithinElement(rowElement, range.endContainer, range.endOffset)
+        : rowText.length;
+
+      const startCharOffset = clampNumber(Number(rawStartOffset) || 0, 0, rowText.length);
+      const endCharOffset = clampNumber(
+        Number(rawEndOffset) || rowText.length,
+        startCharOffset,
+        rowText.length
+      );
+      const text = rowText
+        .slice(startCharOffset, endCharOffset)
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (!text) continue;
+      const fragmentStartSeconds = estimateBoundarySeconds(row, startCharOffset);
+      const fragmentEndSeconds = estimateBoundarySeconds(row, endCharOffset);
+      fragments.push({
+        index,
+        text,
+        startCharOffset,
+        endCharOffset,
+        startSeconds: Number(fragmentStartSeconds.toFixed(3)),
+        endSeconds: Number(fragmentEndSeconds.toFixed(3)),
+      });
+    }
+
+    if (fragments.length === 0) {
+      const fallbackText = String(range.toString() || '').replace(/\s+/g, ' ').trim();
+      if (!fallbackText) return null;
+      return {
+        startIndex,
+        endIndex,
+        text: fallbackText.slice(0, 600),
+      };
+    }
+
+    const firstFragment = fragments[0];
+    const lastFragment = fragments[fragments.length - 1];
+    const exactText = fragments
+      .map((fragment) => fragment.text)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 600);
+    const selectionStartSeconds = firstFragment.startSeconds;
+    const selectionEndSeconds = lastFragment.endSeconds;
+
+    return {
+      startIndex: firstFragment.index,
+      endIndex: lastFragment.index,
+      text: exactText,
+      selectionStartSeconds: Number(selectionStartSeconds.toFixed(3)),
+      selectionEndSeconds: Number(selectionEndSeconds.toFixed(3)),
+      fragments,
+    };
+  }, [transcriptRows]);
 
   const transcriptMatchIndices = useMemo(() => {
     if (!transcriptQueryNormalized) return [];
@@ -1701,12 +2084,20 @@ const ManualClipLab = ({
       return;
     }
 
-    const clipStartSeconds = isFiniteNumber(startRow.startSeconds)
-      ? startRow.startSeconds
-      : parseTimestamp(startRow.startTimestamp);
-    const clipEndSecondsRaw = isFiniteNumber(endRow.endSeconds)
-      ? endRow.endSeconds
-      : parseTimestamp(endRow.endTimestamp);
+    const clipStartSeconds = isFiniteNumber(Number(selectedTranscriptSelection.selectionStartSeconds))
+      ? Number(selectedTranscriptSelection.selectionStartSeconds)
+      : (
+        isFiniteNumber(startRow.startSeconds)
+          ? startRow.startSeconds
+          : parseTimestamp(startRow.startTimestamp)
+      );
+    const clipEndSecondsRaw = isFiniteNumber(Number(selectedTranscriptSelection.selectionEndSeconds))
+      ? Number(selectedTranscriptSelection.selectionEndSeconds)
+      : (
+        isFiniteNumber(endRow.endSeconds)
+          ? endRow.endSeconds
+          : parseTimestamp(endRow.endTimestamp)
+      );
     if (!isFiniteNumber(clipStartSeconds) || !isFiniteNumber(clipEndSecondsRaw)) {
       setStatus('Selected transcript range has invalid timing.');
       return;
@@ -1716,8 +2107,8 @@ const ManualClipLab = ({
     pausePreview();
     setIsAuditioningClip(false);
     setIsLoopPlayback(false);
-    setStartTime(formatTimestamp(clipStartSeconds));
-    setEndTime(formatTimestamp(clipEndSeconds));
+    setStartTime(formatTimestampPrecise(clipStartSeconds, 2));
+    setEndTime(formatTimestampPrecise(clipEndSeconds, 2));
 
     const clipLength = Math.max(1, clipEndSeconds - clipStartSeconds);
     const mediaDurationHint = isFiniteNumber(mediaDurationSeconds) && mediaDurationSeconds > 0
@@ -1737,6 +2128,9 @@ const ManualClipLab = ({
       title: `Transcript Selection ${clipCounterRef.current + 1}`,
       description: selectedTranscriptSelection.text,
       origin: 'transcript-selection',
+      selectionFragments: Array.isArray(selectedTranscriptSelection.fragments)
+        ? selectedTranscriptSelection.fragments
+        : [],
     });
     setAlignedPreviewWordCues([]);
     seekToSeconds(clipStartSeconds, { allowExternalOpen: false });
@@ -1749,7 +2143,7 @@ const ManualClipLab = ({
 
     if (sourceMode !== 'url' || !isYouTubeSource || !sourceUrl) {
       setAlignmentWaveformData(null);
-      setStatus('Transcript selection ready for trim. Scrub waveform, then use Cmd+T (or I/O) to set In/Out.');
+      setStatus('Transcript selection ready for trim. Scrub the waveform, use Ctrl+[ / Ctrl+] to place In and Out, then create a preview clip to unlock split editing.');
       return;
     }
 
@@ -1952,35 +2346,15 @@ const ManualClipLab = ({
       return;
     }
 
-    const resolveTranscriptIndex = (node) => {
-      const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
-      const transcriptRow = element?.closest?.('[data-transcript-index]');
-      if (!transcriptRow) return null;
-      const indexValue = Number(transcriptRow.getAttribute('data-transcript-index'));
-      return Number.isInteger(indexValue) ? indexValue : null;
-    };
-
-    const anchorIndex = resolveTranscriptIndex(anchorNode);
-    const focusIndex = resolveTranscriptIndex(focusNode);
-    if (!isFiniteNumber(anchorIndex) || !isFiniteNumber(focusIndex)) {
+    const selectionRange = selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+    const nextSelection = buildTranscriptSelectionFromRange(selectionRange);
+    if (!nextSelection?.text) {
       setSelectedTranscriptSelection(null);
       return;
     }
 
-    const startIndex = Math.min(anchorIndex, focusIndex);
-    const endIndex = Math.max(anchorIndex, focusIndex);
-    const selectedText = String(selection.toString() || '').replace(/\s+/g, ' ').trim();
-    if (!selectedText) {
-      setSelectedTranscriptSelection(null);
-      return;
-    }
-
-    setSelectedTranscriptSelection({
-      startIndex,
-      endIndex,
-      text: selectedText.slice(0, 600),
-    });
-  }, []);
+    setSelectedTranscriptSelection(nextSelection);
+  }, [buildTranscriptSelectionFromRange]);
 
   const canRunAiTranscriber = !isTranscribing && sourceMode !== 'none';
   const aiTranscriberButtonLabel = isTranscribing && transcriptLoadMode === 'ai'
@@ -1996,8 +2370,43 @@ const ManualClipLab = ({
   const MIN_CLIP_SECONDS = 0.1;
   const effectiveMinClipSeconds = MIN_CLIP_SECONDS;
   const dragFractionDigits = 3;
-  const rangeStartSeconds = parseTimestamp(startTime);
-  const rangeEndSeconds = parseTimestamp(endTime);
+  const precisionPreviewWindowStart = Number(precisionPreviewClip?.windowStartSeconds);
+  const precisionPreviewWindowEnd = Number(precisionPreviewClip?.windowEndSeconds);
+  const precisionPreviewToken = useMemo(
+    () => extractRenderedClipToken(precisionPreviewClip?.downloadUrl),
+    [precisionPreviewClip?.downloadUrl]
+  );
+  const clipEditRegionsSorted = useMemo(() => (
+    (Array.isArray(clipEditRegions) ? clipEditRegions : [])
+      .map((region) => {
+        const startSeconds = Number(region?.startSeconds);
+        const endSeconds = Number(region?.endSeconds);
+        if (!isFiniteNumber(startSeconds) || !isFiniteNumber(endSeconds) || endSeconds <= startSeconds) return null;
+        return {
+          id: String(region?.id || createStudioRegionId()),
+          startSeconds: Number(startSeconds.toFixed(3)),
+          endSeconds: Number(endSeconds.toFixed(3)),
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => left.startSeconds - right.startSeconds)
+  ), [clipEditRegions]);
+  const selectedEditRegion = useMemo(() => {
+    if (clipEditRegionsSorted.length === 0) return null;
+    return clipEditRegionsSorted.find((region) => region.id === selectedEditRegionId) || clipEditRegionsSorted[0];
+  }, [clipEditRegionsSorted, selectedEditRegionId]);
+  const hasRegionEditSource = (
+    isPrecisionPreviewActive
+    && Boolean(precisionPreviewToken)
+    && clipEditRegionsSorted.length > 0
+    && selectedEditRegion
+  );
+  const rangeStartSeconds = hasRegionEditSource
+    ? Number(selectedEditRegion.startSeconds)
+    : parseTimestamp(startTime);
+  const rangeEndSeconds = hasRegionEditSource
+    ? Number(selectedEditRegion.endSeconds)
+    : parseTimestamp(endTime);
   const fallbackRangeStart = isFiniteNumber(rangeStartSeconds) ? rangeStartSeconds : 0;
   const fallbackRangeEnd = isFiniteNumber(rangeEndSeconds) && rangeEndSeconds > fallbackRangeStart
     ? rangeEndSeconds
@@ -2020,14 +2429,19 @@ const ManualClipLab = ({
     isFiniteNumber(normalizedRangeEnd) &&
     normalizedRangeEnd > normalizedRangeStart
   );
-  const precisionPreviewWindowStart = Number(precisionPreviewClip?.windowStartSeconds);
+  const sourceClipWindowStart = hasRegionEditSource && isFiniteNumber(precisionPreviewWindowStart)
+    ? precisionPreviewWindowStart
+    : normalizedRangeStart;
+  const sourceClipWindowEnd = hasRegionEditSource && isFiniteNumber(precisionPreviewWindowEnd) && precisionPreviewWindowEnd > sourceClipWindowStart
+    ? precisionPreviewWindowEnd
+    : normalizedRangeEnd;
   const rangeDurationLabel = hasValidRange
     ? formatTimestamp(normalizedRangeEnd - normalizedRangeStart)
     : '--:--';
   const normalizedCaptionWordsPerChunk = Math.round(
     clampNumber(Number(captionPreviewWordsPerChunk) || 5, 3, 8)
   );
-  const alignedPreviewWordCuesInRange = useMemo(() => (
+  const alignedPreviewWordCuesInSourceWindow = useMemo(() => (
     (Array.isArray(alignedPreviewWordCues) ? alignedPreviewWordCues : [])
       .map((cue, index) => {
         const text = cleanTitleText(cue?.text || '');
@@ -2035,25 +2449,25 @@ const ManualClipLab = ({
         const cueStart = Number(cue?.startSeconds);
         const cueEnd = Number(cue?.endSeconds);
         if (!isFiniteNumber(cueStart) || !isFiniteNumber(cueEnd) || cueEnd <= cueStart) return null;
-        if (cueEnd <= normalizedRangeStart || cueStart >= normalizedRangeEnd) return null;
+        if (cueEnd <= sourceClipWindowStart || cueStart >= sourceClipWindowEnd) return null;
         return {
           id: String(cue?.id || `aligned-cue-${index + 1}`),
           text,
-          startSeconds: Number(Math.max(normalizedRangeStart, cueStart).toFixed(3)),
-          endSeconds: Number(Math.min(normalizedRangeEnd, cueEnd).toFixed(3)),
+          startSeconds: Number(Math.max(sourceClipWindowStart, cueStart).toFixed(3)),
+          endSeconds: Number(Math.min(sourceClipWindowEnd, cueEnd).toFixed(3)),
         };
       })
       .filter(Boolean)
       .sort((left, right) => left.startSeconds - right.startSeconds)
-  ), [alignedPreviewWordCues, normalizedRangeEnd, normalizedRangeStart]);
-  const transcriptDerivedPreviewWordCues = useMemo(() => {
+  ), [alignedPreviewWordCues, sourceClipWindowEnd, sourceClipWindowStart]);
+  const transcriptDerivedPreviewWordCuesInSourceWindow = useMemo(() => {
     const cues = [];
-    transcriptRows.forEach((row, rowIndex) => {
+    activeTranscriptCueRows.forEach((row, rowIndex) => {
       const rowStart = Number(row?.startSeconds);
       const rowEnd = Number(row?.endSeconds);
       if (!isFiniteNumber(rowStart) || !isFiniteNumber(rowEnd) || rowEnd <= rowStart) return;
-      const segmentStart = Math.max(normalizedRangeStart, rowStart);
-      const segmentEnd = Math.min(normalizedRangeEnd, rowEnd);
+      const segmentStart = Math.max(sourceClipWindowStart, rowStart);
+      const segmentEnd = Math.min(sourceClipWindowEnd, rowEnd);
       if (!(segmentEnd > segmentStart)) return;
 
       const words = tokenizeCaptionWords(row?.text || '');
@@ -2073,21 +2487,37 @@ const ManualClipLab = ({
       });
     });
     return cues;
-  }, [normalizedRangeEnd, normalizedRangeStart, transcriptRows]);
-  const previewWordCues = useMemo(() => (
+  }, [activeTranscriptCueRows, sourceClipWindowEnd, sourceClipWindowStart]);
+  const sourceClipPreviewWordCues = useMemo(() => (
     mergeAlignedWordCuesWithFallback({
-      alignedCues: alignedPreviewWordCuesInRange,
-      fallbackCues: transcriptDerivedPreviewWordCues,
-      rangeStartSeconds: normalizedRangeStart,
-      rangeEndSeconds: normalizedRangeEnd,
+      alignedCues: alignedPreviewWordCuesInSourceWindow,
+      fallbackCues: transcriptDerivedPreviewWordCuesInSourceWindow,
+      rangeStartSeconds: sourceClipWindowStart,
+      rangeEndSeconds: sourceClipWindowEnd,
       gapToleranceSeconds: 0.08,
       maxCues: 900,
     })
   ), [
-    alignedPreviewWordCuesInRange,
+    alignedPreviewWordCuesInSourceWindow,
+    sourceClipWindowEnd,
+    sourceClipWindowStart,
+    transcriptDerivedPreviewWordCuesInSourceWindow,
+  ]);
+  const previewWordCues = useMemo(() => (
+    sourceClipPreviewWordCues
+      .map((cue) => {
+        if (cue.endSeconds <= normalizedRangeStart || cue.startSeconds >= normalizedRangeEnd) return null;
+        return {
+          ...cue,
+          startSeconds: Number(Math.max(normalizedRangeStart, cue.startSeconds).toFixed(3)),
+          endSeconds: Number(Math.min(normalizedRangeEnd, cue.endSeconds).toFixed(3)),
+        };
+      })
+      .filter(Boolean)
+  ), [
     normalizedRangeEnd,
     normalizedRangeStart,
-    transcriptDerivedPreviewWordCues,
+    sourceClipPreviewWordCues,
   ]);
   const activePreviewWordIndex = useMemo(() => {
     if (previewWordCues.length === 0) return -1;
@@ -2145,9 +2575,9 @@ const ManualClipLab = ({
       captionPreviewChunkWords.slice(firstLineCount),
     ].filter((line) => line.length > 0);
   }, [captionPreviewChunkWords]);
-  const captionPreviewSourceLabel = alignedPreviewWordCuesInRange.length > 0
+  const captionPreviewSourceLabel = alignedPreviewWordCuesInSourceWindow.length > 0
     ? (
-      previewWordCues.length > alignedPreviewWordCuesInRange.length
+      previewWordCues.length > alignedPreviewWordCuesInSourceWindow.length
         ? 'Aligned + transcript assist'
         : 'Aligned words'
     )
@@ -2198,11 +2628,53 @@ const ManualClipLab = ({
     0,
     Math.min(100, ((clampedCurrentSeconds - viewportStartSeconds) / viewportDurationSeconds) * 100)
   );
-  const formatTrimTimeLabel = (seconds) => (
+  const visibleClipEditRegions = useMemo(() => {
+    if (!hasRegionEditSource) return [];
+    return clipEditRegionsSorted
+      .map((region, index) => {
+        const visibleStart = Math.max(viewportStartSeconds, region.startSeconds);
+        const visibleEnd = Math.min(viewportEndSeconds, region.endSeconds);
+        if (!(visibleEnd > visibleStart)) return null;
+        const leftPercent = clampNumber(((visibleStart - viewportStartSeconds) / viewportDurationSeconds) * 100, 0, 100);
+        const rightPercent = clampNumber(((visibleEnd - viewportStartSeconds) / viewportDurationSeconds) * 100, 0, 100);
+        return {
+          ...region,
+          index,
+          leftPercent,
+          widthPercent: Math.max(0.9, rightPercent - leftPercent),
+          isSelected: selectedEditRegion?.id === region.id,
+        };
+      })
+      .filter(Boolean);
+  }, [
+    clipEditRegionsSorted,
+    hasRegionEditSource,
+    selectedEditRegion?.id,
+    viewportDurationSeconds,
+    viewportEndSeconds,
+    viewportStartSeconds,
+  ]);
+  const canDeleteSelectedEditRegion = hasRegionEditSource && clipEditRegionsSorted.length > 1;
+  const canSplitSelectedEditRegion = (
+    hasRegionEditSource
+    && selectedEditRegion
+    && isFiniteNumber(currentTime)
+    && currentTime > selectedEditRegion.startSeconds + effectiveMinClipSeconds
+    && currentTime < selectedEditRegion.endSeconds - effectiveMinClipSeconds
+  );
+  const editModeStatusMessage = hasRegionEditSource
+    ? 'Edit mode armed: Ctrl+T splits the selected region, Ctrl+[ / Ctrl+] trim that region, Delete removes it, Ctrl+J joins adjacent regions, trackpad swipe pans, and wheel zooms.'
+    : 'Edit mode armed: Ctrl+T trims the nearest boundary, Ctrl+[ sets In, Ctrl+] sets Out, trackpad swipe pans, and wheel zooms.';
+  const trimShortcutInLabel = hasRegionEditSource ? 'Ctrl+[ -> Region In' : 'Ctrl+[ -> In';
+  const trimShortcutOutLabel = hasRegionEditSource ? 'Ctrl+] -> Region Out' : 'Ctrl+] -> Out';
+  const trimInstructionCopy = hasRegionEditSource
+    ? 'Drag the waveform to scrub the playhead. In Edit mode, two-finger swipe pans the timeline, wheel zooms around the playhead, Ctrl+T splits the selected region, Ctrl+[ / Ctrl+] trim that region, Delete removes it, Ctrl+J joins adjacent splits, and Space plays/stops.'
+    : 'Drag the waveform to scrub the playhead. In Edit mode, two-finger swipe pans the timeline, wheel zooms around the playhead, Ctrl+T trims the nearest boundary, Ctrl+[ sets In, Ctrl+] sets Out, and Space plays/stops.';
+  const formatTrimTimeLabel = useCallback((seconds) => (
     zoomLevel >= 3
       ? formatTimestampPrecise(seconds, 2)
       : formatTimestamp(seconds)
-  );
+  ), [zoomLevel]);
   const viewportPanStepSeconds = Math.max(0.25, viewportDurationSeconds * 0.25);
   const viewportStartLabel = formatTrimTimeLabel(viewportStartSeconds);
   const viewportEndLabel = formatTrimTimeLabel(viewportEndSeconds);
@@ -2368,6 +2840,222 @@ const ManualClipLab = ({
     });
   }, [effectiveDurationSeconds, viewportDurationSeconds, viewportStartSeconds]);
 
+  const selectedEditRegionIndex = useMemo(() => (
+    selectedEditRegion
+      ? clipEditRegionsSorted.findIndex((region) => region.id === selectedEditRegion.id)
+      : -1
+  ), [clipEditRegionsSorted, selectedEditRegion]);
+
+  const selectEditRegion = useCallback((regionId) => {
+    const target = clipEditRegionsSorted.find((region) => region.id === regionId);
+    if (!target) return;
+    setSelectedEditRegionId(target.id);
+    seekToSeconds(target.startSeconds, { allowExternalOpen: false });
+    const focusedWindow = buildFocusedTrimWindow({
+      clipStartSeconds: target.startSeconds,
+      clipEndSeconds: target.endSeconds,
+      mediaDurationSeconds: sourceClipWindowEnd,
+    });
+    if (focusedWindow) {
+      setTrimViewportRange(focusedWindow);
+      setManualViewportStartSeconds(focusedWindow.start);
+    }
+    const regionIndex = clipEditRegionsSorted.findIndex((region) => region.id === target.id);
+    setStatus(`Selected region ${Math.max(1, regionIndex + 1)} of ${clipEditRegionsSorted.length}.`);
+  }, [clipEditRegionsSorted, seekToSeconds, sourceClipWindowEnd]);
+
+  const updateSelectedEditRegionBoundary = useCallback((targetBoundary, seconds) => {
+    if (!hasRegionEditSource || !selectedEditRegion || !isFiniteNumber(seconds)) return null;
+    const previousRegion = selectedEditRegionIndex > 0 ? clipEditRegionsSorted[selectedEditRegionIndex - 1] : null;
+    const nextRegion = selectedEditRegionIndex >= 0 && selectedEditRegionIndex < clipEditRegionsSorted.length - 1
+      ? clipEditRegionsSorted[selectedEditRegionIndex + 1]
+      : null;
+
+    const clampedInput = clampNumber(seconds, sourceClipWindowStart, sourceClipWindowEnd);
+    let nextStart = selectedEditRegion.startSeconds;
+    let nextEnd = selectedEditRegion.endSeconds;
+
+    if (targetBoundary === 'start') {
+      const minStart = previousRegion ? previousRegion.endSeconds : sourceClipWindowStart;
+      const maxStart = nextEnd - effectiveMinClipSeconds;
+      nextStart = clampNumber(clampedInput, minStart, Math.max(minStart, maxStart));
+    } else if (targetBoundary === 'end') {
+      const minEnd = nextStart + effectiveMinClipSeconds;
+      const maxEnd = nextRegion ? nextRegion.startSeconds : sourceClipWindowEnd;
+      nextEnd = clampNumber(clampedInput, Math.min(minEnd, maxEnd), maxEnd);
+    } else {
+      return null;
+    }
+
+    if (!(nextEnd > nextStart)) return null;
+
+    setClipEditRegions((previous) => previous.map((region) => {
+      if (region.id !== selectedEditRegion.id) return region;
+      return {
+        ...region,
+        startSeconds: Number(nextStart.toFixed(3)),
+        endSeconds: Number(nextEnd.toFixed(3)),
+      };
+    }));
+    return targetBoundary === 'start' ? nextStart : nextEnd;
+  }, [
+    clipEditRegionsSorted,
+    effectiveMinClipSeconds,
+    hasRegionEditSource,
+    selectedEditRegion,
+    selectedEditRegionIndex,
+    sourceClipWindowEnd,
+    sourceClipWindowStart,
+  ]);
+
+  const splitSelectedEditRegionAtPlayhead = useCallback((seconds) => {
+    if (!hasRegionEditSource || !selectedEditRegion || !isFiniteNumber(seconds)) return false;
+    const splitPoint = clampNumber(seconds, selectedEditRegion.startSeconds, selectedEditRegion.endSeconds);
+    if (
+      splitPoint <= selectedEditRegion.startSeconds + effectiveMinClipSeconds
+      || splitPoint >= selectedEditRegion.endSeconds - effectiveMinClipSeconds
+    ) {
+      setStatus('Move the playhead farther inside the selected region before splitting.');
+      return false;
+    }
+
+    const boundedSplit = Number(splitPoint.toFixed(3));
+    const rightRegionId = createStudioRegionId();
+    setClipEditRegions((previous) => {
+      const ordered = [...previous].sort((left, right) => left.startSeconds - right.startSeconds);
+      const sourceIndex = ordered.findIndex((region) => region.id === selectedEditRegion.id);
+      if (sourceIndex < 0) return previous;
+      const sourceRegion = ordered[sourceIndex];
+      const leftRegion = {
+        ...sourceRegion,
+        startSeconds: Number(sourceRegion.startSeconds.toFixed(3)),
+        endSeconds: boundedSplit,
+      };
+      const rightRegion = {
+        ...sourceRegion,
+        id: rightRegionId,
+        startSeconds: boundedSplit,
+        endSeconds: Number(sourceRegion.endSeconds.toFixed(3)),
+      };
+      ordered.splice(sourceIndex, 1, leftRegion, rightRegion);
+      return ordered;
+    });
+    setSelectedEditRegionId(rightRegionId);
+    setStatus(`Region split at ${formatTrimTimeLabel(boundedSplit)}.`);
+    return true;
+  }, [
+    effectiveMinClipSeconds,
+    formatTrimTimeLabel,
+    hasRegionEditSource,
+    selectedEditRegion,
+  ]);
+
+  const deleteSelectedEditRegion = useCallback(() => {
+    if (!hasRegionEditSource || !selectedEditRegion) return;
+    if (clipEditRegionsSorted.length <= 1) {
+      setStatus('At least one region must remain.');
+      return;
+    }
+
+    const nextSelection = clipEditRegionsSorted[selectedEditRegionIndex + 1] || clipEditRegionsSorted[selectedEditRegionIndex - 1] || null;
+    setClipEditRegions((previous) => previous.filter((region) => region.id !== selectedEditRegion.id));
+    if (nextSelection) {
+      setSelectedEditRegionId(nextSelection.id);
+      seekToSeconds(nextSelection.startSeconds, { allowExternalOpen: false });
+    } else {
+      setSelectedEditRegionId('');
+    }
+    setStatus('Selected region removed. Remaining regions will join seamlessly in the final render.');
+  }, [
+    clipEditRegionsSorted,
+    hasRegionEditSource,
+    selectedEditRegion,
+    selectedEditRegionIndex,
+    seekToSeconds,
+  ]);
+
+  const joinSelectedEditRegion = useCallback(() => {
+    if (!hasRegionEditSource || !selectedEditRegion) return false;
+    const previousRegion = selectedEditRegionIndex > 0 ? clipEditRegionsSorted[selectedEditRegionIndex - 1] : null;
+    const nextRegion = selectedEditRegionIndex >= 0 && selectedEditRegionIndex < clipEditRegionsSorted.length - 1
+      ? clipEditRegionsSorted[selectedEditRegionIndex + 1]
+      : null;
+    const contiguousTolerance = 0.02;
+    const joinLeft = previousRegion && Math.abs(previousRegion.endSeconds - selectedEditRegion.startSeconds) <= contiguousTolerance;
+    const joinRight = nextRegion && Math.abs(selectedEditRegion.endSeconds - nextRegion.startSeconds) <= contiguousTolerance;
+
+    if (!joinLeft && !joinRight) {
+      setStatus('Join works on directly adjacent split regions. Deleted gaps already close automatically in the final render.');
+      return false;
+    }
+
+    if (joinLeft) {
+      const mergedRegionId = previousRegion.id;
+      setClipEditRegions((previous) => previous
+        .filter((region) => region.id !== selectedEditRegion.id)
+        .map((region) => {
+          if (region.id !== previousRegion.id) return region;
+          return {
+            ...region,
+            startSeconds: Number(previousRegion.startSeconds.toFixed(3)),
+            endSeconds: Number(selectedEditRegion.endSeconds.toFixed(3)),
+          };
+        }));
+      setSelectedEditRegionId(mergedRegionId);
+      setStatus('Joined selected region with the previous contiguous region.');
+      return true;
+    }
+
+    const mergedRegionId = selectedEditRegion.id;
+    setClipEditRegions((previous) => previous
+      .filter((region) => region.id !== nextRegion.id)
+      .map((region) => {
+        if (region.id !== selectedEditRegion.id) return region;
+        return {
+          ...region,
+          startSeconds: Number(selectedEditRegion.startSeconds.toFixed(3)),
+          endSeconds: Number(nextRegion.endSeconds.toFixed(3)),
+        };
+      }));
+    setSelectedEditRegionId(mergedRegionId);
+    setStatus('Joined selected region with the next contiguous region.');
+    return true;
+  }, [
+    clipEditRegionsSorted,
+    hasRegionEditSource,
+    selectedEditRegion,
+    selectedEditRegionIndex,
+  ]);
+
+  const setTrimZoomAroundAnchor = useCallback((nextZoomValue, anchorSeconds = null, anchorRatio = 0.5) => {
+    const clampedZoom = clampNumber(Number(nextZoomValue) || 1, 1, 8);
+    const safeAnchorRatio = clampNumber(anchorRatio, 0, 1);
+    const fallbackAnchor = viewportStartSeconds + (viewportDurationSeconds * safeAnchorRatio);
+    const safeAnchorSeconds = clampNumber(
+      isFiniteNumber(anchorSeconds) ? anchorSeconds : fallbackAnchor,
+      0,
+      effectiveDurationSeconds
+    );
+    const nextViewportDuration = Math.min(
+      baseViewportDuration,
+      Math.max(effectiveMinClipSeconds + 0.5, baseViewportDuration / clampedZoom)
+    );
+    const nextStart = clampNumber(
+      safeAnchorSeconds - (safeAnchorRatio * nextViewportDuration),
+      0,
+      Math.max(0, effectiveDurationSeconds - nextViewportDuration)
+    );
+
+    setTrimZoomLevel(clampedZoom);
+    setManualViewportStartSeconds(nextStart);
+  }, [
+    baseViewportDuration,
+    effectiveDurationSeconds,
+    effectiveMinClipSeconds,
+    viewportDurationSeconds,
+    viewportStartSeconds,
+  ]);
+
   const seekClipInPoint = useCallback(() => {
     if (!hasValidRange) return;
     stopClipPlayback();
@@ -2392,6 +3080,80 @@ const ManualClipLab = ({
   const getSecondsFromTimelinePointer = useCallback((clientX) => (
     getSecondsFromClientX(clientX, trimTimelineRef.current)
   ), [getSecondsFromClientX]);
+
+  const handleTrimTimelineWheel = useCallback((event) => {
+    if (!isTrimEditMode || isPrecisionAligning) return;
+
+    const timelineElement = trimTimelineRef.current || event.currentTarget;
+    const bounds = timelineElement?.getBoundingClientRect?.();
+    const anchorRatio = bounds?.width
+      ? clampNumber((event.clientX - bounds.left) / bounds.width, 0, 1)
+      : 0.5;
+    const anchorSeconds = getSecondsFromClientX(event.clientX, timelineElement)
+      ?? (viewportStartSeconds + (viewportDurationSeconds * anchorRatio));
+    const horizontalDominant = Math.abs(event.deltaX) > Math.abs(event.deltaY);
+
+    if (horizontalDominant && Math.abs(event.deltaX) > 0.5) {
+      event.preventDefault();
+      const panScale = bounds?.width ? (event.deltaX / bounds.width) : 0;
+      panViewportBy(panScale * viewportDurationSeconds * 1.35);
+      return;
+    }
+
+    if (Math.abs(event.deltaY) > 0.5) {
+      event.preventDefault();
+      const zoomDelta = clampNumber(event.deltaY / 180, -2.5, 2.5);
+      setTrimZoomAroundAnchor(trimZoomLevel - (zoomDelta * 0.75), anchorSeconds, anchorRatio);
+    }
+  }, [
+    getSecondsFromClientX,
+    isPrecisionAligning,
+    isTrimEditMode,
+    panViewportBy,
+    setTrimZoomAroundAnchor,
+    trimZoomLevel,
+    viewportDurationSeconds,
+    viewportStartSeconds,
+  ]);
+
+  useEffect(() => {
+    if (!isTrimEditMode || isPrecisionAligning) return undefined;
+
+    const timelineElement = trimTimelineRef.current;
+    const rootElement = document.documentElement;
+    const bodyElement = document.body;
+    if (!timelineElement || !rootElement || !bodyElement) return undefined;
+
+    const previousRootOverscroll = rootElement.style.overscrollBehavior;
+    const previousRootOverscrollX = rootElement.style.overscrollBehaviorX;
+    const previousBodyOverscroll = bodyElement.style.overscrollBehavior;
+    const previousBodyOverscrollX = bodyElement.style.overscrollBehaviorX;
+    const previousTimelineOverscroll = timelineElement.style.overscrollBehavior;
+    const previousTimelineOverscrollX = timelineElement.style.overscrollBehaviorX;
+
+    rootElement.style.overscrollBehavior = 'none';
+    rootElement.style.overscrollBehaviorX = 'none';
+    bodyElement.style.overscrollBehavior = 'none';
+    bodyElement.style.overscrollBehaviorX = 'none';
+    timelineElement.style.overscrollBehavior = 'none';
+    timelineElement.style.overscrollBehaviorX = 'none';
+
+    const onWheel = (event) => {
+      handleTrimTimelineWheel(event);
+    };
+
+    timelineElement.addEventListener('wheel', onWheel, { passive: false });
+
+    return () => {
+      timelineElement.removeEventListener('wheel', onWheel);
+      rootElement.style.overscrollBehavior = previousRootOverscroll;
+      rootElement.style.overscrollBehaviorX = previousRootOverscrollX;
+      bodyElement.style.overscrollBehavior = previousBodyOverscroll;
+      bodyElement.style.overscrollBehaviorX = previousBodyOverscrollX;
+      timelineElement.style.overscrollBehavior = previousTimelineOverscroll;
+      timelineElement.style.overscrollBehaviorX = previousTimelineOverscrollX;
+    };
+  }, [handleTrimTimelineWheel, isPrecisionAligning, isTrimEditMode]);
 
   const playScrubAudioPreview = useCallback((seconds, deltaSeconds, speedSecondsPerSecond) => {
     if (!isFiniteNumber(seconds)) return;
@@ -2472,6 +3234,9 @@ const ManualClipLab = ({
 
   const applyRangeBoundaryAtSeconds = useCallback((targetBoundary, seconds) => {
     if (!hasValidRange || !isFiniteNumber(seconds)) return null;
+    if (hasRegionEditSource) {
+      return updateSelectedEditRegionBoundary(targetBoundary, seconds);
+    }
     const cutSeconds = clampNumber(seconds, 0, effectiveDurationSeconds);
 
     if (targetBoundary === 'start') {
@@ -2494,15 +3259,25 @@ const ManualClipLab = ({
     effectiveDurationSeconds,
     effectiveMinClipSeconds,
     hasValidRange,
+    hasRegionEditSource,
     normalizedRangeEnd,
     normalizedRangeStart,
+    updateSelectedEditRegionBoundary,
   ]);
 
   const applyScrubCutAtPlayhead = useCallback((seconds, explicitTarget = null) => {
     if (!hasValidRange || !isFiniteNumber(seconds)) return;
-    const boundary = explicitTarget === 'start' || explicitTarget === 'end'
-      ? explicitTarget
-      : nextScrubCutTarget;
+    const boundary = (() => {
+      if (explicitTarget === 'start' || explicitTarget === 'end') {
+        return explicitTarget;
+      }
+      if (seconds <= normalizedRangeStart) return 'start';
+      if (seconds >= normalizedRangeEnd) return 'end';
+
+      const distanceToStart = Math.abs(seconds - normalizedRangeStart);
+      const distanceToEnd = Math.abs(normalizedRangeEnd - seconds);
+      return distanceToStart <= distanceToEnd ? 'start' : 'end';
+    })();
     const formatCutTime = (value) => (
       zoomLevel >= 3
         ? formatTimestampPrecise(value, 2)
@@ -2513,17 +3288,16 @@ const ManualClipLab = ({
 
     seekToSeconds(appliedSeconds, { allowExternalOpen: false });
     if (boundary === 'start') {
-      setNextScrubCutTarget('end');
-      setStatus(`In point set at ${formatCutTime(appliedSeconds)}. Next Cmd+T sets Out point.`);
+      setStatus(`In point set at ${formatCutTime(appliedSeconds)}.`);
       return;
     }
 
-    setNextScrubCutTarget('start');
-    setStatus(`Out point set at ${formatCutTime(appliedSeconds)}. Next Cmd+T sets In point.`);
+    setStatus(`Out point set at ${formatCutTime(appliedSeconds)}.`);
   }, [
     applyRangeBoundaryAtSeconds,
     hasValidRange,
-    nextScrubCutTarget,
+    normalizedRangeEnd,
+    normalizedRangeStart,
     seekToSeconds,
     zoomLevel,
   ]);
@@ -2542,6 +3316,37 @@ const ManualClipLab = ({
     normalizedRangeStart,
     sourceMode,
   ]);
+
+  const smartCutTarget = useMemo(() => {
+    const playheadSeconds = isFiniteNumber(currentTime)
+      ? Number(currentTime)
+      : normalizedRangeStart;
+    if (!hasValidRange) return 'start';
+    if (playheadSeconds <= normalizedRangeStart) return 'start';
+    if (playheadSeconds >= normalizedRangeEnd) return 'end';
+
+    const distanceToStart = Math.abs(playheadSeconds - normalizedRangeStart);
+    const distanceToEnd = Math.abs(normalizedRangeEnd - playheadSeconds);
+    return distanceToStart <= distanceToEnd ? 'start' : 'end';
+  }, [currentTime, hasValidRange, normalizedRangeEnd, normalizedRangeStart]);
+  const canJoinSelectedEditRegion = useMemo(() => {
+    if (!hasRegionEditSource || !selectedEditRegion) return false;
+    const previousRegion = selectedEditRegionIndex > 0 ? clipEditRegionsSorted[selectedEditRegionIndex - 1] : null;
+    const nextRegion = selectedEditRegionIndex >= 0 && selectedEditRegionIndex < clipEditRegionsSorted.length - 1
+      ? clipEditRegionsSorted[selectedEditRegionIndex + 1]
+      : null;
+    const contiguousTolerance = 0.02;
+    return Boolean(
+      (previousRegion && Math.abs(previousRegion.endSeconds - selectedEditRegion.startSeconds) <= contiguousTolerance)
+      || (nextRegion && Math.abs(selectedEditRegion.endSeconds - nextRegion.startSeconds) <= contiguousTolerance)
+    );
+  }, [clipEditRegionsSorted, hasRegionEditSource, selectedEditRegion, selectedEditRegionIndex]);
+  const trimShortcutPrimaryLabel = hasRegionEditSource
+    ? 'Ctrl+T -> Split'
+    : `Ctrl+T -> ${smartCutTarget === 'start' ? 'nearest In' : 'nearest Out'}`;
+  const trimRangeSummaryLabel = hasRegionEditSource
+    ? `Kept ${clipEditRegionsSorted.length} • Selected R${Math.max(1, selectedEditRegionIndex + 1)} • In ${formatTrimTimeLabel(normalizedRangeStart)} / Out ${formatTrimTimeLabel(normalizedRangeEnd)}`
+    : `In ${formatTrimTimeLabel(normalizedRangeStart)} / Out ${formatTrimTimeLabel(normalizedRangeEnd)}`;
 
   const handleTimelinePointerDown = useCallback((event) => {
     if (isPrecisionAligning) return;
@@ -2564,6 +3369,17 @@ const ManualClipLab = ({
     };
     const captureElement = trimTimelineRef.current || event.currentTarget;
     timelineScrubCaptureElementRef.current = captureElement;
+    if (captureElement && typeof captureElement.focus === 'function') {
+      try {
+        captureElement.focus({ preventScroll: true });
+      } catch {
+        try {
+          captureElement.focus();
+        } catch {
+          // ignore focus failures
+        }
+      }
+    }
 
     if (captureElement && typeof captureElement.setPointerCapture === 'function') {
       try {
@@ -2656,11 +3472,54 @@ const ManualClipLab = ({
       if (sourceMode === 'none' || !hasValidRange || isPrecisionAligning) return;
 
       const lowerKey = String(event.key || '').toLowerCase();
-      const isCommandCut = (event.metaKey || event.ctrlKey) && !event.altKey && lowerKey === 't';
-      if (isCommandCut) {
-        event.preventDefault();
-        cutAtCurrentPlayhead();
-        return;
+      const isBracketLeft = event.code === 'BracketLeft' || event.key === '[';
+      const isBracketRight = event.code === 'BracketRight' || event.key === ']';
+
+      if (isTrimEditMode) {
+        const isControlCut = event.ctrlKey && !event.metaKey && !event.altKey && lowerKey === 't';
+        if (isControlCut) {
+          event.preventDefault();
+          if (hasRegionEditSource) {
+            splitSelectedEditRegionAtPlayhead(
+              isFiniteNumber(currentTime) ? Number(currentTime) : normalizedRangeStart
+            );
+          } else {
+            cutAtCurrentPlayhead();
+          }
+          return;
+        }
+
+        const isControlSetIn = event.ctrlKey && !event.metaKey && !event.altKey && isBracketLeft;
+        if (isControlSetIn) {
+          event.preventDefault();
+          cutAtCurrentPlayhead('start');
+          return;
+        }
+
+        const isControlSetOut = event.ctrlKey && !event.metaKey && !event.altKey && isBracketRight;
+        if (isControlSetOut) {
+          event.preventDefault();
+          cutAtCurrentPlayhead('end');
+          return;
+        }
+
+        if (event.ctrlKey && !event.metaKey && !event.altKey && lowerKey === 'j') {
+          event.preventDefault();
+          if (hasRegionEditSource) {
+            joinSelectedEditRegion();
+          } else {
+            setStatus('Join becomes active after you create a precision preview clip and split regions.');
+          }
+          return;
+        }
+
+        if (!event.metaKey && !event.ctrlKey && !event.altKey && (event.key === 'Backspace' || event.key === 'Delete')) {
+          event.preventDefault();
+          if (hasRegionEditSource) {
+            deleteSelectedEditRegion();
+          }
+          return;
+        }
       }
 
       if (!event.metaKey && !event.ctrlKey && !event.altKey && lowerKey === 'i') {
@@ -2677,7 +3536,19 @@ const ManualClipLab = ({
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [cutAtCurrentPlayhead, hasValidRange, isPrecisionAligning, sourceMode]);
+  }, [
+    currentTime,
+    cutAtCurrentPlayhead,
+    deleteSelectedEditRegion,
+    hasRegionEditSource,
+    hasValidRange,
+    isPrecisionAligning,
+    isTrimEditMode,
+    joinSelectedEditRegion,
+    normalizedRangeStart,
+    sourceMode,
+    splitSelectedEditRegionAtPlayhead,
+  ]);
 
   useEffect(() => {
     const onWindowBlur = () => {
@@ -3162,21 +4033,23 @@ const ManualClipLab = ({
                         {waveformSourceLabel}
                       </span>
                     )}
-                    <span>In {formatTrimTimeLabel(normalizedRangeStart)} / Out {formatTrimTimeLabel(normalizedRangeEnd)}</span>
+                    <span>{trimRangeSummaryLabel}</span>
                   </div>
                 </div>
 
                 <div
                   ref={trimTimelineRef}
                   data-trim-track
-                  className={`relative h-20 rounded-lg border border-slate-300/80 dark:border-slate-600/70 bg-white/90 dark:bg-slate-800/80 overflow-hidden select-none cursor-col-resize ${isPrecisionAligning ? 'opacity-70 pointer-events-none' : ''}`}
+                  tabIndex={0}
+                  aria-label="Trim timeline"
+                  className={`relative h-20 rounded-lg border border-slate-300/80 dark:border-slate-600/70 bg-white/90 dark:bg-slate-800/80 overflow-hidden select-none cursor-ew-resize ${isPrecisionAligning ? 'opacity-70 pointer-events-none' : ''}`}
                   onPointerDown={handleTimelinePointerDown}
                   onPointerMove={handleTimelinePointerMove}
                   onPointerUp={handleTimelinePointerUp}
                   onPointerCancel={handleTimelinePointerCancel}
                   onLostPointerCapture={finishTimelineScrub}
-                >
-                  <div className="absolute inset-0 z-0 pointer-events-none">
+                  >
+                    <div className="absolute inset-0 z-0 pointer-events-none">
                     <svg
                       className="absolute inset-0 h-full w-full"
                       viewBox="0 0 100 100"
@@ -3210,6 +4083,34 @@ const ManualClipLab = ({
                       )}
                     </svg>
                   </div>
+                  {hasRegionEditSource && visibleClipEditRegions.length > 0 && (
+                    <div className="absolute inset-x-1 bottom-1 z-10 h-5">
+                      {visibleClipEditRegions.map((region) => (
+                        <button
+                          key={region.id}
+                          type="button"
+                          onPointerDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            selectEditRegion(region.id);
+                          }}
+                          className={`absolute bottom-0 h-5 rounded-md border text-[9px] font-bold tracking-wide px-1 text-white shadow-sm transition-colors ${
+                            region.isSelected
+                              ? 'border-amber-200 bg-amber-500/90'
+                              : 'border-sky-300/60 bg-sky-700/70 hover:bg-sky-600/80'
+                          }`}
+                          style={{
+                            left: `${region.leftPercent}%`,
+                            width: `${region.widthPercent}%`,
+                            minWidth: '18px',
+                          }}
+                          title={`Region ${region.index + 1}: ${formatTrimTimeLabel(region.startSeconds)} - ${formatTrimTimeLabel(region.endSeconds)}`}
+                        >
+                          <span className="block truncate">R{region.index + 1}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <div
                     className="absolute top-0 bottom-0 z-20 w-[2px] bg-primary/95 pointer-events-none"
                     style={{ left: `${trimStartPercent}%` }}
@@ -3247,7 +4148,7 @@ const ManualClipLab = ({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setTrimZoomLevel((previous) => clampNumber(previous - 0.5, 1, 8))}
+                      onClick={() => setTrimZoomAroundAnchor(trimZoomLevel - 0.5, clampedCurrentSeconds, 0.5)}
                       className="w-7 h-7 rounded-md border border-slate-300 dark:border-slate-600 font-semibold"
                       title="Zoom out trim timeline"
                       disabled={isPrecisionAligning}
@@ -3260,14 +4161,14 @@ const ManualClipLab = ({
                       max="8"
                       step="0.5"
                       value={zoomLevel}
-                      onChange={(event) => setTrimZoomLevel(clampNumber(Number(event.target.value), 1, 8))}
+                      onChange={(event) => setTrimZoomAroundAnchor(Number(event.target.value), clampedCurrentSeconds, 0.5)}
                       className="w-28 accent-primary"
                       aria-label="Trim timeline zoom"
                       disabled={isPrecisionAligning}
                     />
                     <button
                       type="button"
-                      onClick={() => setTrimZoomLevel((previous) => clampNumber(previous + 0.5, 1, 8))}
+                      onClick={() => setTrimZoomAroundAnchor(trimZoomLevel + 0.5, clampedCurrentSeconds, 0.5)}
                       className="w-7 h-7 rounded-md border border-slate-300 dark:border-slate-600 font-semibold"
                       title="Zoom in trim timeline"
                       disabled={isPrecisionAligning}
@@ -3284,6 +4185,28 @@ const ManualClipLab = ({
                       ▶
                     </button>
                     <span className="font-semibold">Zoom {zoomLevel.toFixed(1)}x</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextValue = !isTrimEditMode;
+                        setIsTrimEditMode(nextValue);
+                        if (nextValue) {
+                          trimTimelineRef.current?.focus?.();
+                          setStatus(editModeStatusMessage);
+                        } else {
+                          setStatus('Edit mode off. Timeline wheel/shortcut capture is disabled.');
+                        }
+                      }}
+                      className={`px-2.5 h-7 rounded-md border font-semibold transition-colors ${
+                        isTrimEditMode
+                          ? 'border-emerald-400 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                          : 'border-slate-300 dark:border-slate-600'
+                      }`}
+                      title="Toggle trim edit mode"
+                      disabled={isPrecisionAligning}
+                    >
+                      {isTrimEditMode ? 'Edit On' : 'Edit Off'}
+                    </button>
                   </div>
 
                 </div>
@@ -3296,36 +4219,82 @@ const ManualClipLab = ({
                     onClick={() => cutAtCurrentPlayhead('start')}
                     disabled={sourceMode === 'none' || !hasValidRange || isPrecisionAligning}
                     className="bg-white/15 text-white px-2.5 py-1.5 rounded-md text-[11px] font-semibold disabled:opacity-50"
-                    title="Set In point at current playhead"
+                    title={hasRegionEditSource ? 'Set selected region In point at current playhead' : 'Set In point at current playhead'}
                   >
-                    Set In
+                    {hasRegionEditSource ? 'Set Region In' : 'Set In'}
                   </button>
                   <button
                     onClick={() => cutAtCurrentPlayhead('end')}
                     disabled={sourceMode === 'none' || !hasValidRange || isPrecisionAligning}
                     className="bg-white/15 text-white px-2.5 py-1.5 rounded-md text-[11px] font-semibold disabled:opacity-50"
-                    title="Set Out point at current playhead"
+                    title={hasRegionEditSource ? 'Set selected region Out point at current playhead' : 'Set Out point at current playhead'}
                   >
-                    Set Out
+                    {hasRegionEditSource ? 'Set Region Out' : 'Set Out'}
                   </button>
                   <span className="px-2 py-1 rounded-md bg-white/10 text-[10px] font-semibold tracking-wide">
-                    {'Cmd+T -> '} {nextScrubCutTarget === 'start' ? 'In' : 'Out'}
+                    {trimShortcutPrimaryLabel}
                   </span>
+                  <span className="px-2 py-1 rounded-md bg-white/10 text-[10px] font-semibold tracking-wide">
+                    {trimShortcutInLabel}
+                  </span>
+                  <span className="px-2 py-1 rounded-md bg-white/10 text-[10px] font-semibold tracking-wide">
+                    {trimShortcutOutLabel}
+                  </span>
+                  {hasRegionEditSource && (
+                    <>
+                      <span className="px-2 py-1 rounded-md bg-white/10 text-[10px] font-semibold tracking-wide">
+                        {'Delete -> Remove'}
+                      </span>
+                      <span className="px-2 py-1 rounded-md bg-white/10 text-[10px] font-semibold tracking-wide">
+                        {'Ctrl+J -> Join'}
+                      </span>
+                    </>
+                  )}
+                  {hasRegionEditSource && (
+                    <>
+                      <button
+                        onClick={() => splitSelectedEditRegionAtPlayhead(
+                          isFiniteNumber(currentTime) ? Number(currentTime) : normalizedRangeStart
+                        )}
+                        disabled={!canSplitSelectedEditRegion || isPrecisionAligning}
+                        className="bg-amber-500/90 text-white px-2.5 py-1.5 rounded-md text-[11px] font-semibold disabled:opacity-50"
+                        title="Split selected region at playhead"
+                      >
+                        Split
+                      </button>
+                      <button
+                        onClick={deleteSelectedEditRegion}
+                        disabled={!canDeleteSelectedEditRegion || isPrecisionAligning}
+                        className="bg-rose-500/90 text-white px-2.5 py-1.5 rounded-md text-[11px] font-semibold disabled:opacity-50"
+                        title="Remove selected region"
+                      >
+                        Delete Region
+                      </button>
+                      <button
+                        onClick={joinSelectedEditRegion}
+                        disabled={!canJoinSelectedEditRegion || isPrecisionAligning}
+                        className="bg-emerald-500/90 text-white px-2.5 py-1.5 rounded-md text-[11px] font-semibold disabled:opacity-50"
+                        title="Join selected region with an adjacent split"
+                      >
+                        Join
+                      </button>
+                    </>
+                  )}
                   <button
                     onClick={seekClipInPoint}
                     disabled={sourceMode === 'none' || !hasValidRange || isPrecisionAligning}
                     className="bg-white/15 text-white px-2.5 py-1.5 rounded-md text-[11px] font-semibold disabled:opacity-50"
-                    title="Move playhead to trim start"
+                    title={hasRegionEditSource ? 'Move playhead to selected region start' : 'Move playhead to trim start'}
                   >
-                    Go To In
+                    {hasRegionEditSource ? 'Go To Region In' : 'Go To In'}
                   </button>
                   <button
                     onClick={seekClipOutPoint}
                     disabled={sourceMode === 'none' || !hasValidRange || isPrecisionAligning}
                     className="bg-white/15 text-white px-2.5 py-1.5 rounded-md text-[11px] font-semibold disabled:opacity-50"
-                    title="Move playhead to trim end"
+                    title={hasRegionEditSource ? 'Move playhead to selected region end' : 'Move playhead to trim end'}
                   >
-                    Go To Out
+                    {hasRegionEditSource ? 'Go To Region Out' : 'Go To Out'}
                   </button>
                   <button
                     onClick={isAuditioningClip ? stopClipPlayback : playClipFromCurrent}
@@ -3358,6 +4327,8 @@ const ManualClipLab = ({
                         <button
                           onClick={() => {
                             setPrecisionPreviewClip(null);
+                            setClipEditRegions([]);
+                            setSelectedEditRegionId('');
                             setStatus('Switched back to embedded YouTube preview.');
                           }}
                           disabled={isPrecisionAligning || isGeneratingPrecisionPreview}
@@ -3377,9 +4348,11 @@ const ManualClipLab = ({
                       ? 'Aligning...'
                       : isRendering
                       ? 'Rendering...'
-                      : stagedClipDraft
-                        ? 'Render Trimmed Clip'
-                        : 'Render Clip'}
+                      : hasRegionEditSource
+                        ? 'Render Edited Clip'
+                        : stagedClipDraft
+                          ? 'Render Trimmed Clip'
+                          : 'Render Clip'}
                   </button>
                 </div>
               </div>
@@ -3418,7 +4391,7 @@ const ManualClipLab = ({
               </div>
 
               <div className="text-xs text-slate-500 dark:text-slate-400">
-                Drag the waveform to scrub the playhead. Press Cmd+T to place alternating In/Out cuts at the playhead (or use I for In and O for Out). Press Space to play/stop.
+                {trimInstructionCopy}
               </div>
               {isPrecisionAligning && (
                 <div className="text-xs text-sky-700 dark:text-sky-300">

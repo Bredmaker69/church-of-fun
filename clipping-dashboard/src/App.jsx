@@ -5,7 +5,6 @@ import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { httpsCallable } from 'firebase/functions';
 import Sidebar from './components/Sidebar';
 import TopNav from './components/TopNav';
-import VideoGrid from './components/VideoGrid';
 import MobileTabBar from './components/MobileTabBar';
 import ManualClipLab from './components/ManualClipLab';
 import ClipVaultWorkspace from './components/ClipVaultWorkspace';
@@ -274,15 +273,14 @@ const normalizeProject = (project, index = 0) => {
 function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [workspace, setWorkspace] = useState('studio');
-  const [videos, setVideos] = useState([]);
-  const [localVideos, setLocalVideos] = useState([]);
+  const [, setVideos] = useState([]);
+  const [, setLocalVideos] = useState([]);
   const [localDebugStatus, setLocalDebugStatus] = useState('');
   const [contentProfile, setContentProfile] = useState('generic');
   const [activeSource, setActiveSource] = useState(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [activeTopNavView, setActiveTopNavView] = useState('preview');
-  const [pendingStudioNavTarget, setPendingStudioNavTarget] = useState('');
   const [clipVault, setClipVault] = useState(() => readLocalJson(CLIP_VAULT_STORAGE_KEY, []));
   const [montageProjects, setMontageProjects] = useState(() => {
     const storedProjects = readLocalJson(MONTAGE_PROJECT_STORAGE_KEY, []);
@@ -299,7 +297,6 @@ function App() {
   const sidebarResizeStateRef = useRef(null);
   const mainScrollContainerRef = useRef(null);
   const previewSectionRef = useRef(null);
-  const recentSectionRef = useRef(null);
   const pendingAutoProjectIdRef = useRef('');
   const mediaHydrationInFlightRef = useRef(new Set());
   const clipPersistenceInFlightRef = useRef(new Set());
@@ -1575,7 +1572,6 @@ function App() {
     mobileIngestSurfaceRef.current?.activateUpload?.();
   };
 
-  const displayVideos = skipStorageUploadInLocalMode ? [...localVideos, ...videos] : videos;
   const clipVaultForWorkspace = useMemo(() => {
     return clipVault.map((clip) => ({
       ...clip,
@@ -1584,12 +1580,9 @@ function App() {
     }));
   }, [clipPlaybackUrls, clipVault]);
 
-  const scrollStudioSectionIntoView = useCallback((target, behavior = 'smooth') => {
-    const targetElement = target === 'recent'
-      ? recentSectionRef.current
-      : previewSectionRef.current;
-    if (!targetElement) return false;
-    targetElement.scrollIntoView({ behavior, block: 'start' });
+  const scrollStudioSectionIntoView = useCallback((behavior = 'smooth') => {
+    if (!previewSectionRef.current) return false;
+    previewSectionRef.current.scrollIntoView({ behavior, block: 'start' });
     return true;
   }, []);
 
@@ -1602,21 +1595,11 @@ function App() {
     }
 
     setWorkspace('studio');
-    setActiveTopNavView(target);
-    setPendingStudioNavTarget(target);
-  }, []);
-
-  useEffect(() => {
-    if (workspace !== 'studio' || !pendingStudioNavTarget) return;
-    const frameId = window.requestAnimationFrame(() => {
-      const didScroll = scrollStudioSectionIntoView(pendingStudioNavTarget);
-      if (didScroll) {
-        setPendingStudioNavTarget('');
-      }
+    setActiveTopNavView('preview');
+    window.requestAnimationFrame(() => {
+      scrollStudioSectionIntoView();
     });
-
-    return () => window.cancelAnimationFrame(frameId);
-  }, [workspace, pendingStudioNavTarget, scrollStudioSectionIntoView]);
+  }, [scrollStudioSectionIntoView]);
 
   const handleToggleSidebar = useCallback(() => {
     setIsSidebarCollapsed((previous) => !previous);
@@ -1708,18 +1691,6 @@ function App() {
                       onProjectNameSuggestion={handleProjectNameSuggestion}
                     />
                   </AppErrorBoundary>
-                </div>
-
-                <div ref={recentSectionRef} className="pt-4">
-                  <div className="flex items-center justify-between mb-6">
-                    <h2 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-primary to-accent-neon">
-                      Recent Processed
-                    </h2>
-                    <button className="text-sm font-medium text-slate-500 hover:text-primary dark:text-slate-400 dark:hover:text-accent-neon transition-colors">
-                      View All
-                    </button>
-                  </div>
-                  <VideoGrid videos={displayVideos} />
                 </div>
               </>
             )}
