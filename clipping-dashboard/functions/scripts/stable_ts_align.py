@@ -135,6 +135,53 @@ def _extract_words_and_segments(result: Any) -> tuple[list[dict[str, Any]], list
     return words, segments_out, full_text
 
 
+def _infer_result_duration_seconds(result: Any, segments: list[dict[str, Any]]) -> float | None:
+    if segments:
+        segment_end = _safe_float(segments[-1].get("end"))
+        if segment_end is not None and segment_end > 0:
+            return float(segment_end)
+
+    for key in ("duration", "audio_duration", "audioDuration", "end"):
+        value = _safe_float(_get_field(result, key))
+        if value is not None and value > 0:
+            return float(value)
+
+    if hasattr(result, "to_dict"):
+        try:
+            payload = result.to_dict()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("duration", "audio_duration", "audioDuration", "end"):
+                value = _safe_float(payload.get(key))
+                if value is not None and value > 0:
+                    return float(value)
+
+    return None
+
+
+def _build_approx_words_from_text(text: str, duration_seconds: float | None) -> list[dict[str, Any]]:
+    normalized_text = _normalize_word_text(text)
+    tokens = [token for token in normalized_text.split(" ") if token]
+    safe_duration = _safe_float(duration_seconds)
+    if not tokens or safe_duration is None or safe_duration <= 0:
+        return []
+
+    slot = max(0.02, safe_duration / len(tokens))
+    words: list[dict[str, Any]] = []
+    for index, token in enumerate(tokens):
+        start = slot * index
+        end = safe_duration if index == len(tokens) - 1 else slot * (index + 1)
+        words.append(
+            {
+                "word": token,
+                "start": round(float(start), 4),
+                "end": round(float(max(start + 0.02, end)), 4),
+            }
+        )
+    return words
+
+
 def _print_error(message: str, code: int = 1) -> int:
     payload = {
         "success": False,
@@ -242,26 +289,77 @@ def main() -> int:
             return None, str(error)
 
     attempt_notes: list[str] = []
-    result, transcribe_error = _transcribe_with_kwargs(transcribe_kwargs)
-    if result is None:
-        return _print_error(f"stable-ts transcription failed: {transcribe_error}")
+    attempt_results: list[tuple[str, Any]] = []
 
-    words, segments, transcript_text = _extract_words_and_segments(result)
+    retry_attempts: list[tuple[str, dict[str, Any]]] = [
+        ("default", dict(transcribe_kwargs)),
+    ]
+
+    relaxed_kwargs = dict(transcribe_kwargs)
+    relaxed_kwargs.pop("vad", None)
+    relaxed_kwargs.pop("suppress_silence", None)
+    retry_attempts.append(("retry_without_vad", relaxed_kwargs))
+
+    if args.prompt.strip():
+        no_prompt_kwargs = dict(relaxed_kwargs)
+        no_prompt_kwargs.pop("initial_prompt", None)
+        retry_attempts.append(("retry_without_prompt", no_prompt_kwargs))
+
+    if args.language.strip():
+        no_language_kwargs = dict(relaxed_kwargs)
+        no_language_kwargs.pop("language", None)
+        retry_attempts.append(("retry_without_language", no_language_kwargs))
+
+    if args.prompt.strip() and args.language.strip():
+        minimal_kwargs = dict(relaxed_kwargs)
+        minimal_kwargs.pop("initial_prompt", None)
+        minimal_kwargs.pop("language", None)
+        retry_attempts.append(("retry_minimal", minimal_kwargs))
+
+    words: list[dict[str, Any]] = []
+    segments: list[dict[str, Any]] = []
+    transcript_text = ""
+    selected_result = None
+    selected_attempt = ""
+    first_error = ""
+
+    for attempt_name, attempt_kwargs in retry_attempts:
+        result, transcribe_error = _transcribe_with_kwargs(attempt_kwargs)
+        if result is None:
+            if not first_error:
+                first_error = transcribe_error
+            attempt_notes.append(f"{attempt_name}_error:{transcribe_error[:160]}")
+            continue
+
+        current_words, current_segments, current_text = _extract_words_and_segments(result)
+        attempt_results.append((attempt_name, result))
+        if current_words:
+            words = current_words
+            segments = current_segments
+            transcript_text = current_text
+            selected_result = result
+            selected_attempt = attempt_name
+            break
+
+        attempt_notes.append(f"{attempt_name}_no_words")
+        if not transcript_text and current_text:
+            transcript_text = current_text
+        if not segments and current_segments:
+            segments = current_segments
+        if selected_result is None:
+            selected_result = result
+
+    if not words and selected_result is not None:
+        duration_seconds = _infer_result_duration_seconds(selected_result, segments)
+        approx_words = _build_approx_words_from_text(transcript_text, duration_seconds)
+        if approx_words:
+            words = approx_words
+            selected_attempt = f"{selected_attempt or 'approx'}_approx_text"
+            attempt_notes.append("approx_from_transcript_text")
 
     if not words:
-        # Retry without VAD/silence suppression; those heuristics can over-prune speech on some clips.
-        relaxed_kwargs = dict(transcribe_kwargs)
-        relaxed_kwargs.pop("vad", None)
-        relaxed_kwargs.pop("suppress_silence", None)
-        attempt_notes.append("retry_without_vad")
-
-        second_result, second_error = _transcribe_with_kwargs(relaxed_kwargs)
-        if second_result is not None:
-            words, segments, transcript_text = _extract_words_and_segments(second_result)
-        elif second_error:
-            attempt_notes.append(f"retry_error:{second_error[:160]}")
-
-    if not words:
+        if first_error and not attempt_results:
+            return _print_error(f"stable-ts transcription failed: {first_error}")
         note_text = f" Attempts: {'; '.join(attempt_notes)}." if attempt_notes else ""
         return _print_error(f"stable-ts produced no usable timed words.{note_text}")
 
@@ -270,6 +368,8 @@ def main() -> int:
         "provider": "stable_ts_local",
         "modelUsed": args.model,
         "language": args.language.strip() or "auto",
+        "attemptUsed": selected_attempt or "default",
+        "attemptNotes": attempt_notes,
         "text": transcript_text,
         "wordCount": len(words),
         "segmentCount": len(segments),

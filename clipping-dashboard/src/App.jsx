@@ -8,7 +8,6 @@ import TopNav from './components/TopNav';
 import MobileTabBar from './components/MobileTabBar';
 import ManualClipLab from './components/ManualClipLab';
 import ClipVaultWorkspace from './components/ClipVaultWorkspace';
-import IngestSurface from './components/IngestSurface';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { renderLocalClipFiles } from './lib/localClipper';
 import {
@@ -52,6 +51,15 @@ const parseTimestampToSeconds = (value) => {
   return null;
 };
 
+const formatTimestamp = (totalSeconds) => {
+  const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remaining = seconds % 60;
+  if (hours > 0) return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remaining).padStart(2, '0')}`;
+  return `${String(minutes).padStart(2, '0')}:${String(remaining).padStart(2, '0')}`;
+};
+
 const normalizeCaptionCues = (value) => {
   if (!Array.isArray(value)) return [];
   return value
@@ -68,6 +76,24 @@ const normalizeCaptionCues = (value) => {
         text,
         startSeconds: Number(startSeconds.toFixed(2)),
         endSeconds: Number(endSeconds.toFixed(2)),
+        words: Array.isArray(cue?.words)
+          ? cue.words
+            .map((word, wordIndex) => {
+              const wordText = cleanClipText(word?.text || '');
+              const wordStartSeconds = Number(word?.startSeconds);
+              const wordEndSeconds = Number(word?.endSeconds);
+              if (!wordText || !Number.isFinite(wordStartSeconds) || !Number.isFinite(wordEndSeconds) || wordEndSeconds <= wordStartSeconds) {
+                return null;
+              }
+              return {
+                id: String(word?.id || `${cue?.id || `cue-${index + 1}`}-word-${wordIndex + 1}`),
+                text: wordText,
+                startSeconds: Number(wordStartSeconds.toFixed(2)),
+                endSeconds: Number(wordEndSeconds.toFixed(2)),
+              };
+            })
+            .filter(Boolean)
+          : [],
         sourceStartSeconds: Number.isFinite(Number(cue?.sourceStartSeconds))
           ? Number(Number(cue.sourceStartSeconds).toFixed(2))
           : null,
@@ -119,6 +145,55 @@ const cleanClipText = (value) => {
     .replace(/[[\]{}<>]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+};
+
+const normalizeClipTextAndCaptionState = (clip = {}) => {
+  const transcriptSourceText = cleanClipText(
+    clip.transcriptSourceText || clip.transcriptText || clip.description || ''
+  );
+  const transcriptSelectedText = cleanClipText(clip.transcriptSelectedText || '');
+  const transcriptOriginalText = cleanClipText(
+    clip.transcriptOriginalText || transcriptSelectedText || transcriptSourceText
+  );
+  const transcriptEditedText = cleanClipText(clip.transcriptEditedText || '');
+  const transcriptDisplayText = transcriptEditedText || transcriptSelectedText || transcriptOriginalText || transcriptSourceText;
+  const transcriptSnippet = cleanClipText(
+    clip.transcriptSnippet || transcriptDisplayText || transcriptSourceText
+  ).slice(0, 260);
+  const captionCuesOriginal = normalizeCaptionCues(clip.captionCuesOriginal || clip.captionCues);
+  const captionCuesEdited = normalizeCaptionCues(clip.captionCuesEdited);
+  const captionTextOverride = cleanClipText(clip.captionTextOverride || '');
+  const captionEditMode = String(
+    clip.captionEditMode
+      || (captionCuesEdited.length > 0 ? 'cue-edit' : (transcriptEditedText || captionTextOverride ? 'text-edit' : 'source'))
+  );
+  const transcriptEditedAt = String(clip.transcriptEditedAt || '');
+
+  return {
+    transcriptSourceText,
+    transcriptSelectedText,
+    transcriptOriginalText,
+    transcriptEditedText,
+    transcriptSnippet,
+    captionCuesOriginal,
+    captionCuesEdited,
+    captionTextOverride,
+    captionEditMode,
+    transcriptEditedAt,
+  };
+};
+
+const normalizeVaultClipRecord = (clip = {}) => {
+  const textAndCaptionState = normalizeClipTextAndCaptionState(clip);
+  return {
+    ...clip,
+    ...textAndCaptionState,
+    captionCues: textAndCaptionState.captionCuesOriginal,
+    captionStylePreset: String(clip.captionStylePreset || 'reel-bold'),
+    captionConfirmationStatus: String(clip.captionConfirmationStatus || 'pending'),
+    captionConfirmedText: cleanClipText(clip.captionConfirmedText || ''),
+    captionConfirmedAt: String(clip.captionConfirmedAt || ''),
+  };
 };
 
 const toTitleCase = (value) => {
@@ -189,7 +264,9 @@ const shortHash = (value) => {
 };
 
 const buildSemanticTitleBase = (clip) => {
-  const transcriptText = cleanClipText(clip?.transcriptSnippet || clip?.transcriptText || '');
+  const transcriptText = cleanClipText(
+    clip?.transcriptEditedText || clip?.transcriptSnippet || clip?.transcriptText || ''
+  );
   const descriptionText = cleanClipText(clip?.description || '');
   const fallbackText = cleanClipText(clip?.title || '');
   const sourceText = transcriptText || descriptionText || fallbackText;
@@ -261,10 +338,71 @@ const normalizeProject = (project, index = 0) => {
     : (Array.isArray(project?.clipIds) ? project.clipIds : []).map((clipId) => createTimelineItem(String(clipId)));
 
   return {
+    ...project,
     id: baseId,
     name: String(project?.name || `Montage ${index + 1}`),
+    workflowType: String(project?.workflowType || 'standard'),
     timelineItems,
     clipIds: timelineItems.map((item) => item.clipId),
+    mediaAssets: Array.isArray(project?.mediaAssets) ? project.mediaAssets.map((asset, assetIndex) => ({
+      id: String(asset?.id || `${baseId}-asset-${assetIndex + 1}`),
+      label: String(asset?.label || `Asset ${assetIndex + 1}`),
+      clipId: String(asset?.clipId || ''),
+      fileName: String(asset?.fileName || ''),
+      mimeType: String(asset?.mimeType || 'video/mp4'),
+      sizeBytes: Number(asset?.sizeBytes || 0),
+      durationSeconds: Number(asset?.durationSeconds || 0),
+      width: Number(asset?.width || 0),
+      height: Number(asset?.height || 0),
+      hasEmbeddedAudio: asset?.hasEmbeddedAudio !== false,
+    })) : [],
+    syncMap: project?.syncMap && typeof project.syncMap === 'object'
+      ? {
+        method: String(project.syncMap.method || ''),
+        offsetSeconds: Number(project.syncMap.offsetSeconds || 0),
+        confidence: Number(project.syncMap.confidence || 0),
+        cameraOffsets: {
+          camera1: Number(project.syncMap?.cameraOffsets?.camera1 || 0),
+          camera2: Number(project.syncMap?.cameraOffsets?.camera2 || 0),
+        },
+      }
+      : null,
+    masterAudioAssetId: String(project?.masterAudioAssetId || ''),
+    audioMixMode: String(project?.audioMixMode || 'single_master'),
+    audioMixSettings: project?.audioMixSettings && typeof project.audioMixSettings === 'object'
+      ? {
+        camera1Volume: Number(project.audioMixSettings.camera1Volume || 100),
+        camera2Volume: Number(project.audioMixSettings.camera2Volume || 100),
+        camera1Pan: Number.isFinite(Number(project.audioMixSettings.camera1Pan)) ? Number(project.audioMixSettings.camera1Pan) : -1,
+        camera2Pan: Number.isFinite(Number(project.audioMixSettings.camera2Pan)) ? Number(project.audioMixSettings.camera2Pan) : 1,
+      }
+      : {
+        camera1Volume: 100,
+        camera2Volume: 100,
+        camera1Pan: -1,
+        camera2Pan: 1,
+      },
+    speakerProfiles: Array.isArray(project?.speakerProfiles) ? project.speakerProfiles : [],
+    speakerCameraPreferences: project?.speakerCameraPreferences && typeof project.speakerCameraPreferences === 'object'
+      ? project.speakerCameraPreferences
+      : {},
+    multicamTimelineSegments: Array.isArray(project?.multicamTimelineSegments)
+      ? project.multicamTimelineSegments.map((segment, segmentIndex) => ({
+        id: String(segment?.id || `${baseId}-segment-${segmentIndex + 1}`),
+        cameraId: String(segment?.cameraId || 'camera1'),
+        cameraClipId: String(segment?.cameraClipId || ''),
+        startSeconds: Number(segment?.startSeconds || 0),
+        endSeconds: Number(segment?.endSeconds || 0),
+        confidence: Number(segment?.confidence || 0),
+        silenceCandidate: Boolean(segment?.silenceCandidate),
+        autoDecision: String(segment?.autoDecision || 'hold'),
+        manualCameraId: String(segment?.manualCameraId || ''),
+        isLocked: Boolean(segment?.isLocked),
+      }))
+      : [],
+    manualOverrides: project?.manualOverrides && typeof project.manualOverrides === 'object'
+      ? project.manualOverrides
+      : { segments: {}, speakerCameraPreferences: {} },
     createdAt: project?.createdAt || new Date().toISOString(),
     updatedAt: project?.updatedAt || project?.createdAt || new Date().toISOString(),
   };
@@ -277,11 +415,15 @@ function App() {
   const [, setLocalVideos] = useState([]);
   const [localDebugStatus, setLocalDebugStatus] = useState('');
   const [contentProfile, setContentProfile] = useState('generic');
+  const [studioPrepMode, setStudioPrepMode] = useState('single');
   const [activeSource, setActiveSource] = useState(null);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [activeTopNavView, setActiveTopNavView] = useState('preview');
-  const [clipVault, setClipVault] = useState(() => readLocalJson(CLIP_VAULT_STORAGE_KEY, []));
+  const [clipVault, setClipVault] = useState(() => {
+    const storedClips = readLocalJson(CLIP_VAULT_STORAGE_KEY, []);
+    return Array.isArray(storedClips) ? storedClips.map((clip) => normalizeVaultClipRecord(clip)) : [];
+  });
   const [montageProjects, setMontageProjects] = useState(() => {
     const storedProjects = readLocalJson(MONTAGE_PROJECT_STORAGE_KEY, []);
     return Array.isArray(storedProjects) ? storedProjects.map((project, index) => normalizeProject(project, index)) : [];
@@ -292,8 +434,7 @@ function App() {
   const [clipPlaybackUrls, setClipPlaybackUrls] = useState({});
   const [clipMediaStats, setClipMediaStats] = useState({ totalBytes: 0, clipCount: 0 });
   const clipPlaybackUrlsRef = useRef({});
-  const desktopIngestSurfaceRef = useRef(null);
-  const mobileIngestSurfaceRef = useRef(null);
+  const studioFileInputRef = useRef(null);
   const sidebarResizeStateRef = useRef(null);
   const mainScrollContainerRef = useRef(null);
   const previewSectionRef = useRef(null);
@@ -461,14 +602,25 @@ function App() {
             ? endSeconds - startSeconds
             : Number(clip.durationSeconds) || null
         );
-        const normalizedTranscriptSourceText = cleanClipText(
-          clip.transcriptSourceText || clip.transcriptText || clip.description || ''
+        const {
+          transcriptSourceText: normalizedTranscriptSourceText,
+          transcriptSelectedText: normalizedTranscriptSelectedText,
+          transcriptOriginalText: normalizedTranscriptOriginalText,
+          transcriptEditedText: normalizedTranscriptEditedText,
+          transcriptSnippet: normalizedTranscriptSnippet,
+          captionCuesOriginal: normalizedCaptionCuesOriginal,
+          captionCuesEdited: normalizedCaptionCuesEdited,
+          captionTextOverride: normalizedCaptionTextOverride,
+          captionEditMode: normalizedCaptionEditMode,
+          transcriptEditedAt: normalizedTranscriptEditedAt,
+        } = normalizeClipTextAndCaptionState(clip);
+        const hasIncomingTranscriptEdits = Boolean(
+          normalizedTranscriptEditedText
+          || normalizedCaptionCuesEdited.length > 0
+          || normalizedCaptionTextOverride
+          || normalizedTranscriptEditedAt
+          || normalizedCaptionEditMode !== 'source'
         );
-        const normalizedTranscriptSelectedText = cleanClipText(clip.transcriptSelectedText || '');
-        const normalizedTranscriptSnippet = cleanClipText(
-          clip.transcriptSnippet || normalizedTranscriptSelectedText || normalizedTranscriptSourceText
-        ).slice(0, 260);
-        const normalizedCaptionCues = normalizeCaptionCues(clip.captionCues);
 
         const baseItem = {
           id: `vault-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -491,6 +643,9 @@ function App() {
           transcriptSourceText: normalizedTranscriptSourceText,
           transcriptSnippet: normalizedTranscriptSnippet,
           transcriptSelectedText: normalizedTranscriptSelectedText,
+          transcriptOriginalText: normalizedTranscriptOriginalText,
+          transcriptEditedText: normalizedTranscriptEditedText,
+          transcriptEditedAt: normalizedTranscriptEditedAt,
           transcriptProvider: String(clip.transcriptProvider || ''),
           transcriptLanguage: String(clip.transcriptLanguage || ''),
           selectionStartSeconds: Number.isFinite(Number(clip.selectionStartSeconds))
@@ -499,7 +654,11 @@ function App() {
           selectionEndSeconds: Number.isFinite(Number(clip.selectionEndSeconds))
             ? Number(Number(clip.selectionEndSeconds).toFixed(2))
             : null,
-          captionCues: normalizedCaptionCues,
+          captionCues: normalizedCaptionCuesOriginal,
+          captionCuesOriginal: normalizedCaptionCuesOriginal,
+          captionCuesEdited: normalizedCaptionCuesEdited,
+          captionTextOverride: normalizedCaptionTextOverride,
+          captionEditMode: normalizedCaptionEditMode,
           captionStylePreset: String(clip.captionStylePreset || 'reel-bold'),
           captionConfirmationStatus: String(clip.captionConfirmationStatus || 'pending'),
           captionConfirmedText: cleanClipText(clip.captionConfirmedText || ''),
@@ -522,9 +681,22 @@ function App() {
           const mergedMediaStatus = hasPersistableMedia
             ? (existingStatus === 'persisted' || existingStatus === 'persisting' ? existingStatus : 'pending')
             : 'none';
+          const preservedEditableFields = hasIncomingTranscriptEdits
+            ? {}
+            : {
+              transcriptEditedText: cleanClipText(existing.transcriptEditedText || ''),
+              transcriptEditedAt: String(existing.transcriptEditedAt || ''),
+              captionCuesEdited: normalizeCaptionCues(existing.captionCuesEdited),
+              captionTextOverride: cleanClipText(existing.captionTextOverride || ''),
+              captionEditMode: String(existing.captionEditMode || baseItem.captionEditMode || 'source'),
+              captionConfirmationStatus: String(existing.captionConfirmationStatus || baseItem.captionConfirmationStatus || 'pending'),
+              captionConfirmedText: cleanClipText(existing.captionConfirmedText || ''),
+              captionConfirmedAt: String(existing.captionConfirmedAt || ''),
+            };
           next[existingIndex] = {
             ...existing,
             ...baseItem,
+            ...preservedEditableFields,
             id: existing.id,
             createdAt: existing.createdAt || timestampNow,
             mediaPersistenceStatus: mergedMediaStatus,
@@ -867,7 +1039,7 @@ function App() {
     }
   };
 
-  const processUploadedFile = async (file, projectId) => {
+  const processUploadedFile = useCallback(async (file, projectId) => {
     if (!file) return;
 
     try {
@@ -1065,9 +1237,15 @@ function App() {
     } catch (err) {
       console.error('Error setting up upload', err);
     }
-  };
+  }, [
+    callGenerateClipsWithTimeout,
+    contentProfile,
+    saveClipsToVault,
+    skipStorageUploadInLocalMode,
+    updateLocalVideo,
+  ]);
 
-  const handleIngestFile = (file) => {
+  const handleIngestFile = useCallback((file) => {
     if (!file) return;
     if (!String(file.type || '').startsWith('video/')) return;
 
@@ -1084,9 +1262,40 @@ function App() {
     });
 
     void processUploadedFile(file, projectId);
-  };
+  }, [createMontageProjectRecord, processUploadedFile]);
 
-  const handleIngestUrl = (url) => {
+  const handleIngestFiles = useCallback((files) => {
+    const normalizedFiles = Array.from(files || []).filter((file) => String(file?.type || '').startsWith('video/'));
+    if (normalizedFiles.length === 0) return;
+    if (studioPrepMode !== 'multicam') {
+      handleIngestFile(normalizedFiles[0]);
+      return;
+    }
+
+    if (normalizedFiles.length < 2) return;
+
+    const [camera1File, camera2File] = normalizedFiles.slice(0, 2);
+    const fallbackName = [stripFileExtension(camera1File?.name), stripFileExtension(camera2File?.name)]
+      .filter(Boolean)
+      .join(' + ') || `Podcast Session ${new Date().toLocaleDateString()}`;
+    const projectId = createMontageProjectRecord(fallbackName, {
+      switchWorkspaceToVault: false,
+      markManualOverride: false,
+    });
+
+    setWorkspace('studio');
+    setActiveSource({
+      kind: 'multicam',
+      label: `${camera1File.name} + ${camera2File.name}`,
+      payload: {
+        projectId,
+        projectName: fallbackName,
+        cameraFiles: [camera1File, camera2File],
+      },
+    });
+  }, [createMontageProjectRecord, handleIngestFile, studioPrepMode]);
+
+  const handleIngestUrl = useCallback((url) => {
     const normalizedUrl = parseHttpUrl(url);
     if (!normalizedUrl) return;
 
@@ -1100,20 +1309,7 @@ function App() {
       label: normalizedUrl,
       payload: normalizedUrl
     });
-  };
-
-  const handleDropPayload = (payload) => {
-    if (!payload) return;
-
-    if (payload.kind === 'file' && payload.file) {
-      handleIngestFile(payload.file);
-      return;
-    }
-
-    if (payload.kind === 'url' && payload.url) {
-      handleIngestUrl(payload.url);
-    }
-  };
+  }, [createMontageProjectRecord]);
 
   const handleCreateMontageProject = useCallback((projectName) => {
     const trimmedName = String(projectName || '').trim();
@@ -1480,6 +1676,39 @@ function App() {
     );
   }, []);
 
+  const handleUpdateClip = useCallback((clipId, patch) => {
+    if (!clipId || !patch || typeof patch !== 'object') return;
+    setClipVault((previous) => previous.map((clip) => {
+      if (clip.id !== clipId) return clip;
+      return normalizeVaultClipRecord({
+        ...clip,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      });
+    }));
+  }, []);
+
+  const handleUpdateMontageProject = useCallback((projectId, patchOrUpdater) => {
+    const normalizedProjectId = String(projectId || '').trim();
+    if (!normalizedProjectId || !patchOrUpdater) return false;
+
+    let changed = false;
+    setMontageProjects((previous) => previous.map((project, index) => {
+      if (project.id !== normalizedProjectId) return project;
+      const nextPatch = typeof patchOrUpdater === 'function'
+        ? patchOrUpdater(normalizeProject(project, index))
+        : patchOrUpdater;
+      if (!nextPatch || typeof nextPatch !== 'object') return project;
+      changed = true;
+      return normalizeProject({
+        ...project,
+        ...nextPatch,
+        updatedAt: new Date().toISOString(),
+      }, index);
+    }));
+    return changed;
+  }, []);
+
   const handleSplitTimelineItem = useCallback((projectId, timelineItemId, splitSeconds) => {
     if (!projectId || !timelineItemId || !Number.isFinite(Number(splitSeconds))) return null;
     let splitResult = null;
@@ -1553,28 +1782,34 @@ function App() {
   }, [ensureActiveProjectId, saveClipsToVault]);
 
   const handleUploadShortcut = () => {
-    const isDesktopViewport =
-      typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches;
-
-    if (isDesktopViewport) {
-      desktopIngestSurfaceRef.current?.activateUpload?.();
-      return;
-    }
-
     if (workspace !== 'studio') {
       setWorkspace('studio');
       window.setTimeout(() => {
-        mobileIngestSurfaceRef.current?.activateUpload?.();
+        studioFileInputRef.current?.click?.();
       }, 40);
       return;
     }
 
-    mobileIngestSurfaceRef.current?.activateUpload?.();
+    studioFileInputRef.current?.click?.();
   };
+
+  const handleStudioTopUrlSubmit = useCallback((value) => {
+    if (studioPrepMode === 'multicam') return;
+    const parsed = parseHttpUrl(value);
+    if (!parsed) return;
+    if (workspace !== 'studio') {
+      setWorkspace('studio');
+    }
+    handleIngestUrl(parsed);
+  }, [handleIngestUrl, studioPrepMode, workspace]);
+
+  const handleStudioPrepModeChange = useCallback((nextMode) => {
+    setStudioPrepMode(nextMode === 'multicam' ? 'multicam' : 'single');
+  }, []);
 
   const clipVaultForWorkspace = useMemo(() => {
     return clipVault.map((clip) => ({
-      ...clip,
+      ...normalizeVaultClipRecord(clip),
       playbackUrl: clipPlaybackUrls[clip.id] || '',
       renderDownloadUrl: String(clip.renderDownloadUrl || clip.downloadUrl || ''),
     }));
@@ -1605,6 +1840,161 @@ function App() {
     setIsSidebarCollapsed((previous) => !previous);
   }, []);
 
+  const handleFocusClipStudioEdit = useCallback(() => {
+    setIsSidebarCollapsed(true);
+  }, []);
+
+  const handleCreateMulticamProjectFromPrep = useCallback(async (draft) => {
+    const projectId = String(draft?.projectId || '').trim() || ensureActiveProjectId(String(draft?.projectName || 'Podcast Session'));
+    const projectName = String(draft?.projectName || 'Podcast Session').trim() || 'Podcast Session';
+    const mediaAssets = Array.isArray(draft?.mediaAssets) ? draft.mediaAssets : [];
+    const multicamTimelineSegments = Array.isArray(draft?.timelineSegments) ? draft.timelineSegments : [];
+    const masterAudioAssetId = String(draft?.masterAudioAssetId || mediaAssets[0]?.id || 'camera1');
+    const audioMixMode = String(draft?.audioMixMode || 'single_master');
+    const audioMixSettings = draft?.audioMixSettings && typeof draft.audioMixSettings === 'object'
+      ? {
+        camera1Volume: Number(draft.audioMixSettings.camera1Volume || 100),
+        camera2Volume: Number(draft.audioMixSettings.camera2Volume || 100),
+        camera1Pan: Number.isFinite(Number(draft.audioMixSettings.camera1Pan)) ? Number(draft.audioMixSettings.camera1Pan) : -1,
+        camera2Pan: Number.isFinite(Number(draft.audioMixSettings.camera2Pan)) ? Number(draft.audioMixSettings.camera2Pan) : 1,
+      }
+      : {
+        camera1Volume: 100,
+        camera2Volume: 100,
+        camera1Pan: -1,
+        camera2Pan: 1,
+      };
+    const syncMap = draft?.syncMap && typeof draft.syncMap === 'object'
+      ? draft.syncMap
+      : {
+        method: 'waveform-correlation',
+        offsetSeconds: 0,
+        confidence: 0,
+        cameraOffsets: { camera1: 0, camera2: 0 },
+      };
+
+    const clipEntries = [];
+    const playbackAssignments = [];
+    const clipIdByAssetId = new Map();
+
+    for (const asset of mediaAssets) {
+      const clipId = String(asset?.clipId || `multicam-${projectId}-${asset.id}`);
+      clipIdByAssetId.set(String(asset?.id || ''), clipId);
+      const file = asset?.file;
+      if (!(file instanceof File)) continue;
+      const playbackUrl = URL.createObjectURL(file);
+      playbackAssignments.push({ clipId, playbackUrl });
+
+      await storeClipMedia({
+        clipId,
+        projectId,
+        fileName: file.name,
+        blob: file,
+      });
+
+      clipEntries.push(normalizeVaultClipRecord({
+        id: clipId,
+        dedupeKey: `multicam-source|${projectId}|${asset.id}`,
+        projectId,
+        projectName,
+        projectFolder: slugify(projectName) || 'session',
+        title: `${projectName} ${asset.label}`,
+        originalTitle: `${projectName} ${asset.label}`,
+        description: `${asset.label} source media`,
+        startTimestamp: '00:00',
+        endTimestamp: formatTimestamp(asset.durationSeconds || 0),
+        durationSeconds: Number(asset.durationSeconds || 0),
+        sourceRef: `multicam://${projectId}/${asset.id}`,
+        sourceTitle: file.name,
+        sourceType: 'multicam-source',
+        contentProfile,
+        origin: 'multicam-source',
+        fileName: file.name,
+        downloadUrl: '',
+        renderDownloadUrl: '',
+        mediaPersistenceStatus: 'persisted',
+        mediaPersistenceError: '',
+        mediaPersistedAt: new Date().toISOString(),
+        mediaSizeBytes: Number(file.size || 0),
+        transcriptSourceText: '',
+        transcriptSnippet: '',
+        transcriptSelectedText: '',
+        transcriptOriginalText: '',
+        transcriptEditedText: '',
+        captionCues: [],
+        captionCuesOriginal: [],
+        captionCuesEdited: [],
+        captionTextOverride: '',
+        captionEditMode: 'source',
+        captionStylePreset: 'reel-bold',
+        captionConfirmationStatus: 'pending',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }));
+    }
+
+    const timelineItems = multicamTimelineSegments.map((segment) => {
+      const cameraAssetId = String(segment.cameraId || 'camera1');
+      const clipId = clipIdByAssetId.get(cameraAssetId) || clipEntries[0]?.id || '';
+      return {
+        ...createTimelineItem(clipId),
+        trimStartSeconds: Number(segment.startSeconds || 0),
+        trimEndSeconds: Number(segment.endSeconds || 0),
+        captionEnabled: false,
+        effectsPreset: 'none',
+        effectsIntensity: 100,
+        meta: {
+          cameraId: cameraAssetId,
+          confidence: Number(segment.confidence || 0),
+          silenceCandidate: Boolean(segment.silenceCandidate),
+          autoDecision: String(segment.autoDecision || 'hold'),
+        },
+      };
+    }).filter((item) => item.clipId);
+
+    setClipVault((previous) => {
+      const filtered = previous.filter((item) => !clipEntries.some((entry) => entry.id === item.id));
+      return [...clipEntries, ...filtered];
+    });
+    playbackAssignments.forEach(({ clipId, playbackUrl }) => setClipPlaybackUrl(clipId, playbackUrl));
+    await refreshClipMediaStats();
+
+    setMontageProjects((previous) => previous.map((project) => {
+      if (project.id !== projectId) return project;
+      return normalizeProject({
+        ...project,
+        name: projectName,
+        workflowType: 'multicam',
+        mediaAssets: mediaAssets.map((asset) => ({
+          ...asset,
+          clipId: clipIdByAssetId.get(String(asset.id || '')) || '',
+          file: undefined,
+        })),
+        syncMap,
+        masterAudioAssetId,
+        audioMixMode,
+        audioMixSettings,
+        speakerProfiles: Array.isArray(draft?.speakerProfiles) ? draft.speakerProfiles : [],
+        speakerCameraPreferences: draft?.speakerCameraPreferences || {},
+        multicamTimelineSegments: multicamTimelineSegments.map((segment) => ({
+          ...segment,
+          cameraClipId: clipIdByAssetId.get(String(segment.cameraId || '')) || '',
+        })),
+        manualOverrides: {
+          segments: {},
+          speakerCameraPreferences: draft?.speakerCameraPreferences || {},
+        },
+        timelineItems,
+        clipIds: timelineItems.map((item) => item.clipId),
+        updatedAt: new Date().toISOString(),
+      });
+    }));
+
+    setSelectedMontageProjectId(projectId);
+    setWorkspace('vault');
+    return true;
+  }, [contentProfile, ensureActiveProjectId, refreshClipMediaStats, setClipPlaybackUrl]);
+
   const handleSidebarResizeStart = useCallback((event) => {
     if (isSidebarCollapsed) return;
     event.preventDefault();
@@ -1616,6 +2006,8 @@ function App() {
     document.body.style.userSelect = 'none';
   }, [isSidebarCollapsed, sidebarWidth]);
 
+  const showVaultSidebar = workspace === 'vault' && !isSidebarCollapsed;
+
   return (
     <div className={`min-h-screen font-display ${isDarkMode ? 'dark text-slate-100 bg-background-dark' : 'text-slate-900 bg-background-light'}`}>
       {import.meta.env.DEV && localDebugStatus && (
@@ -1625,22 +2017,11 @@ function App() {
       )}
 
       <div className="flex min-h-screen">
-        {!isSidebarCollapsed && (
+        {showVaultSidebar && (
           <>
             <Sidebar
               className="hidden lg:flex shrink-0"
               style={{ width: `${sidebarWidth}px` }}
-              ingestPanel={(
-                <IngestSurface
-                  ref={desktopIngestSurfaceRef}
-                  activeSource={activeSource}
-                  onIngestFile={handleIngestFile}
-                  onIngestUrl={handleIngestUrl}
-                  onDropPayload={handleDropPayload}
-                  compact
-                  sourceUrlInputId="source-url-input-desktop"
-                />
-              )}
               activeSource={activeSource}
               contentProfile={contentProfile}
               onContentProfileChange={setContentProfile}
@@ -1657,12 +2038,31 @@ function App() {
         )}
 
         <main className="flex-1 flex flex-col h-screen overflow-hidden">
+          <input
+            ref={studioFileInputRef}
+            type="file"
+            accept="video/*"
+            multiple={studioPrepMode === 'multicam'}
+            className="hidden"
+            onChange={(event) => {
+              const files = Array.from(event.target.files || []);
+              if (files.length > 0) handleIngestFiles(files);
+              event.target.value = '';
+            }}
+          />
           <TopNav
             isDarkMode={isDarkMode}
             toggleTheme={toggleTheme}
             onUpload={handleUploadShortcut}
+            onStudioUrlSubmit={handleStudioTopUrlSubmit}
+            studioPrepMode={studioPrepMode}
+            onStudioPrepModeChange={handleStudioPrepModeChange}
             onToggleSidebar={handleToggleSidebar}
             isSidebarCollapsed={isSidebarCollapsed}
+            showSidebarToggle={workspace === 'vault'}
+            showStudioIngest={workspace === 'studio'}
+            contentProfile={contentProfile}
+            onContentProfileChange={setContentProfile}
             onNavigate={handleTopNavNavigate}
             activeView={activeTopNavView}
           />
@@ -1670,16 +2070,6 @@ function App() {
           <div ref={mainScrollContainerRef} className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-8 scroll-smooth pb-24 lg:pb-8">
             {workspace === 'studio' && (
               <>
-                <IngestSurface
-                  ref={mobileIngestSurfaceRef}
-                  activeSource={activeSource}
-                  onIngestFile={handleIngestFile}
-                  onIngestUrl={handleIngestUrl}
-                  onDropPayload={handleDropPayload}
-                  className="lg:hidden"
-                  sourceUrlInputId="source-url-input-mobile"
-                />
-
                 <div ref={previewSectionRef}>
                   <AppErrorBoundary
                     resetKey={`${workspace}:${String(activeSource?.kind || 'none')}:${String(activeSource?.label || '')}`}
@@ -1689,6 +2079,8 @@ function App() {
                       contentProfile={contentProfile}
                       onClipsRendered={handleManualClipsRendered}
                       onProjectNameSuggestion={handleProjectNameSuggestion}
+                      onRequestFocusEditWorkspace={handleFocusClipStudioEdit}
+                      onCreateMulticamProject={handleCreateMulticamProjectFromPrep}
                     />
                   </AppErrorBoundary>
                 </div>
@@ -1709,6 +2101,8 @@ function App() {
                 onAddClipToProject={handleAddClipToProject}
                 onRemoveClipFromProject={handleRemoveTimelineItem}
                 onMoveTimelineItem={handleMoveTimelineItem}
+                onUpdateClip={handleUpdateClip}
+                onUpdateProject={handleUpdateMontageProject}
                 onUpdateTimelineItem={handleUpdateTimelineItem}
                 onSplitTimelineItem={handleSplitTimelineItem}
                 mediaStats={clipMediaStats}

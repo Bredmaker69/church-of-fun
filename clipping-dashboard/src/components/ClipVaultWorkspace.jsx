@@ -1,6 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { httpsCallable } from 'firebase/functions';
 import { functions } from '../firebase';
+import {
+  buildReflowedCaptionCues,
+  normalizeCaptionEditorText,
+  normalizeCaptionEditorCues,
+} from '../lib/captionEditor';
 
 const DND_PAYLOAD_KEY = 'application/x-clip-vault';
 const MEDIA_BIN_MIN_WIDTH = 240;
@@ -15,6 +20,13 @@ const TIMELINE_MIN_PX_PER_SECOND = 8;
 const TIMELINE_MAX_PX_PER_SECOND = 260;
 const TIMELINE_ROW_HEIGHT_PX = 94;
 const TIMELINE_RULER_HEIGHT_PX = 28;
+const CAPTION_STYLE_OPTIONS = [
+  { value: 'reel-bold', label: 'Reel Bold' },
+  { value: 'pop-punch', label: 'Pop Punch' },
+  { value: 'paint-reveal', label: 'Paint Reveal' },
+  { value: 'clean-lower', label: 'Clean Lower' },
+  { value: 'minimal', label: 'Minimal' },
+];
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -32,15 +44,43 @@ const splitCaptionWords = (value) => {
     .slice(0, 24);
 };
 
-const formatCaptionTwoRows = (words, maxWords = 5) => {
-  const safeWords = Array.isArray(words)
-    ? words.filter(Boolean).slice(0, Math.max(1, Math.floor(Number(maxWords) || 5)))
-    : [];
-  if (safeWords.length === 0) return '';
-  const splitIndex = Math.ceil(safeWords.length / 2);
-  const topRow = safeWords.slice(0, splitIndex).join(' ');
-  const bottomRow = safeWords.slice(splitIndex).join(' ');
-  return bottomRow ? `${topRow}\n${bottomRow}` : topRow;
+const getCaptionOverlayClassName = (stylePreset) => {
+  const value = String(stylePreset || '').trim();
+  if (value === 'pop-punch') {
+    return 'max-w-[78%] rounded-xl border border-white/20 bg-fuchsia-950/70 px-3 py-2 shadow-lg shadow-fuchsia-950/40 backdrop-blur-[1px]';
+  }
+  if (value === 'paint-reveal') {
+    return 'max-w-[78%] rounded-xl border border-cyan-300/35 bg-slate-950/78 px-3 py-2 shadow-lg shadow-cyan-950/30 backdrop-blur-[1px]';
+  }
+  if (value === 'clean-lower') {
+    return 'max-w-[82%] rounded-lg border border-white/12 bg-black/58 px-3 py-2 shadow-lg shadow-black/40 backdrop-blur-[1px]';
+  }
+  if (value === 'minimal') {
+    return 'max-w-[82%] rounded-md bg-black/42 px-3 py-2 shadow-lg shadow-black/30 backdrop-blur-[1px]';
+  }
+  return 'max-w-[78%] rounded-xl border border-white/20 bg-black/70 px-3 py-2 shadow-lg shadow-black/50 backdrop-blur-[1px]';
+};
+
+const getCaptionWordClassName = ({ stylePreset, isActive }) => {
+  const value = String(stylePreset || '').trim();
+  if (value === 'paint-reveal') {
+    return isActive
+      ? 'text-cyan-200 scale-110 font-extrabold drop-shadow-[0_0_7px_rgba(103,232,249,0.65)]'
+      : 'text-cyan-50/92 font-semibold';
+  }
+  if (value === 'minimal') {
+    return isActive
+      ? 'text-white scale-105 font-bold'
+      : 'text-white/80 font-medium';
+  }
+  if (value === 'clean-lower') {
+    return isActive
+      ? 'text-amber-200 scale-105 font-bold drop-shadow-[0_0_5px_rgba(253,230,138,0.45)]'
+      : 'text-white/92 font-semibold';
+  }
+  return isActive
+    ? 'text-amber-300 scale-110 font-extrabold drop-shadow-[0_0_6px_rgba(251,191,36,0.75)]'
+    : 'text-white/95 font-semibold';
 };
 
 const parseTimestampToSeconds = (value) => {
@@ -195,11 +235,40 @@ const normalizeClipCaptionCues = (clip) => {
         text,
         startSeconds,
         endSeconds,
+        words: Array.isArray(cue?.words)
+          ? cue.words
+            .map((word, wordIndex) => {
+              const wordText = normalizeCaptionText(word?.text || '');
+              const wordStart = Number(word?.startSeconds);
+              const wordEnd = Number(word?.endSeconds);
+              if (!wordText || !Number.isFinite(wordStart) || !Number.isFinite(wordEnd) || wordEnd <= wordStart) {
+                return null;
+              }
+              return {
+                id: String(word?.id || `${cue?.id || `cue-${index + 1}`}-word-${wordIndex + 1}`),
+                text: wordText,
+                startSeconds: wordStart,
+                endSeconds: wordEnd,
+              };
+            })
+            .filter(Boolean)
+          : [],
       };
     })
     .filter(Boolean)
     .sort((left, right) => left.startSeconds - right.startSeconds)
     .slice(0, 500);
+};
+
+const getClipActiveCaptionCues = (clip) => {
+  const editedCues = normalizeClipCaptionCues({ captionCues: clip?.captionCuesEdited });
+  if (editedCues.length > 0) return editedCues;
+  const originalCues = normalizeClipCaptionCues({ captionCues: clip?.captionCuesOriginal || clip?.captionCues });
+  return originalCues;
+};
+
+const getClipOriginalCaptionCues = (clip) => {
+  return normalizeCaptionEditorCues(clip?.captionCuesOriginal || clip?.captionCues);
 };
 
 const buildCaptionPayloadForEntry = (entry, { preferOverride = true } = {}) => {
@@ -231,17 +300,34 @@ const buildCaptionPayloadForEntry = (entry, { preferOverride = true } = {}) => {
     };
   }
 
-  const sourceCues = normalizeClipCaptionCues(clip);
+  const sourceCues = getClipActiveCaptionCues(clip);
   const cues = sourceCues
     .map((cue, index) => {
       const overlapStart = Math.max(range.start, cue.startSeconds);
       const overlapEnd = Math.min(range.end, cue.endSeconds);
       if (!Number.isFinite(overlapStart) || !Number.isFinite(overlapEnd) || overlapEnd <= overlapStart) return null;
+      const words = Array.isArray(cue.words)
+        ? cue.words
+          .map((word, wordIndex) => {
+            const wordStart = Math.max(range.start, Number(word?.startSeconds));
+            const wordEnd = Math.min(range.end, Number(word?.endSeconds));
+            const wordText = normalizeCaptionText(word?.text || '');
+            if (!wordText || !Number.isFinite(wordStart) || !Number.isFinite(wordEnd) || wordEnd <= wordStart) return null;
+            return {
+              id: String(word?.id || `${cue.id || `cue-${index + 1}`}-word-${wordIndex + 1}`),
+              text: wordText,
+              startSeconds: Number((wordStart - range.start).toFixed(2)),
+              endSeconds: Number((wordEnd - range.start).toFixed(2)),
+            };
+          })
+          .filter(Boolean)
+        : [];
       return {
         id: `${cue.id || `cue-${index + 1}`}`,
         text: cue.text,
         startSeconds: Number((overlapStart - range.start).toFixed(2)),
         endSeconds: Number((overlapEnd - range.start).toFixed(2)),
+        words,
       };
     })
     .filter(Boolean);
@@ -256,7 +342,9 @@ const buildCaptionPayloadForEntry = (entry, { preferOverride = true } = {}) => {
 
   const fallbackText = normalizeCaptionText(
     item.captionConfirmedText
+    || clip.transcriptEditedText
     || clip.transcriptSelectedText
+    || clip.transcriptOriginalText
     || clip.transcriptSnippet
     || clip.description
     || clip.title
@@ -281,25 +369,18 @@ const buildCaptionPayloadForEntry = (entry, { preferOverride = true } = {}) => {
   };
 };
 
-const getCaptionStyleClassName = (stylePreset) => {
-  const value = String(stylePreset || '').trim();
-  if (value === 'pop-punch') {
-    return 'max-w-[72%] text-center whitespace-pre-line leading-tight text-white text-lg md:text-2xl font-extrabold bg-fuchsia-700/80 border-2 border-white/90 px-4 py-2 rounded-xl shadow-[0_0_20px_rgba(217,70,239,0.35)]';
-  }
-  if (value === 'paint-reveal') {
-    return 'max-w-[72%] text-center whitespace-pre-line leading-tight text-cyan-100 text-lg md:text-xl font-bold bg-slate-900/70 border border-cyan-300/70 px-4 py-2 rounded-lg tracking-wide';
-  }
-  if (value === 'clean-lower') {
-    return 'max-w-[78%] text-center whitespace-pre-line leading-tight text-white text-base md:text-lg font-semibold bg-black/50 border border-white/20 px-3 py-1.5 rounded-md';
-  }
-  if (value === 'minimal') {
-    return 'max-w-[78%] text-center whitespace-pre-line leading-tight text-white text-sm md:text-base font-medium bg-black/35 px-2.5 py-1 rounded';
-  }
-  return 'max-w-[78%] text-center whitespace-pre-line leading-tight text-white text-lg md:text-2xl font-bold bg-black/60 border border-white/25 px-4 py-2 rounded-lg';
-};
-
 const getClipPlaybackUrl = (clip) => String(clip?.playbackUrl || clip?.downloadUrl || '').trim();
 const getClipRenderUrl = (clip) => String(clip?.renderDownloadUrl || clip?.downloadUrl || '').trim();
+const getProjectAssetOffsetSeconds = (project, assetId) => {
+  if (!project?.syncMap?.cameraOffsets || typeof project.syncMap.cameraOffsets !== 'object') return 0;
+  return Number(project.syncMap.cameraOffsets[String(assetId || '')] || 0);
+};
+
+const getMulticamActiveCameraId = (segment) => {
+  return String(segment?.manualCameraId || segment?.cameraId || 'camera1');
+};
+
+const clampPan = (value) => clamp(Number(value), -1, 1);
 
 const extractRenderedClipToken = (value) => {
   const text = String(value || '').trim();
@@ -327,10 +408,17 @@ const ClipVaultWorkspace = ({
   onFlushProjectMedia,
   onAddClipToProject,
   onMoveTimelineItem,
+  onUpdateClip,
+  onUpdateProject,
   onUpdateTimelineItem,
   mediaStats = { totalBytes: 0, clipCount: 0 },
 }) => {
   const previewRef = useRef(null);
+  const multicamPreviewRefs = useRef({});
+  const multicamPreviewAnimationRef = useRef(null);
+  const multicamAudioRefs = useRef({});
+  const multicamAudioContextRef = useRef(null);
+  const multicamAudioNodesRef = useRef({});
   const timelineTrackRef = useRef(null);
   const timelineScrollerRef = useRef(null);
   const paneResizeStateRef = useRef(null);
@@ -356,6 +444,10 @@ const ClipVaultWorkspace = ({
   const [renderedEditDownloads, setRenderedEditDownloads] = useState([]);
   const [timelineZoom, setTimelineZoom] = useState(1.25);
   const [timelinePlayheadSeconds, setTimelinePlayheadSeconds] = useState(0);
+  const [clipTranscriptDraft, setClipTranscriptDraft] = useState('');
+  const [isClipToolsOpen, setIsClipToolsOpen] = useState(false);
+  const [selectedMulticamSegmentId, setSelectedMulticamSegmentId] = useState('');
+  const [isMulticamPlaying, setIsMulticamPlaying] = useState(false);
 
   const renderTimelineEdits = useMemo(
     () => httpsCallable(functions, 'renderTimelineEdits'),
@@ -369,6 +461,78 @@ const ClipVaultWorkspace = ({
   const selectedProject = useMemo(() => {
     return montageProjects.find((project) => project.id === selectedProjectId) || null;
   }, [montageProjects, selectedProjectId]);
+  const isMulticamProject = selectedProject?.workflowType === 'multicam';
+
+  const multicamAssets = useMemo(() => {
+    if (!isMulticamProject || !Array.isArray(selectedProject?.mediaAssets)) return [];
+    return selectedProject.mediaAssets.map((asset) => ({
+      ...asset,
+      clip: clipsById.get(String(asset?.clipId || '')) || null,
+      playbackUrl: getClipPlaybackUrl(clipsById.get(String(asset?.clipId || ''))),
+    }));
+  }, [clipsById, isMulticamProject, selectedProject?.mediaAssets]);
+
+  const multicamSegments = useMemo(() => {
+    if (!isMulticamProject || !Array.isArray(selectedProject?.multicamTimelineSegments)) return [];
+    return [...selectedProject.multicamTimelineSegments]
+      .map((segment, index) => ({
+        ...segment,
+        id: String(segment?.id || `segment-${index + 1}`),
+        cameraId: String(segment?.cameraId || 'camera1'),
+        manualCameraId: String(segment?.manualCameraId || ''),
+        isLocked: Boolean(segment?.isLocked),
+      }))
+      .sort((left, right) => Number(left.startSeconds || 0) - Number(right.startSeconds || 0));
+  }, [isMulticamProject, selectedProject?.multicamTimelineSegments]);
+
+  const effectiveSelectedMulticamSegmentId = useMemo(() => {
+    if (!selectedMulticamSegmentId) return multicamSegments[0]?.id || '';
+    const exists = multicamSegments.some((segment) => segment.id === selectedMulticamSegmentId);
+    return exists ? selectedMulticamSegmentId : (multicamSegments[0]?.id || '');
+  }, [multicamSegments, selectedMulticamSegmentId]);
+
+  const selectedMulticamSegment = useMemo(() => {
+    if (!effectiveSelectedMulticamSegmentId) return null;
+    return multicamSegments.find((segment) => segment.id === effectiveSelectedMulticamSegmentId) || null;
+  }, [effectiveSelectedMulticamSegmentId, multicamSegments]);
+
+  const multicamDurationSeconds = useMemo(() => {
+    if (multicamSegments.length === 0) return 0;
+    return Math.max(...multicamSegments.map((segment) => Number(segment.endSeconds || 0)));
+  }, [multicamSegments]);
+
+  const multicamTrackDurationSeconds = useMemo(() => Math.max(15, multicamDurationSeconds + 2), [multicamDurationSeconds]);
+
+  const multicamPreviewSegment = useMemo(() => {
+    if (multicamSegments.length === 0) return null;
+    const byPlayhead = multicamSegments.find((segment) => (
+      timelinePlayheadSeconds >= Number(segment.startSeconds || 0)
+      && timelinePlayheadSeconds < Number(segment.endSeconds || 0)
+    ));
+    return byPlayhead || selectedMulticamSegment || multicamSegments[0];
+  }, [multicamSegments, selectedMulticamSegment, timelinePlayheadSeconds]);
+
+  const multicamPreviewUrls = useMemo(() => ({
+    camera1: String(multicamAssets.find((asset) => String(asset.id || '') === 'camera1')?.playbackUrl || '').trim(),
+    camera2: String(multicamAssets.find((asset) => String(asset.id || '') === 'camera2')?.playbackUrl || '').trim(),
+  }), [multicamAssets]);
+  const multicamAudioMixMode = String(selectedProject?.audioMixMode || 'single_master');
+  const multicamAudioMixSettings = useMemo(() => ({
+    camera1Volume: Number(selectedProject?.audioMixSettings?.camera1Volume || 100),
+    camera2Volume: Number(selectedProject?.audioMixSettings?.camera2Volume || 100),
+    camera1Pan: Number.isFinite(Number(selectedProject?.audioMixSettings?.camera1Pan)) ? Number(selectedProject.audioMixSettings.camera1Pan) : -1,
+    camera2Pan: Number.isFinite(Number(selectedProject?.audioMixSettings?.camera2Pan)) ? Number(selectedProject.audioMixSettings.camera2Pan) : 1,
+  }), [
+    selectedProject?.audioMixSettings?.camera1Pan,
+    selectedProject?.audioMixSettings?.camera1Volume,
+    selectedProject?.audioMixSettings?.camera2Pan,
+    selectedProject?.audioMixSettings?.camera2Volume,
+  ]);
+  const multicamClockAssetId = useMemo(() => {
+    const preferred = String(selectedProject?.masterAudioAssetId || 'camera1');
+    if (preferred === 'camera2' && multicamPreviewUrls.camera2) return 'camera2';
+    return multicamPreviewUrls.camera1 ? 'camera1' : (multicamPreviewUrls.camera2 ? 'camera2' : 'camera1');
+  }, [multicamPreviewUrls.camera1, multicamPreviewUrls.camera2, selectedProject?.masterAudioAssetId]);
 
   useEffect(() => {
     setProjectNameDraft(String(selectedProject?.name || ''));
@@ -431,6 +595,406 @@ const ClipVaultWorkspace = ({
     if (previewMode !== 'timeline') return selectedTimelineEntry;
     return playbackTimelineEntry || selectedTimelineEntry;
   }, [previewMode, playbackTimelineEntry, selectedTimelineEntry]);
+  const selectedEditableClip = selectedTimelineEntry?.clip || null;
+
+  useEffect(() => {
+    const nextText = normalizeCaptionEditorText(
+      selectedEditableClip?.transcriptEditedText
+      || selectedEditableClip?.transcriptSelectedText
+      || selectedEditableClip?.transcriptOriginalText
+      || selectedEditableClip?.transcriptSnippet
+      || ''
+    );
+    setClipTranscriptDraft(nextText);
+  }, [selectedEditableClip?.id, selectedEditableClip?.transcriptEditedText, selectedEditableClip?.transcriptSelectedText, selectedEditableClip?.transcriptOriginalText, selectedEditableClip?.transcriptSnippet]);
+
+  const selectedClipSourceTranscriptText = normalizeCaptionEditorText(
+    selectedEditableClip?.transcriptSelectedText
+    || selectedEditableClip?.transcriptOriginalText
+    || selectedEditableClip?.transcriptSnippet
+    || ''
+  );
+  const selectedClipHasTranscriptEdit = Boolean(
+    normalizeCaptionEditorText(selectedEditableClip?.transcriptEditedText || '')
+  );
+  const selectedCaptionStylePreset = String(
+    selectedTimelineEntry?.item?.captionStylePreset
+    || selectedEditableClip?.captionStylePreset
+    || 'reel-bold'
+  );
+
+  useEffect(() => {
+    setIsClipToolsOpen(false);
+  }, [selectedEditableClip?.id]);
+
+  useEffect(() => {
+    if (!isMulticamProject) {
+      setSelectedMulticamSegmentId('');
+      setIsMulticamPlaying(false);
+      return;
+    }
+    if (!selectedMulticamSegmentId && multicamSegments[0]?.id) {
+      setSelectedMulticamSegmentId(multicamSegments[0].id);
+    }
+  }, [isMulticamProject, multicamSegments, selectedMulticamSegmentId]);
+
+  const updateSelectedTimelineItem = useCallback((patch) => {
+    if (!selectedProjectId || !selectedTimelineEntry?.item?.id || !onUpdateTimelineItem) return;
+    onUpdateTimelineItem(selectedProjectId, selectedTimelineEntry.item.id, patch);
+  }, [onUpdateTimelineItem, selectedProjectId, selectedTimelineEntry?.item?.id]);
+
+  const updateSelectedProject = useCallback((patchOrUpdater) => {
+    if (!selectedProjectId || !onUpdateProject) return false;
+    return onUpdateProject(selectedProjectId, patchOrUpdater);
+  }, [onUpdateProject, selectedProjectId]);
+
+  const handleSelectMulticamSegment = useCallback((segmentId) => {
+    setSelectedMulticamSegmentId(segmentId);
+    const segment = multicamSegments.find((entry) => entry.id === segmentId);
+    if (!segment) return;
+    const startSeconds = Number(segment.startSeconds || 0);
+    setTimelinePlayheadSeconds(startSeconds);
+    setCurrentPreviewTime(startSeconds);
+  }, [multicamSegments]);
+
+  const applyMulticamSegments = useCallback((nextSegments, statusMessage = '') => {
+    updateSelectedProject(() => ({
+      multicamTimelineSegments: nextSegments.map((segment) => ({
+        ...segment,
+        cameraClipId: String(segment?.cameraClipId || ''),
+      })),
+      updatedAt: new Date().toISOString(),
+    }));
+    if (statusMessage) setLocalStatus(statusMessage);
+  }, [updateSelectedProject]);
+
+  const splitSelectedMulticamSegment = useCallback(() => {
+    if (!selectedMulticamSegment) return;
+    const splitSeconds = Number(timelinePlayheadSeconds || 0);
+    const segmentStart = Number(selectedMulticamSegment.startSeconds || 0);
+    const segmentEnd = Number(selectedMulticamSegment.endSeconds || 0);
+    if (!(splitSeconds > segmentStart + TRIM_MIN_GAP_SECONDS && splitSeconds < segmentEnd - TRIM_MIN_GAP_SECONDS)) {
+      setLocalStatus('Move the playhead inside the selected segment before splitting.');
+      return;
+    }
+
+    const nextSegments = multicamSegments.flatMap((segment) => {
+      if (segment.id !== selectedMulticamSegment.id) return [segment];
+      const left = {
+        ...segment,
+        id: `${segment.id}-a-${Date.now()}`,
+        endSeconds: Number(splitSeconds.toFixed(3)),
+      };
+      const right = {
+        ...segment,
+        id: `${segment.id}-b-${Date.now()}`,
+        startSeconds: Number(splitSeconds.toFixed(3)),
+      };
+      return [left, right];
+    });
+
+    applyMulticamSegments(nextSegments, 'Inserted a new multicam cut at the playhead.');
+  }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment, timelinePlayheadSeconds]);
+
+  const joinSelectedMulticamSegment = useCallback(() => {
+    if (!selectedMulticamSegment) return;
+    const selectedIndex = multicamSegments.findIndex((segment) => segment.id === selectedMulticamSegment.id);
+    if (selectedIndex < 0 || selectedIndex >= multicamSegments.length - 1) {
+      setLocalStatus('Select a segment that has a following segment to join.');
+      return;
+    }
+    const nextSegment = multicamSegments[selectedIndex + 1];
+    const mergedSegment = {
+      ...selectedMulticamSegment,
+      id: `${selectedMulticamSegment.id}-join-${Date.now()}`,
+      endSeconds: Number(nextSegment.endSeconds || selectedMulticamSegment.endSeconds || 0),
+      manualCameraId: String(selectedMulticamSegment.manualCameraId || selectedMulticamSegment.cameraId || 'camera1'),
+      isLocked: Boolean(selectedMulticamSegment.isLocked || nextSegment.isLocked),
+    };
+    const nextSegments = [
+      ...multicamSegments.slice(0, selectedIndex),
+      mergedSegment,
+      ...multicamSegments.slice(selectedIndex + 2),
+    ];
+    applyMulticamSegments(nextSegments, 'Joined the selected multicam segment with the next segment.');
+    setSelectedMulticamSegmentId(mergedSegment.id);
+  }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment]);
+
+  const setSelectedMulticamCamera = useCallback((cameraId) => {
+    if (!selectedMulticamSegment) return;
+    const normalizedCameraId = String(cameraId || '').trim() || 'camera1';
+    const nextSegments = multicamSegments.map((segment) => {
+      if (segment.id !== selectedMulticamSegment.id) return segment;
+      return {
+        ...segment,
+        manualCameraId: normalizedCameraId,
+        isLocked: true,
+      };
+    });
+    applyMulticamSegments(nextSegments, `Locked ${normalizedCameraId === 'camera2' ? 'Camera 2' : 'Camera 1'} on the selected segment.`);
+  }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment]);
+
+  const clearSelectedMulticamOverride = useCallback(() => {
+    if (!selectedMulticamSegment) return;
+    const nextSegments = multicamSegments.map((segment) => {
+      if (segment.id !== selectedMulticamSegment.id) return segment;
+      return {
+        ...segment,
+        manualCameraId: '',
+        isLocked: false,
+      };
+    });
+    applyMulticamSegments(nextSegments, 'Removed manual override from the selected segment.');
+  }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment]);
+
+  const getMulticamSourceTimeForAsset = useCallback((programSeconds, assetId, fallbackDuration = 0) => {
+    const offset = getProjectAssetOffsetSeconds(selectedProject, assetId);
+    return clamp(
+      Number(programSeconds || 0) - offset,
+      0,
+      Math.max(0, Number(fallbackDuration || 0))
+    );
+  }, [selectedProject]);
+
+  const ensureMulticamAudioRouting = useCallback(async () => {
+    if (!isMulticamProject) return null;
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) return null;
+
+    let audioContext = multicamAudioContextRef.current;
+    if (!audioContext) {
+      audioContext = new AudioContextCtor();
+      multicamAudioContextRef.current = audioContext;
+    }
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume();
+    }
+
+    multicamAssets.forEach((asset) => {
+      const assetId = String(asset?.id || '');
+      const media = multicamAudioRefs.current[assetId];
+      if (!media || multicamAudioNodesRef.current[assetId]) return;
+
+      const sourceNode = audioContext.createMediaElementSource(media);
+      const gainNode = audioContext.createGain();
+      let panNode = null;
+
+      if (typeof audioContext.createStereoPanner === 'function') {
+        panNode = audioContext.createStereoPanner();
+        sourceNode.connect(gainNode);
+        gainNode.connect(panNode);
+        panNode.connect(audioContext.destination);
+      } else {
+        sourceNode.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+      }
+
+      multicamAudioNodesRef.current[assetId] = {
+        sourceNode,
+        gainNode,
+        panNode,
+      };
+    });
+
+    return audioContext;
+  }, [isMulticamProject, multicamAssets]);
+
+  const applyMulticamAudioMix = useCallback(() => {
+    const applyTrack = (assetId, volumePercent, panValue, enabled) => {
+      const media = multicamAudioRefs.current[assetId];
+      if (media) {
+        media.volume = 1;
+      }
+      const nodes = multicamAudioNodesRef.current[assetId];
+      if (!nodes?.gainNode) return;
+      nodes.gainNode.gain.value = enabled ? clamp(Number(volumePercent || 0) / 100, 0, 1) : 0;
+      if (nodes.panNode) {
+        nodes.panNode.pan.value = clampPan(panValue);
+      }
+    };
+
+    if (multicamAudioMixMode === 'stereo_mix') {
+      applyTrack('camera1', multicamAudioMixSettings.camera1Volume, multicamAudioMixSettings.camera1Pan, Boolean(multicamPreviewUrls.camera1));
+      applyTrack('camera2', multicamAudioMixSettings.camera2Volume, multicamAudioMixSettings.camera2Pan, Boolean(multicamPreviewUrls.camera2));
+      return;
+    }
+
+    applyTrack('camera1', 100, 0, multicamClockAssetId === 'camera1' && Boolean(multicamPreviewUrls.camera1));
+    applyTrack('camera2', 100, 0, multicamClockAssetId === 'camera2' && Boolean(multicamPreviewUrls.camera2));
+  }, [
+    multicamAudioMixMode,
+    multicamAudioMixSettings.camera1Pan,
+    multicamAudioMixSettings.camera1Volume,
+    multicamAudioMixSettings.camera2Pan,
+    multicamAudioMixSettings.camera2Volume,
+    multicamClockAssetId,
+    multicamPreviewUrls.camera1,
+    multicamPreviewUrls.camera2,
+  ]);
+
+  const syncMulticamPreviewFrame = useCallback(() => {
+    const clockVideo = multicamPreviewRefs.current[multicamClockAssetId];
+    if (!clockVideo) return;
+
+    const clockDuration = Number(
+      multicamAssets.find((asset) => String(asset.id || '') === multicamClockAssetId)?.durationSeconds || 0
+    );
+    const nextProgramSeconds = clamp(
+      Number(clockVideo.currentTime || 0) + getProjectAssetOffsetSeconds(selectedProject, multicamClockAssetId),
+      0,
+      Math.max(multicamTrackDurationSeconds, clockDuration)
+    );
+
+    setCurrentPreviewTime(nextProgramSeconds);
+    setTimelinePlayheadSeconds(nextProgramSeconds);
+
+    const activeSegment = multicamSegments.find((segment) => (
+      nextProgramSeconds >= Number(segment.startSeconds || 0)
+      && nextProgramSeconds < Number(segment.endSeconds || 0)
+    ));
+    if (activeSegment && activeSegment.id !== effectiveSelectedMulticamSegmentId) {
+      setSelectedMulticamSegmentId(activeSegment.id);
+    }
+
+    if (nextProgramSeconds >= multicamTrackDurationSeconds - 0.02) {
+      setIsMulticamPlaying(false);
+      setLocalStatus('Reached end of multicam timeline.');
+      return;
+    }
+
+    multicamPreviewAnimationRef.current = window.requestAnimationFrame(syncMulticamPreviewFrame);
+  }, [
+    effectiveSelectedMulticamSegmentId,
+    multicamAssets,
+    multicamClockAssetId,
+    multicamSegments,
+    multicamTrackDurationSeconds,
+    selectedProject,
+  ]);
+
+  const playSelectedMulticamProgram = useCallback(() => {
+    if (!multicamPreviewUrls.camera1 && !multicamPreviewUrls.camera2) {
+      setLocalStatus('No synced camera media is available for multicam preview.');
+      return;
+    }
+    setIsMulticamPlaying(true);
+    setLocalStatus('Playing multicam program from the current playhead.');
+  }, [multicamPreviewUrls.camera1, multicamPreviewUrls.camera2]);
+
+  const pauseSelectedMulticamProgram = useCallback(() => {
+    if (multicamPreviewAnimationRef.current) {
+      cancelAnimationFrame(multicamPreviewAnimationRef.current);
+      multicamPreviewAnimationRef.current = null;
+    }
+    setIsMulticamPlaying(false);
+    Object.values(multicamPreviewRefs.current).forEach((video) => {
+      try {
+        video?.pause?.();
+      } catch {
+        // no-op
+      }
+    });
+    Object.values(multicamAudioRefs.current).forEach((audio) => {
+      try {
+        audio?.pause?.();
+      } catch {
+        // no-op
+      }
+    });
+    setLocalStatus('Paused multicam program playback.');
+  }, []);
+
+  const handleMulticamLoadedMetadata = useCallback((assetId, event) => {
+    const video = event.currentTarget;
+    const assetDuration = Number(
+      multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
+    );
+    try {
+      video.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
+    } catch {
+      // ignore seek edge cases
+    }
+    if (isMulticamPlaying) {
+      video.play().catch(() => {});
+    }
+  }, [getMulticamSourceTimeForAsset, isMulticamPlaying, multicamAssets, timelinePlayheadSeconds]);
+
+  useEffect(() => {
+    void ensureMulticamAudioRouting().then(() => {
+      applyMulticamAudioMix();
+    });
+  }, [applyMulticamAudioMix, ensureMulticamAudioRouting]);
+
+  const handleCaptionStyleChange = useCallback((event) => {
+    const nextValue = String(event.target.value || 'reel-bold').trim() || 'reel-bold';
+    updateSelectedTimelineItem({ captionStylePreset: nextValue });
+  }, [updateSelectedTimelineItem]);
+
+  const handleCaptionEnabledToggle = useCallback(() => {
+    const currentlyEnabled = selectedTimelineEntry?.item?.captionEnabled !== false;
+    updateSelectedTimelineItem({ captionEnabled: !currentlyEnabled });
+  }, [selectedTimelineEntry?.item?.captionEnabled, updateSelectedTimelineItem]);
+
+  const applyClipTranscriptEdit = useCallback(() => {
+    if (!selectedEditableClip?.id || !onUpdateClip) return;
+    const normalizedDraft = normalizeCaptionEditorText(clipTranscriptDraft);
+    const normalizedSource = selectedClipSourceTranscriptText;
+    if (!normalizedDraft) {
+      onUpdateClip(selectedEditableClip.id, {
+        transcriptEditedText: '',
+        transcriptEditedAt: '',
+        captionCuesEdited: [],
+        captionEditMode: 'source',
+      });
+      setLocalStatus('Cleared clip transcript edit and restored source captions.');
+      return;
+    }
+
+    if (normalizedDraft === normalizedSource) {
+      onUpdateClip(selectedEditableClip.id, {
+        transcriptEditedText: '',
+        transcriptEditedAt: '',
+        captionCuesEdited: [],
+        captionEditMode: 'source',
+      });
+      setLocalStatus('Transcript matches source. Removed clip-level text edit.');
+      return;
+    }
+
+    const clipDuration = getClipDurationSeconds(selectedEditableClip);
+    const sourceCues = getClipOriginalCaptionCues(selectedEditableClip);
+    const editedCues = buildReflowedCaptionCues({
+      sourceCues,
+      editedText: normalizedDraft,
+      rangeStartSeconds: 0,
+      rangeEndSeconds: Number.isFinite(clipDuration) ? clipDuration : null,
+      idPrefix: 'clip-edit',
+    });
+
+    onUpdateClip(selectedEditableClip.id, {
+      transcriptEditedText: normalizedDraft,
+      transcriptEditedAt: new Date().toISOString(),
+      captionCuesEdited: editedCues,
+      captionEditMode: 'text-edit',
+    });
+    setLocalStatus(
+      editedCues.length > 0
+        ? `Saved transcript edit and reflowed ${editedCues.length} timed caption cues.`
+        : 'Saved transcript edit.'
+    );
+  }, [clipTranscriptDraft, onUpdateClip, selectedClipSourceTranscriptText, selectedEditableClip]);
+
+  const resetClipTranscriptEdit = useCallback(() => {
+    if (!selectedEditableClip?.id || !onUpdateClip) return;
+    setClipTranscriptDraft(selectedClipSourceTranscriptText);
+    onUpdateClip(selectedEditableClip.id, {
+      transcriptEditedText: '',
+      transcriptEditedAt: '',
+      captionCuesEdited: [],
+      captionEditMode: 'source',
+    });
+    setLocalStatus('Restored source transcript and source caption timing for this clip.');
+  }, [onUpdateClip, selectedClipSourceTranscriptText, selectedEditableClip]);
 
   const previewTimelineIndex = useMemo(() => {
     if (!previewTimelineEntry) return -1;
@@ -450,40 +1014,89 @@ const ClipVaultWorkspace = ({
     if (!previewTrimRange) return Number(currentPreviewTime) || 0;
     return Math.max(0, (Number(currentPreviewTime) || 0) - previewTrimRange.start);
   }, [currentPreviewTime, previewTrimRange]);
-  const activePreviewCaption = useMemo(() => {
-    if (!previewCaptionPayload?.enabled || !Array.isArray(previewCaptionPayload.cues)) return '';
+  const previewCaptionLines = useMemo(() => {
+    if (!previewCaptionPayload?.enabled || !Array.isArray(previewCaptionPayload.cues)) return [];
     const cue = previewCaptionPayload.cues.find((item) => (
       Number.isFinite(Number(item.startSeconds))
       && Number.isFinite(Number(item.endSeconds))
       && previewRelativeTime >= Number(item.startSeconds)
       && previewRelativeTime < Number(item.endSeconds)
     ));
-    const style = String(previewCaptionPayload?.stylePreset || '');
-    const cueText = normalizeCaptionText(cue?.text || '');
-    if (!cueText) return '';
-    if (!cue || !['pop-punch', 'paint-reveal'].includes(style)) return cueText;
+    if (!cue) return [];
 
     const cueStart = Number(cue.startSeconds);
     const cueEnd = Number(cue.endSeconds);
-    const words = splitCaptionWords(cueText);
+    const cueWords = Array.isArray(cue?.words) && cue.words.length > 0
+      ? cue.words
+          .map((word, index) => {
+            const text = normalizeCaptionText(word?.text || '');
+            const startSeconds = Number(word?.startSeconds);
+            const endSeconds = Number(word?.endSeconds);
+            if (!text || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) {
+              return null;
+            }
+            return {
+              id: String(word?.id || `${cue.id || 'cue'}-word-${index + 1}`),
+              text,
+              startSeconds,
+              endSeconds,
+            };
+          })
+          .filter(Boolean)
+      : splitCaptionWords(normalizeCaptionText(cue?.text || '')).map((word, index, words) => {
+          const safeCueStart = Number.isFinite(cueStart) ? cueStart : 0;
+          const safeCueEnd = Number.isFinite(cueEnd) && cueEnd > safeCueStart ? cueEnd : safeCueStart + 0.1;
+          const perWordDuration = Math.max(0.08, (safeCueEnd - safeCueStart) / Math.max(1, words.length));
+          const wordStart = safeCueStart + perWordDuration * index;
+          const wordEnd = index === words.length - 1
+            ? safeCueEnd
+            : safeCueStart + perWordDuration * (index + 1);
+          return {
+            id: `${cue.id || 'cue'}-word-${index + 1}`,
+            text: word,
+            startSeconds: wordStart,
+            endSeconds: wordEnd,
+          };
+        });
+
     if (
       !Number.isFinite(cueStart)
       || !Number.isFinite(cueEnd)
       || cueEnd <= cueStart
-      || words.length === 0
+      || cueWords.length === 0
     ) {
-      return cueText;
+      return [];
     }
 
-    const elapsed = clamp(previewRelativeTime - cueStart, 0, cueEnd - cueStart);
-    const perWordDuration = Math.max(0.08, (cueEnd - cueStart) / words.length);
-    const activeWordCount = clamp(Math.floor(elapsed / perWordDuration) + 1, 1, words.length);
+    let activeWordIndex = 0;
+    for (let index = 0; index < cueWords.length; index += 1) {
+      const word = cueWords[index];
+      if (previewRelativeTime >= word.startSeconds && previewRelativeTime < word.endSeconds) {
+        activeWordIndex = index;
+        break;
+      }
+      if (word.startSeconds <= previewRelativeTime) {
+        activeWordIndex = index;
+      } else {
+        break;
+      }
+    }
+
     const windowSize = 5;
-    const windowIndex = Math.floor((activeWordCount - 1) / windowSize);
+    const windowIndex = Math.floor(activeWordIndex / windowSize);
     const windowStart = windowIndex * windowSize;
-    const windowWords = words.slice(windowStart, windowStart + windowSize);
-    const wordsInWindow = Math.max(1, activeWordCount - windowStart);
-    return formatCaptionTwoRows(windowWords.slice(0, wordsInWindow), windowSize);
+    const visibleWords = cueWords
+      .slice(windowStart, windowStart + windowSize)
+      .map((word, index) => ({
+        ...word,
+        isActive: windowStart + index === activeWordIndex,
+      }));
+    if (visibleWords.length === 0) return [];
+    const firstLineCount = Math.max(1, Math.ceil(visibleWords.length / 2));
+    return [
+      visibleWords.slice(0, firstLineCount),
+      visibleWords.slice(firstLineCount),
+    ].filter((line) => line.length > 0);
   }, [previewCaptionPayload, previewRelativeTime]);
 
   const projectScopedVaultClips = useMemo(() => {
@@ -563,6 +1176,21 @@ const ClipVaultWorkspace = ({
     }
     return ticks;
   }, [timelineRulerStepSeconds, timelineTrackDurationSeconds]);
+  const multicamTrackWidthPx = useMemo(() => {
+    return Math.max(960, Math.ceil(multicamTrackDurationSeconds * timelinePixelsPerSecond) + 80);
+  }, [multicamTrackDurationSeconds, timelinePixelsPerSecond]);
+  const multicamRulerTicks = useMemo(() => {
+    const ticks = [];
+    const count = Math.ceil(multicamTrackDurationSeconds / timelineRulerStepSeconds);
+    for (let index = 0; index <= count; index += 1) {
+      const seconds = index * timelineRulerStepSeconds;
+      ticks.push({
+        seconds,
+        isMajor: index % Math.round(Math.max(1, 5 / timelineRulerStepSeconds)) === 0,
+      });
+    }
+    return ticks;
+  }, [multicamTrackDurationSeconds, timelineRulerStepSeconds]);
 
   const hasPlayableTimelineClip = useMemo(() => {
     return timelineEntries.some((entry) => Boolean(getClipPlaybackUrl(entry.clip)));
@@ -775,6 +1403,25 @@ const ClipVaultWorkspace = ({
     seekTimelineToSeconds(targetSeconds, { updatePreview: true });
   }, [getTimelineSecondsFromClientX, seekTimelineToSeconds, timelineSequenceEntries.length]);
 
+  const handleMulticamRulerPointerDown = useCallback((event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    if (multicamSegments.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const targetSeconds = getTimelineSecondsFromClientX(event.clientX);
+    if (!Number.isFinite(targetSeconds)) return;
+
+    timelinePlayheadDragRef.current = {
+      pointerId: event.pointerId,
+      multicam: true,
+    };
+    document.body.style.cursor = 'ew-resize';
+    document.body.style.userSelect = 'none';
+    setTimelinePlayheadSeconds(clamp(targetSeconds, 0, multicamTrackDurationSeconds));
+    setCurrentPreviewTime(clamp(targetSeconds, 0, multicamTrackDurationSeconds));
+  }, [getTimelineSecondsFromClientX, multicamSegments.length, multicamTrackDurationSeconds]);
+
   const handleTimelineTrackDrop = useCallback((event) => {
     event.preventDefault();
     const payload = parseDragPayload(event);
@@ -885,6 +1532,13 @@ const ClipVaultWorkspace = ({
           text: String(cue.text || ''),
           startSeconds: Number(Number(cue.startSeconds || 0).toFixed(2)),
           endSeconds: Number(Number(cue.endSeconds || 0).toFixed(2)),
+          words: Array.isArray(cue.words)
+            ? cue.words.map((word) => ({
+              text: String(word.text || ''),
+              startSeconds: Number(Number(word.startSeconds || 0).toFixed(2)),
+              endSeconds: Number(Number(word.endSeconds || 0).toFixed(2)),
+            }))
+            : [],
         }))
         : [],
     };
@@ -991,6 +1645,82 @@ const ClipVaultWorkspace = ({
       video.play().catch(() => {});
     }
   }, [isTimelinePlaying, previewMode, previewTimelineEntry, timelineEntryById]);
+
+  useEffect(() => {
+    if (!isMulticamProject) return undefined;
+
+    if (!isMulticamPlaying) {
+      if (multicamPreviewAnimationRef.current) {
+        cancelAnimationFrame(multicamPreviewAnimationRef.current);
+        multicamPreviewAnimationRef.current = null;
+      }
+      Object.entries(multicamPreviewRefs.current).forEach(([assetId, video]) => {
+        if (!video) return;
+        const assetDuration = Number(
+          multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
+        );
+        try {
+          video.pause();
+          video.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
+        } catch {
+          // ignore seek edge cases
+        }
+      });
+      Object.entries(multicamAudioRefs.current).forEach(([assetId, audio]) => {
+        if (!audio) return;
+        const assetDuration = Number(
+          multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
+        );
+        try {
+          audio.pause();
+          audio.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
+        } catch {
+          // ignore seek edge cases
+        }
+      });
+      return undefined;
+    }
+
+    Object.entries(multicamPreviewRefs.current).forEach(([assetId, video]) => {
+      if (!video) return;
+      const assetDuration = Number(
+        multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
+      );
+      try {
+        video.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
+      } catch {
+        // ignore seek edge cases
+      }
+      video.play().catch(() => {});
+    });
+    Object.entries(multicamAudioRefs.current).forEach(([assetId, audio]) => {
+      if (!audio) return;
+      const assetDuration = Number(
+        multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
+      );
+      try {
+        audio.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
+      } catch {
+        // ignore seek edge cases
+      }
+      audio.play().catch(() => {});
+    });
+
+    multicamPreviewAnimationRef.current = window.requestAnimationFrame(syncMulticamPreviewFrame);
+    return () => {
+      if (multicamPreviewAnimationRef.current) {
+        cancelAnimationFrame(multicamPreviewAnimationRef.current);
+        multicamPreviewAnimationRef.current = null;
+      }
+    };
+  }, [
+    getMulticamSourceTimeForAsset,
+    isMulticamPlaying,
+    isMulticamProject,
+    multicamAssets,
+    syncMulticamPreviewFrame,
+    timelinePlayheadSeconds,
+  ]);
 
   const handlePreviewTimeUpdate = useCallback((event) => {
     const video = event.currentTarget;
@@ -1187,6 +1917,12 @@ const ClipVaultWorkspace = ({
       if (event.pointerId !== dragState.pointerId) return;
       const seconds = getTimelineSecondsFromClientX(event.clientX);
       if (!Number.isFinite(seconds)) return;
+      if (dragState.multicam) {
+        const nextSeconds = clamp(seconds, 0, multicamTrackDurationSeconds);
+        setTimelinePlayheadSeconds(nextSeconds);
+        setCurrentPreviewTime(nextSeconds);
+        return;
+      }
       seekTimelineToSeconds(seconds, { updatePreview: true });
     };
 
@@ -1208,7 +1944,7 @@ const ClipVaultWorkspace = ({
       window.removeEventListener('pointerup', handlePointerUp);
       window.removeEventListener('pointercancel', handlePointerUp);
     };
-  }, [getTimelineSecondsFromClientX, seekTimelineToSeconds]);
+  }, [getTimelineSecondsFromClientX, multicamTrackDurationSeconds, seekTimelineToSeconds]);
 
   const startPaneResize = useCallback((type) => (event) => {
     event.preventDefault();
@@ -1229,6 +1965,28 @@ const ClipVaultWorkspace = ({
 
   return (
     <section className="glass rounded-3xl p-5 lg:p-6 space-y-4">
+      {isMulticamProject && (
+        <div className="rounded-2xl border border-emerald-300/70 dark:border-emerald-700/70 bg-emerald-50/80 dark:bg-emerald-950/20 px-4 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="material-symbols-outlined text-[18px] text-emerald-700 dark:text-emerald-300">video_camera_front</span>
+                <div className="text-sm font-semibold text-emerald-900 dark:text-emerald-100">Multicam Mode</div>
+              </div>
+              <div className="mt-1 text-xs text-emerald-800/80 dark:text-emerald-200/80">
+                Editing a synced two-camera project. Camera 1 is the top track, Camera 2 is the bottom track, and each segment controls which camera is live in the program output.
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold">
+              <span className="rounded-full bg-emerald-600 text-white px-2.5 py-1">Green = Active</span>
+              <span className="rounded-full bg-rose-600 text-white px-2.5 py-1">Red = Inactive</span>
+              <span className="rounded-full bg-slate-900 text-white px-2.5 py-1">Ctrl+T Cut</span>
+              <span className="rounded-full bg-slate-900 text-white px-2.5 py-1">Ctrl+J Join</span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isMediaBinCollapsed && (
         <div className="flex flex-wrap items-center gap-2">
           {isMediaBinCollapsed && (
@@ -1390,6 +2148,23 @@ const ClipVaultWorkspace = ({
               Cached Media: <span className="font-semibold">{formatBytesLabel(mediaStats?.totalBytes)}</span> ({Number(mediaStats?.clipCount || 0)} clips)
             </div>
 
+            {selectedProject?.workflowType === 'multicam' ? (
+              <div className="rounded-lg border border-sky-300/40 dark:border-sky-500/35 bg-sky-50/70 dark:bg-sky-950/20 px-3 py-2 grid grid-cols-2 gap-2 text-[11px] text-slate-600 dark:text-slate-300">
+                <div>
+                  Workflow: <span className="font-semibold text-slate-800 dark:text-slate-100">Two-Camera Podcast</span>
+                </div>
+                <div>
+                  Assets: <span className="font-semibold text-slate-800 dark:text-slate-100">{Array.isArray(selectedProject?.mediaAssets) ? selectedProject.mediaAssets.length : 0}</span>
+                </div>
+                <div>
+                  Sync: <span className="font-semibold text-slate-800 dark:text-slate-100">{Number.isFinite(Number(selectedProject?.syncMap?.offsetSeconds)) ? `${Number(selectedProject.syncMap.offsetSeconds).toFixed(2)}s` : '--'}</span>
+                </div>
+                <div>
+                  Project Audio: <span className="font-semibold text-slate-800 dark:text-slate-100">{multicamAudioMixMode === 'stereo_mix' ? 'Synced Stereo Mix' : (String(selectedProject?.masterAudioAssetId || '').trim() || '--')}</span>
+                </div>
+              </div>
+            ) : null}
+
             <div className="space-y-2">
               <label htmlFor="vault-search" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
                 Search Clips
@@ -1447,6 +2222,303 @@ const ClipVaultWorkspace = ({
         )}
 
         <div className="min-w-0 flex-1 flex flex-col">
+          {isMulticamProject ? (
+            <>
+              <section
+                className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-0"
+                style={{ height: `${monitorHeight}px` }}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Program Monitor</div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {isMulticamPlaying ? (
+                      <button
+                        type="button"
+                        onClick={pauseSelectedMulticamProgram}
+                        className="inline-flex items-center gap-1 rounded-lg bg-slate-800 text-white px-3 py-2 text-xs font-semibold"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">pause</span>
+                        Pause Program
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={playSelectedMulticamProgram}
+                    disabled={!multicamPreviewUrls.camera1 && !multicamPreviewUrls.camera2}
+                        className="inline-flex items-center gap-1 rounded-lg bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">play_arrow</span>
+                        Play Program
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={splitSelectedMulticamSegment}
+                      disabled={!selectedMulticamSegment}
+                      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                    >
+                      <span className="material-symbols-outlined text-[14px]">content_cut</span>
+                      Cut At Playhead
+                    </button>
+                    <button
+                      type="button"
+                      onClick={joinSelectedMulticamSegment}
+                      disabled={!selectedMulticamSegment}
+                      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                    >
+                      <span className="material-symbols-outlined text-[14px]">join_inner</span>
+                      Join Next
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                  <span>{selectedProject ? selectedProject.name : 'No Project Selected'}</span>
+                  {selectedMulticamSegment ? (
+                    <span className="font-semibold text-slate-700 dark:text-slate-200">
+                      Segment {multicamSegments.findIndex((segment) => segment.id === selectedMulticamSegment.id) + 1}/{multicamSegments.length}
+                    </span>
+                  ) : null}
+                  {multicamPreviewSegment ? (
+                    <span className="font-semibold text-emerald-600 dark:text-emerald-300">
+                      Active {getMulticamActiveCameraId(multicamPreviewSegment) === 'camera2' ? 'Camera 2' : 'Camera 1'}
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="mt-3 flex-1 min-h-0">
+                  <div className="relative w-full h-full rounded-xl overflow-hidden bg-black/90 border border-slate-300/60 dark:border-slate-700/60">
+                    {multicamPreviewUrls.camera1 || multicamPreviewUrls.camera2 ? (
+                      <>
+                        {(['camera1', 'camera2']).map((assetId) => {
+                          const src = multicamPreviewUrls[assetId];
+                          if (!src) return null;
+                          const isActive = getMulticamActiveCameraId(multicamPreviewSegment) === assetId;
+                          return (
+                            <video
+                              key={assetId}
+                              ref={(node) => {
+                                multicamPreviewRefs.current[assetId] = node;
+                              }}
+                              src={src}
+                              playsInline
+                              muted
+                              className={`absolute inset-0 w-full h-full object-contain transition-opacity duration-75 ${
+                                isActive ? 'opacity-100' : 'opacity-0 pointer-events-none'
+                              }`}
+                              onLoadedMetadata={(event) => handleMulticamLoadedMetadata(assetId, event)}
+                            />
+                          );
+                        })}
+                        {(['camera1', 'camera2']).map((assetId) => {
+                          const src = multicamPreviewUrls[assetId];
+                          if (!src) return null;
+                          return (
+                            <audio
+                              key={`audio-${assetId}`}
+                              ref={(node) => {
+                                multicamAudioRefs.current[assetId] = node;
+                              }}
+                              src={src}
+                              preload="auto"
+                              className="hidden"
+                            />
+                          );
+                        })}
+                      </>
+                    ) : (
+                      <div className="w-full h-full flex flex-col items-center justify-center text-slate-300 text-sm gap-2">
+                        <span className="material-symbols-outlined text-[34px]">videocam_off</span>
+                        Select a multicam segment with a valid source file to preview.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                  <span>
+                    Program Playhead: <span className="font-semibold">{formatTimelineTickLabel(timelinePlayheadSeconds)}</span>
+                  </span>
+                  {selectedMulticamSegment ? (
+                    <span>
+                      Segment Range: <span className="font-semibold">{formatTimelineTickLabel(selectedMulticamSegment.startSeconds)} - {formatTimelineTickLabel(selectedMulticamSegment.endSeconds)}</span>
+                    </span>
+                  ) : null}
+                </div>
+
+                <div className="mt-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/30 p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Active Camera Override</div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                        Green track is active. Red track is inactive. Switching a segment locks a manual override.
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedMulticamCamera('camera1')}
+                        disabled={!selectedMulticamSegment}
+                        className="rounded-md bg-emerald-600 text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                      >
+                        Camera 1 Active
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedMulticamCamera('camera2')}
+                        disabled={!selectedMulticamSegment}
+                        className="rounded-md bg-emerald-600 text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                      >
+                        Camera 2 Active
+                      </button>
+                      <button
+                        type="button"
+                        onClick={clearSelectedMulticamOverride}
+                        disabled={!selectedMulticamSegment || (!selectedMulticamSegment?.manualCameraId && !selectedMulticamSegment?.isLocked)}
+                        className="rounded-md border border-slate-300 dark:border-slate-600 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                      >
+                        Clear Override
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <button
+                type="button"
+                onMouseDown={startPaneResize('monitor')}
+                aria-label="Resize monitor and timeline panes"
+                className="hidden lg:block h-2 my-2 cursor-row-resize rounded bg-transparent hover:bg-primary/30 transition-colors"
+              />
+
+              <section className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-[280px] flex-1">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Multicam Timeline</div>
+                  <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                    <span>Playhead {formatTimelineTickLabel(timelinePlayheadSeconds)}</span>
+                    <div className="inline-flex items-center gap-1">
+                      <span>Zoom</span>
+                      <input
+                        type="range"
+                        min="0.6"
+                        max="4"
+                        step="0.1"
+                        value={timelineZoom}
+                        onChange={(event) => setTimelineZoom(clamp(Number(event.target.value), 0.6, 4))}
+                        className="w-24 accent-primary"
+                        aria-label="Timeline zoom"
+                      />
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">{timelineZoom.toFixed(1)}x</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  ref={timelineScrollerRef}
+                  className="mt-3 rounded-xl border border-slate-300/70 dark:border-slate-700/70 bg-slate-950/80 overflow-x-auto overflow-y-hidden flex-1 min-h-0"
+                >
+                  {multicamSegments.length === 0 ? (
+                    <div className="h-full min-h-[240px] flex items-center justify-center text-slate-400 text-sm">
+                      Multicam segments will appear here after Sermon Prep sync.
+                    </div>
+                  ) : (
+                    <div
+                      ref={timelineTrackRef}
+                      className="relative min-h-[240px] select-none"
+                      style={{ width: `${multicamTrackWidthPx}px` }}
+                      onPointerDown={handleMulticamRulerPointerDown}
+                    >
+                      <div
+                        className="absolute left-0 right-0 top-0 bg-slate-900/95 border-b border-slate-700"
+                        style={{ height: `${TIMELINE_RULER_HEIGHT_PX}px` }}
+                      >
+                        {multicamRulerTicks.map((tick) => {
+                          const leftPx = tick.seconds * timelinePixelsPerSecond;
+                          return (
+                            <div
+                              key={`multicam-tick-${tick.seconds}`}
+                              className="absolute top-0 bottom-0 text-[10px] text-slate-400"
+                              style={{ left: `${leftPx}px` }}
+                            >
+                              <div className={`w-px bg-slate-500/70 ${tick.isMajor ? 'h-4' : 'h-2.5'}`} />
+                              {tick.isMajor && (
+                                <div className="mt-0.5 -translate-x-1/2 whitespace-nowrap">
+                                  {formatTimelineTickLabel(tick.seconds)}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div className="absolute left-0 right-0 border-b border-slate-700/80 bg-slate-900/45" style={{ top: `${TIMELINE_RULER_HEIGHT_PX}px`, height: `${TIMELINE_ROW_HEIGHT_PX}px` }} />
+                      <div className="absolute left-0 right-0 border-b border-slate-700/80 bg-slate-900/35" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX}px`, height: `${TIMELINE_ROW_HEIGHT_PX}px` }} />
+                      <div className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + 6}px` }}>Camera 1</div>
+                      <div className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX + 6}px` }}>Camera 2</div>
+
+                      {multicamSegments.map((segment, index) => {
+                        const start = Number(segment.startSeconds || 0);
+                        const end = Number(segment.endSeconds || 0);
+                        const duration = Math.max(TRIM_MIN_GAP_SECONDS, end - start);
+                        const activeCameraId = getMulticamActiveCameraId(segment);
+                        const leftPx = start * timelinePixelsPerSecond;
+                        const widthPx = Math.max(24, duration * timelinePixelsPerSecond);
+                        const isSelected = segment.id === effectiveSelectedMulticamSegmentId;
+                        const topSegmentStyle = activeCameraId === 'camera1'
+                          ? 'bg-emerald-500/85 border-emerald-200 text-emerald-50'
+                          : 'bg-rose-500/70 border-rose-200/70 text-rose-50';
+                        const bottomSegmentStyle = activeCameraId === 'camera2'
+                          ? 'bg-emerald-500/85 border-emerald-200 text-emerald-50'
+                          : 'bg-rose-500/70 border-rose-200/70 text-rose-50';
+                        return (
+                          <React.Fragment key={segment.id}>
+                            <button
+                              type="button"
+                              onClick={() => handleSelectMulticamSegment(segment.id)}
+                              className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${topSegmentStyle} ${isSelected ? 'ring-2 ring-white/90' : ''}`}
+                              style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${TIMELINE_RULER_HEIGHT_PX + 10}px`, height: `${TIMELINE_ROW_HEIGHT_PX - 20}px` }}
+                              title={`Segment ${index + 1} • Camera 1 • ${formatTimelineTickLabel(start)} - ${formatTimelineTickLabel(end)}`}
+                            >
+                              <div className="text-[10px] font-bold opacity-80">#{index + 1}</div>
+                              <div className="text-xs font-semibold truncate">{activeCameraId === 'camera1' ? 'ACTIVE' : 'inactive'}</div>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleSelectMulticamSegment(segment.id)}
+                              className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${bottomSegmentStyle} ${isSelected ? 'ring-2 ring-white/90' : ''}`}
+                              style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX + 10}px`, height: `${TIMELINE_ROW_HEIGHT_PX - 20}px` }}
+                              title={`Segment ${index + 1} • Camera 2 • ${formatTimelineTickLabel(start)} - ${formatTimelineTickLabel(end)}`}
+                            >
+                              <div className="text-[10px] font-bold opacity-80">#{index + 1}</div>
+                              <div className="text-xs font-semibold truncate">{activeCameraId === 'camera2' ? 'ACTIVE' : 'inactive'}</div>
+                            </button>
+                            <div
+                              className="pointer-events-none absolute top-[28px] bottom-0 z-30 w-px bg-white/50"
+                              style={{ left: `${leftPx}px` }}
+                            />
+                          </React.Fragment>
+                        );
+                      })}
+
+                      <div
+                        className="pointer-events-none absolute top-0 bottom-0 z-40"
+                        style={{ left: `${timelinePlayheadSeconds * timelinePixelsPerSecond}px` }}
+                      >
+                        <div className="w-[2px] h-full bg-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.6)]" />
+                        <div className="absolute -top-0.5 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[7px] border-r-[7px] border-t-[10px] border-l-transparent border-r-transparent border-t-white/95" />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400">
+                  <span>Click a segment to target it. Green is active camera, red is inactive.</span>
+                  <span>Click the ruler to move the playhead. Use Cut At Playhead and Join Next to reshape the edit.</span>
+                </div>
+              </section>
+            </>
+          ) : (
+            <>
           <section
             className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-0"
             style={{ height: `${monitorHeight}px` }}
@@ -1565,10 +2637,29 @@ const ClipVaultWorkspace = ({
                     Select a timeline clip with a rendered file to preview.
                   </div>
                 )}
-                {activePreviewCaption && (
+                {previewCaptionLines.length > 0 && (
                   <div className="pointer-events-none absolute inset-x-0 bottom-4 flex items-end justify-center px-4">
-                    <div className={getCaptionStyleClassName(previewCaptionPayload?.stylePreset)}>
-                      {activePreviewCaption}
+                    <div className={getCaptionOverlayClassName(previewCaptionPayload?.stylePreset)}>
+                      <div className="space-y-1.5 text-center leading-tight">
+                        {previewCaptionLines.map((line, lineIndex) => (
+                          <div
+                            key={`vault-caption-line-${lineIndex}`}
+                            className="flex flex-wrap justify-center items-baseline gap-x-1.5 gap-y-1"
+                          >
+                            {line.map((word) => (
+                              <span
+                                key={word.id}
+                                className={`inline-block px-1 rounded transition-all duration-100 ${getCaptionWordClassName({
+                                  stylePreset: previewCaptionPayload?.stylePreset,
+                                  isActive: word.isActive,
+                                })}`}
+                              >
+                                {word.text}
+                              </span>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   </div>
                 )}
@@ -1585,6 +2676,111 @@ const ClipVaultWorkspace = ({
                 </span>
               )}
             </div>
+
+            <div className="mt-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/30 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Caption Style</div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Changes look only. Word timing and cue sync stay intact.
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleCaptionEnabledToggle}
+                    disabled={!selectedTimelineEntry}
+                    className={`rounded-md px-3 py-2 text-xs font-semibold disabled:opacity-50 ${
+                      selectedTimelineEntry?.item?.captionEnabled === false
+                        ? 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
+                        : 'bg-emerald-600 text-white'
+                    }`}
+                  >
+                    {selectedTimelineEntry?.item?.captionEnabled === false ? 'Captions Off' : 'Captions On'}
+                  </button>
+                  <select
+                    value={selectedCaptionStylePreset}
+                    onChange={handleCaptionStyleChange}
+                    disabled={!selectedTimelineEntry}
+                    className="rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-100 disabled:opacity-50"
+                    aria-label="Caption style preset"
+                  >
+                    {CAPTION_STYLE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+
+          </section>
+
+          <section className="mt-4 rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20">
+            <button
+              type="button"
+              onClick={() => setIsClipToolsOpen((previous) => !previous)}
+              className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left"
+            >
+              <div>
+                <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Clip Tools</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Advanced transcript correction and reflow.
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {selectedEditableClip && (
+                  <span className={`text-[11px] font-semibold px-2 py-1 rounded-md ${
+                    selectedClipHasTranscriptEdit
+                      ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200'
+                      : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'
+                  }`}>
+                    {selectedClipHasTranscriptEdit ? 'Edited text active' : 'Hidden'}
+                  </span>
+                )}
+                <span className="material-symbols-outlined text-slate-500 dark:text-slate-300">
+                  {isClipToolsOpen ? 'expand_less' : 'expand_more'}
+                </span>
+              </div>
+            </button>
+            {isClipToolsOpen && (
+              <div className="border-t border-slate-200/70 dark:border-slate-700/70 p-4 space-y-3">
+                <textarea
+                  value={clipTranscriptDraft}
+                  onChange={(event) => setClipTranscriptDraft(event.target.value)}
+                  disabled={!selectedEditableClip}
+                  rows={4}
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm"
+                  placeholder={selectedEditableClip ? 'Edit the clip transcript here' : 'Select a clip in the timeline to edit its transcript'}
+                />
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                    {selectedEditableClip
+                      ? 'Apply Text + Reflow regenerates timed caption cues from the selected clip timing.'
+                      : 'Select a timeline clip to enable transcript editing.'}
+                  </div>
+                  <div className="inline-flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={resetClipTranscriptEdit}
+                      disabled={!selectedEditableClip}
+                      className="rounded-md border border-slate-300 dark:border-slate-600 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                    >
+                      Reset to Source
+                    </button>
+                    <button
+                      type="button"
+                      onClick={applyClipTranscriptEdit}
+                      disabled={!selectedEditableClip}
+                      className="rounded-md bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                    >
+                      Apply Text + Reflow
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </section>
 
           <button
@@ -1767,6 +2963,8 @@ const ClipVaultWorkspace = ({
               <span>Click anywhere on the ruler/track to move the playhead and update the monitor.</span>
             </div>
           </section>
+            </>
+          )}
         </div>
 
       </div>

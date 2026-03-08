@@ -980,6 +980,13 @@ async function requestOpenAiAudioTranscription({
     const shouldRetryWithoutGranularity = (message) => {
         return /timestamp_granularities|verbose_json|word/i.test(String(message || ""));
     };
+    const getResponseFormatForModel = (modelName) => {
+        const normalized = String(modelName || "").trim().toLowerCase();
+        if (normalized.startsWith("gpt-4o-transcribe") || normalized.startsWith("gpt-4o-mini-transcribe")) {
+            return "json";
+        }
+        return "verbose_json";
+    };
 
     const assertTranscriptionQuality = (payload, modelName) => {
         const timedWordCount = countValidTimedWords(payload);
@@ -998,7 +1005,7 @@ async function requestOpenAiAudioTranscription({
         const form = new FormData();
         form.append("file", new Blob([audioBuffer], { type: "audio/mpeg" }), fileName);
         form.append("model", modelName);
-        form.append("response_format", "verbose_json");
+        form.append("response_format", getResponseFormatForModel(modelName));
 
         if (normalizedPrompt) {
             form.append("prompt", normalizedPrompt);
@@ -1434,6 +1441,27 @@ function normalizeCaptionCuesForRender(cues, clipDurationSeconds) {
                 text,
                 startSeconds: Number(start.toFixed(2)),
                 endSeconds: Number(end.toFixed(2)),
+                words: Array.isArray(cue?.words)
+                    ? cue.words
+                        .map((word, wordIndex) => {
+                            const wordText = String(word?.text || "").replace(/\s+/g, " ").trim();
+                            const wordStartSeconds = Number(word?.startSeconds);
+                            const wordEndSeconds = Number(word?.endSeconds);
+                            if (!wordText || !Number.isFinite(wordStartSeconds) || !Number.isFinite(wordEndSeconds)) return null;
+                            const normalizedWordStart = clampNumber(wordStartSeconds, 0, maxDuration);
+                            const normalizedWordEnd = clampNumber(wordEndSeconds, normalizedWordStart + 0.03, maxDuration);
+                            if (!Number.isFinite(normalizedWordStart) || !Number.isFinite(normalizedWordEnd) || normalizedWordEnd <= normalizedWordStart) {
+                                return null;
+                            }
+                            return {
+                                id: String(word?.id || `${cue?.id || `cue-${index + 1}`}-word-${wordIndex + 1}`),
+                                text: wordText,
+                                startSeconds: Number(normalizedWordStart.toFixed(2)),
+                                endSeconds: Number(normalizedWordEnd.toFixed(2)),
+                            };
+                        })
+                        .filter(Boolean)
+                    : [],
             };
         })
         .filter(Boolean);
@@ -1531,22 +1559,63 @@ function buildCaptionDrawtextFilters({ captionCues, captionStylePreset }) {
             .flatMap((cue) => {
                 const cueStart = Number(cue.startSeconds);
                 const cueEnd = Number(cue.endSeconds);
-                const words = splitCaptionWords(cue.text);
-                const windows = splitCaptionWindows(words, cueStart, cueEnd, 5);
+                const exactWords = Array.isArray(cue?.words)
+                    ? cue.words
+                        .map((word, index) => {
+                            const text = String(word?.text || "").replace(/\s+/g, " ").trim();
+                            const startSeconds = Number(word?.startSeconds);
+                            const endSeconds = Number(word?.endSeconds);
+                            if (!text || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) return null;
+                            return {
+                                id: String(word?.id || `${cue.id || "cue"}-word-${index + 1}`),
+                                text,
+                                startSeconds,
+                                endSeconds,
+                            };
+                        })
+                        .filter(Boolean)
+                    : [];
+                const windows = exactWords.length > 0
+                    ? (() => {
+                        const groupedWindows = [];
+                        for (let startIndex = 0; startIndex < exactWords.length; startIndex += 5) {
+                            const windowWords = exactWords.slice(startIndex, startIndex + 5);
+                            if (windowWords.length === 0) continue;
+                            groupedWindows.push({
+                                words: windowWords.map((word) => word.text),
+                                startSeconds: windowWords[0].startSeconds,
+                                endSeconds: windowWords[windowWords.length - 1].endSeconds,
+                                timedWords: windowWords,
+                            });
+                        }
+                        return groupedWindows;
+                    })()
+                    : splitCaptionWindows(splitCaptionWords(cue.text), cueStart, cueEnd, 5);
                 const filters = [];
 
                 for (const window of windows) {
-                    const localPerWord = window.perWordDuration;
-                    for (let index = 0; index < window.words.length; index += 1) {
-                        const stepStart = window.startSeconds + localPerWord * index;
-                        const rawStepEnd = index === window.words.length - 1
-                            ? window.endSeconds
-                            : window.startSeconds + localPerWord * (index + 1);
+                    const words = Array.isArray(window.timedWords) && window.timedWords.length > 0
+                        ? window.timedWords
+                        : window.words.map((text, index) => {
+                            const localPerWord = window.perWordDuration;
+                            const stepStart = window.startSeconds + localPerWord * index;
+                            const rawStepEnd = index === window.words.length - 1
+                                ? window.endSeconds
+                                : window.startSeconds + localPerWord * (index + 1);
+                            return {
+                                text,
+                                startSeconds: stepStart,
+                                endSeconds: Math.min(window.endSeconds, Math.max(stepStart + 0.06, rawStepEnd)),
+                            };
+                        });
+                    for (let index = 0; index < words.length; index += 1) {
+                        const stepStart = Number(words[index].startSeconds);
+                        const rawStepEnd = Number(words[index].endSeconds);
                         const stepEnd = Math.min(window.endSeconds, Math.max(stepStart + 0.06, rawStepEnd));
                         if (stepEnd <= stepStart) continue;
 
                         const progressiveText = escapeDrawtextText(
-                            buildTwoRowCaptionText(window.words.slice(0, index + 1), 5)
+                            buildTwoRowCaptionText(words.slice(0, index + 1).map((word) => word.text), 5)
                         );
                         if (!progressiveText) continue;
 
@@ -1572,22 +1641,63 @@ function buildCaptionDrawtextFilters({ captionCues, captionStylePreset }) {
             .flatMap((cue) => {
                 const cueStart = Number(cue.startSeconds);
                 const cueEnd = Number(cue.endSeconds);
-                const words = splitCaptionWords(cue.text);
-                const windows = splitCaptionWindows(words, cueStart, cueEnd, 5);
+                const exactWords = Array.isArray(cue?.words)
+                    ? cue.words
+                        .map((word, index) => {
+                            const text = String(word?.text || "").replace(/\s+/g, " ").trim();
+                            const startSeconds = Number(word?.startSeconds);
+                            const endSeconds = Number(word?.endSeconds);
+                            if (!text || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) return null;
+                            return {
+                                id: String(word?.id || `${cue.id || "cue"}-word-${index + 1}`),
+                                text,
+                                startSeconds,
+                                endSeconds,
+                            };
+                        })
+                        .filter(Boolean)
+                    : [];
+                const windows = exactWords.length > 0
+                    ? (() => {
+                        const groupedWindows = [];
+                        for (let startIndex = 0; startIndex < exactWords.length; startIndex += 5) {
+                            const windowWords = exactWords.slice(startIndex, startIndex + 5);
+                            if (windowWords.length === 0) continue;
+                            groupedWindows.push({
+                                words: windowWords.map((word) => word.text),
+                                startSeconds: windowWords[0].startSeconds,
+                                endSeconds: windowWords[windowWords.length - 1].endSeconds,
+                                timedWords: windowWords,
+                            });
+                        }
+                        return groupedWindows;
+                    })()
+                    : splitCaptionWindows(splitCaptionWords(cue.text), cueStart, cueEnd, 5);
                 const filters = [];
 
                 for (const window of windows) {
-                    const localPerWord = window.perWordDuration;
-                    for (let index = 0; index < window.words.length; index += 1) {
-                        const stepStart = window.startSeconds + localPerWord * index;
-                        const rawStepEnd = index === window.words.length - 1
-                            ? window.endSeconds
-                            : window.startSeconds + localPerWord * (index + 1);
+                    const words = Array.isArray(window.timedWords) && window.timedWords.length > 0
+                        ? window.timedWords
+                        : window.words.map((text, index) => {
+                            const localPerWord = window.perWordDuration;
+                            const stepStart = window.startSeconds + localPerWord * index;
+                            const rawStepEnd = index === window.words.length - 1
+                                ? window.endSeconds
+                                : window.startSeconds + localPerWord * (index + 1);
+                            return {
+                                text,
+                                startSeconds: stepStart,
+                                endSeconds: Math.min(window.endSeconds, Math.max(stepStart + 0.06, rawStepEnd)),
+                            };
+                        });
+                    for (let index = 0; index < words.length; index += 1) {
+                        const stepStart = Number(words[index].startSeconds);
+                        const rawStepEnd = Number(words[index].endSeconds);
                         const stepEnd = Math.min(window.endSeconds, Math.max(stepStart + 0.06, rawStepEnd));
                         if (stepEnd <= stepStart) continue;
 
                         const progressiveText = escapeDrawtextText(
-                            buildTwoRowCaptionText(window.words.slice(0, index + 1), 5)
+                            buildTwoRowCaptionText(words.slice(0, index + 1).map((word) => word.text), 5)
                         );
                         if (!progressiveText) continue;
                         filters.push(
