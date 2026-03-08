@@ -19,3 +19,8 @@ coverage/
 # Editor/IDE metadata
 .idea/
 .vscode/
+
+# large local media
+/*.mov
+/*.mp4
+/*.pptx
