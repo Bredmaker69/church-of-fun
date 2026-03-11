@@ -7,7 +7,8 @@ import {
   probeLocalMediaAsset,
   extractLocalAudioWaveform,
   estimateScratchAudioSync,
-  buildFirstPassMulticamTimeline,
+  buildManualMulticamTimeline,
+  createDefaultMulticamShotPresets,
 } from '../lib/multicamProject';
 import {
   buildReflowedCaptionCues,
@@ -933,7 +934,7 @@ const ManualClipLab = ({
       setMulticamPrepPhase('idle');
       setMulticamPreparedDraft(null);
       setIsPreparingMulticamPackage(false);
-      setStatus('Select Camera 1 and Camera 2 to begin multicam prep.');
+      setStatus('Select Camera A and Camera B to begin multicam prep.');
       return () => {
         cancelled = true;
       };
@@ -944,13 +945,13 @@ const ManualClipLab = ({
     setMulticamPrepPhase('analyzing');
     setMulticamPreparedDraft(null);
     setIsPreparingMulticamPackage(false);
-    setStatus('Preparing Camera 1 and Camera 2 metadata, waveforms, and sync...');
+    setStatus('Preparing Camera A and Camera B metadata, waveforms, and sync...');
 
     void (async () => {
       try {
         const [asset1, asset2] = await Promise.all([
-          probeLocalMediaAsset(camera1File, 'camera1', 'Camera 1'),
-          probeLocalMediaAsset(camera2File, 'camera2', 'Camera 2'),
+          probeLocalMediaAsset(camera1File, 'camera1', 'Camera A'),
+          probeLocalMediaAsset(camera2File, 'camera2', 'Camera B'),
         ]);
         const waveformResults = await Promise.allSettled([
           extractLocalAudioWaveform(camera1File),
@@ -981,12 +982,9 @@ const ManualClipLab = ({
           Number(asset1.durationSeconds || 0),
           Number(asset2.durationSeconds || 0) + Number(syncEstimate.offsetSeconds || 0)
         );
-        const timelineSegments = buildFirstPassMulticamTimeline({
-          waveformA: waveform1 || { bins: [], binDurationSeconds: 0 },
-          waveformB: waveform2 || { bins: [], binDurationSeconds: 0 },
+        const timelineSegments = buildManualMulticamTimeline({
           durationSeconds: syncedDurationSeconds,
-          minShotDurationSeconds: 6,
-          preferInitialCameraId: 'camera1',
+          initialShotId: '1A',
         });
 
         const previewUrl1 = URL.createObjectURL(camera1File);
@@ -1022,6 +1020,7 @@ const ManualClipLab = ({
             },
             masterAudioAssetId: 'camera1',
             timelineSegments,
+            shotPresets: createDefaultMulticamShotPresets(),
             prepWarnings: waveformFailureMessages,
           };
         });
@@ -1029,9 +1028,9 @@ const ManualClipLab = ({
         setMulticamMasterAudioAssetId('camera1');
         setMulticamPrepPhase('ready');
         if (hasWaveformSync) {
-          setStatus('Camera 1 and Camera 2 loaded. Review the waveform slip sync, then confirm before preparing Sanctuary.');
+          setStatus('Camera A and Camera B loaded. Review the waveform slip sync, then confirm before preparing Sanctuary.');
         } else {
-          setStatus(`Camera 1 and Camera 2 loaded, but waveform sync is unavailable. Use manual offset sync before preparing Sanctuary. ${waveformFailureMessages.join(' | ')}`.trim());
+          setStatus(`Camera A and Camera B loaded, but waveform sync is unavailable. Use manual offset sync before preparing Sanctuary. ${waveformFailureMessages.join(' | ')}`.trim());
         }
       } catch (error) {
         if (cancelled) return;
@@ -1088,12 +1087,9 @@ const ManualClipLab = ({
       Number(assetB?.durationSeconds || 0) + Number(multicamManualOffsetSeconds || 0)
     );
 
-    return buildFirstPassMulticamTimeline({
-      waveformA: multicamPrep?.waveforms?.camera1 || { bins: [], binDurationSeconds: 0 },
-      waveformB: multicamPrep?.waveforms?.camera2 || { bins: [], binDurationSeconds: 0 },
+    return buildManualMulticamTimeline({
       durationSeconds: syncedDurationSeconds,
-      minShotDurationSeconds: 6,
-      preferInitialCameraId: 'camera1',
+      initialShotId: '1A',
     });
   }, [multicamManualOffsetSeconds, multicamPrep]);
 
@@ -1428,7 +1424,7 @@ const ManualClipLab = ({
     setMulticamPreparedDraft(null);
     setMulticamPrepPhase('confirmed');
     setStatus(
-      `Sync confirmed. Camera 2 offset locked at ${formatTimestampPrecise(multicamManualOffsetSeconds, 2)}s. Prepare the Sanctuary package when ready.`
+      `Sync confirmed. Camera B offset locked at ${formatTimestampPrecise(multicamManualOffsetSeconds, 2)}s. Prepare the Sanctuary package when ready.`
     );
   }, [multicamManualOffsetSeconds, multicamPrep]);
 
@@ -1452,6 +1448,7 @@ const ManualClipLab = ({
           camera2Pan: 1,
         },
         timelineSegments: effectiveMulticamTimelineSegments,
+        shotPresets: Array.isArray(multicamPrep.shotPresets) ? multicamPrep.shotPresets : createDefaultMulticamShotPresets(),
         speakerProfiles: [],
         speakerCameraPreferences: {},
       };
@@ -1525,7 +1522,7 @@ const ManualClipLab = ({
         pauseMulticamSyncPlayback('Sync-by-ear playback paused.');
       } else {
         void playMulticamSyncPlayback();
-        setStatus('Sync-by-ear playback started. Adjust Camera 2 offset until both voices line up.');
+        setStatus('Sync-by-ear playback started. Adjust Camera B offset until both voices line up.');
       }
     };
 
@@ -5171,7 +5168,7 @@ const ManualClipLab = ({
                 <div>
                   <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Two-Camera Podcast Prep</div>
                   <div className="text-xs text-slate-500 dark:text-slate-400">
-                    Load Camera 1 and Camera 2, sync scratch audio, confirm the sync map, then prepare a Sanctuary package.
+                    Load Camera A and Camera B, sync scratch audio, confirm the sync map, then prepare a Sanctuary package.
                   </div>
                 </div>
                 <div className="inline-flex items-center gap-2">
@@ -5190,12 +5187,12 @@ const ManualClipLab = ({
                 {[
                   {
                     key: 'camera1',
-                    label: 'Camera 1 Loaded',
+                    label: 'Camera A Loaded',
                     active: Boolean(multicamPrep?.mediaAssets?.some((asset) => asset.id === 'camera1')),
                   },
                   {
                     key: 'camera2',
-                    label: 'Camera 2 Loaded',
+                    label: 'Camera B Loaded',
                     active: Boolean(multicamPrep?.mediaAssets?.some((asset) => asset.id === 'camera2')),
                   },
                   {
@@ -5271,7 +5268,7 @@ const ManualClipLab = ({
                   <div>
                     <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Waveform Slip Sync</div>
                     <div className="text-xs text-slate-500 dark:text-slate-400">
-                      Adjust Camera 2 against Camera 1 using scratch audio when available. Positive offset means Camera 2 starts later.
+                      Adjust Camera B against Camera A using scratch audio when available. Positive offset means Camera B starts later.
                     </div>
                   </div>
                   <div className="inline-flex items-center gap-3 text-xs">
@@ -5289,7 +5286,7 @@ const ManualClipLab = ({
                     <div>
                       <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Sync By Ear</div>
                       <div className="text-xs text-slate-500 dark:text-slate-400">
-                        Play both camera audio tracks at the same time, then nudge Camera 2 until the voices line up. Spacebar toggles play and stop.
+                        Play both camera audio tracks at the same time, then nudge Camera B until the voices line up. Spacebar toggles play and stop.
                       </div>
                     </div>
                     <div className="inline-flex items-center gap-2 flex-wrap">
@@ -5312,8 +5309,8 @@ const ManualClipLab = ({
                             ? 'bg-primary text-white'
                             : 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
                         }`}
-                      >
-                        Solo Camera 1
+                        >
+                        Solo Camera A
                       </button>
                       <button
                         type="button"
@@ -5323,8 +5320,8 @@ const ManualClipLab = ({
                             ? 'bg-primary text-white'
                             : 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
                         }`}
-                      >
-                        Solo Camera 2
+                        >
+                        Solo Camera B
                       </button>
                     </div>
                   </div>
@@ -5337,7 +5334,7 @@ const ManualClipLab = ({
                           pauseMulticamSyncPlayback('Sync-by-ear playback paused.');
                         } else {
                           void playMulticamSyncPlayback();
-                          setStatus('Sync-by-ear playback started. Adjust Camera 2 offset until both voices line up.');
+                          setStatus('Sync-by-ear playback started. Adjust Camera B offset until both voices line up.');
                         }
                       }}
                       className="inline-flex items-center gap-2 rounded-full bg-slate-900 text-white px-4 py-2 text-sm font-semibold"
@@ -5381,7 +5378,7 @@ const ManualClipLab = ({
 
                     <label className="space-y-2">
                       <div className="flex items-center justify-between gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
-                        <span>Camera 1 Volume</span>
+                        <span>Camera A Volume</span>
                         <span>{Math.round(multicamCamera1Volume)}%</span>
                       </div>
                       <input
@@ -5398,7 +5395,7 @@ const ManualClipLab = ({
 
                     <label className="space-y-2">
                       <div className="flex items-center justify-between gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
-                        <span>Camera 2 Volume</span>
+                        <span>Camera B Volume</span>
                         <span>{Math.round(multicamCamera2Volume)}%</span>
                       </div>
                       <input
@@ -5430,7 +5427,7 @@ const ManualClipLab = ({
                 <div className="rounded-lg border border-slate-300/80 dark:border-slate-600/70 bg-white/90 dark:bg-slate-800/80 p-3 space-y-3">
                   <div className="rounded-lg border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/80 dark:bg-slate-950/40 px-3 py-2">
                     <div className="mb-2 flex items-center justify-between gap-2">
-                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">Camera 1</div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">Camera A</div>
                       <div className="text-[10px] text-slate-500 dark:text-slate-400">Reference waveform</div>
                     </div>
                     <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-24 w-full">
@@ -5459,7 +5456,7 @@ const ManualClipLab = ({
 
                   <div className="rounded-lg border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/80 dark:bg-slate-950/40 px-3 py-2">
                     <div className="mb-2 flex items-center justify-between gap-2">
-                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">Camera 2</div>
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-600 dark:text-slate-300">Camera B</div>
                       <div className="text-[10px] text-slate-500 dark:text-slate-400">Shifted by current offset</div>
                     </div>
                     <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-24 w-full">
@@ -5518,7 +5515,7 @@ const ManualClipLab = ({
                   <div>
                     <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">First-Pass Multicam Timeline</div>
                     <div className="text-xs text-slate-500 dark:text-slate-400">
-                      Audio-energy driven camera selection with minimum shot hold. Manual speaker labels and transcript alignment come next.
+                      Manual director timeline. Sanctuary will open with one full-length segment and reusable shot presets for Camera A and Camera B.
                     </div>
                   </div>
                   <span className="text-xs font-semibold px-2 py-1 rounded-full bg-slate-200 text-slate-700 dark:bg-slate-800 dark:text-slate-300">
@@ -5532,7 +5529,7 @@ const ManualClipLab = ({
                       <div key={segment.id} className="flex items-center justify-between gap-4 px-3 py-2 text-xs">
                         <div className="min-w-0">
                           <div className="font-semibold text-slate-800 dark:text-slate-100">
-                            {segment.cameraId === 'camera2' ? 'Camera 2' : 'Camera 1'}
+                            {String(segment.shotId || '1A')}
                           </div>
                           <div className="text-slate-500 dark:text-slate-400">
                             {formatTimestampPrecise(segment.startSeconds, 2)} - {formatTimestampPrecise(segment.endSeconds, 2)}
@@ -5540,7 +5537,7 @@ const ManualClipLab = ({
                         </div>
                         <div className="flex items-center gap-2 text-[11px]">
                           <span className="px-2 py-1 rounded-full bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
-                            {Math.round((segment.confidence || 0) * 100)}% conf
+                            manual
                           </span>
                           {segment.silenceCandidate ? (
                             <span className="px-2 py-1 rounded-full bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">

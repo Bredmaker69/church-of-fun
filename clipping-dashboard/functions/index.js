@@ -7,6 +7,13 @@ const { createReadStream } = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 const { randomUUID } = require("node:crypto");
+const {
+    DEFAULT_SPEECH_CLEANUP_PRESET,
+    buildSpeechCleanupAudioFilter,
+    buildSpeechCleanupCacheKey,
+    getSpeechCleanupProxyFileName,
+    normalizeSpeechCleanupPreset,
+} = require("./lib/speechCleanup");
 
 const execFileAsync = promisify(execFile);
 
@@ -68,6 +75,10 @@ const CONTENT_PROFILE_INSTRUCTIONS = {
 const youtubeTranscriptCache = new Map();
 const renderedClipStore = new Map();
 const renderedClipStorageDir = path.join(os.tmpdir(), "church-of-fun-rendered-clips");
+const speechCleanupCacheDir = path.join(renderedClipStorageDir, "speech-cleanup-cache");
+const SPEECH_CLEANUP_MODEL_PATH = String(
+    process.env.SPEECH_CLEANUP_MODEL_PATH || path.join(__dirname, "models", "speech-cleanup.rnnn")
+).trim();
 
 let hostSupportsArm64 = false;
 if (process.platform === "darwin") {
@@ -1544,6 +1555,106 @@ function buildEffectFilters({ effectsPreset, effectsIntensity }) {
     return [];
 }
 
+async function cleanupSpeechCleanupArtifactsForToken(token) {
+    const normalizedToken = String(token || "").trim();
+    if (!normalizedToken) return;
+    const names = await fs.readdir(speechCleanupCacheDir).catch(() => []);
+    await Promise.all(names
+        .filter((name) => name.includes(normalizedToken))
+        .map((name) => fs.rm(path.join(speechCleanupCacheDir, name), { force: true }).catch(() => {})));
+}
+
+async function ensureSpeechCleanupAudioProxy({
+    sourcePath,
+    sourceToken,
+    speechCleanupPreset,
+}) {
+    const normalizedPreset = normalizeSpeechCleanupPreset(speechCleanupPreset || DEFAULT_SPEECH_CLEANUP_PRESET);
+    const { filter, engine } = buildSpeechCleanupAudioFilter({
+        preset: normalizedPreset,
+        modelPath: SPEECH_CLEANUP_MODEL_PATH,
+    });
+    const cacheKey = buildSpeechCleanupCacheKey({
+        sourcePath,
+        preset: normalizedPreset,
+        engine,
+    });
+    const tokenSeed = String(sourceToken || cacheKey).trim() || cacheKey;
+    await fs.mkdir(speechCleanupCacheDir, { recursive: true });
+    const outputPath = path.join(
+        speechCleanupCacheDir,
+        getSpeechCleanupProxyFileName({ key: `${tokenSeed}-${cacheKey}`.slice(0, 96), preset: normalizedPreset })
+    );
+
+    const existingStats = await fs.stat(outputPath).catch(() => null);
+    if (existingStats?.isFile() && existingStats.size > 0) {
+        return {
+            filePath: outputPath,
+            preset: normalizedPreset,
+            engine,
+            cached: true,
+        };
+    }
+
+    await execFileAsync("ffmpeg", [
+        "-y",
+        "-i", sourcePath,
+        "-vn",
+        "-af", filter,
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ac", "2",
+        "-ar", "48000",
+        outputPath,
+    ], {
+        timeout: 10 * 60 * 1000,
+        maxBuffer: 20 * 1024 * 1024,
+    });
+
+    const stats = await fs.stat(outputPath).catch(() => null);
+    if (!stats?.isFile() || stats.size <= 0) {
+        throw new Error("Speech Cleanup audio proxy was not created.");
+    }
+
+    return {
+        filePath: outputPath,
+        preset: normalizedPreset,
+        engine,
+        cached: false,
+    };
+}
+
+async function renderSpeechCleanupPreviewProxy({
+    sourcePath,
+    sourceToken,
+    speechCleanupPreset,
+    tempDir,
+}) {
+    const cleanedAudio = await ensureSpeechCleanupAudioProxy({
+        sourcePath,
+        sourceToken,
+        speechCleanupPreset,
+    });
+    const outputPath = path.join(tempDir, `speech-cleanup-preview-${Date.now()}.mp4`);
+    await execFileAsync("ffmpeg", [
+        "-y",
+        "-i", sourcePath,
+        "-i", cleanedAudio.filePath,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-ac", "2",
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        outputPath,
+    ], {
+        timeout: 10 * 60 * 1000,
+        maxBuffer: 20 * 1024 * 1024,
+    });
+    return outputPath;
+}
+
 function buildCaptionDrawtextFilters({ captionCues, captionStylePreset }) {
     const normalizedStyle = normalizeCaptionStylePreset(captionStylePreset);
     let styleArgs = "fontcolor=white:fontsize=42:x=(w-text_w)/2:y=h-(text_h*2.2):line_spacing=8:box=1:boxcolor=black@0.58:boxborderw=16";
@@ -1735,12 +1846,15 @@ function buildEditVideoFilter({ effectsPreset, effectsIntensity, captionCues, ca
 
 async function renderEditedClipSegment({
     sourcePath,
+    sourceToken,
     trimStartSeconds,
     trimEndSeconds,
     tempDir,
     index,
     effectsPreset,
     effectsIntensity,
+    speechCleanupEnabled,
+    speechCleanupPreset,
     captionCues,
     captionStylePreset,
 }) {
@@ -1753,6 +1867,20 @@ async function renderEditedClipSegment({
         : sourceDuration;
     const clipDurationSeconds = Math.max(0.1, end - start);
     const normalizedCaptionCues = normalizeCaptionCuesForRender(captionCues, clipDurationSeconds);
+    let cleanedAudioPath = "";
+    if (speechCleanupEnabled) {
+        try {
+            const cleanedAudio = await ensureSpeechCleanupAudioProxy({
+                sourcePath,
+                sourceToken,
+                speechCleanupPreset,
+            });
+            cleanedAudioPath = cleanedAudio.filePath;
+            console.log(`Speech Cleanup enabled for timeline render (${cleanedAudio.engine}, ${cleanedAudio.cached ? "cache hit" : "fresh"}).`);
+        } catch (error) {
+            console.warn("Speech Cleanup proxy generation failed. Falling back to original audio.", summarizeExecError(error));
+        }
+    }
 
     const outputPath = path.join(tempDir, `timeline-edit-${index + 1}.mp4`);
     const args = [
@@ -1760,6 +1888,17 @@ async function renderEditedClipSegment({
         "-ss", start.toFixed(3),
         "-to", end.toFixed(3),
         "-i", sourcePath,
+    ];
+    if (cleanedAudioPath) {
+        args.push(
+            "-ss", start.toFixed(3),
+            "-to", end.toFixed(3),
+            "-i", cleanedAudioPath,
+            "-map", "0:v:0",
+            "-map", "1:a:0"
+        );
+    }
+    args.push(
         "-vf", buildEditVideoFilter({
             effectsPreset,
             effectsIntensity,
@@ -1775,7 +1914,7 @@ async function renderEditedClipSegment({
         "-ar", "48000",
         "-movflags", "+faststart",
         outputPath,
-    ];
+    );
 
     await execFileAsync("ffmpeg", args, {
         timeout: 10 * 60 * 1000,
@@ -1886,6 +2025,7 @@ async function removeRenderedClipArtifacts(token, entry = null) {
     if (normalized?.filePath) {
         await fs.rm(normalized.filePath, { force: true }).catch(() => {});
     }
+    await cleanupSpeechCleanupArtifactsForToken(token);
 
     const metadataPath = getRenderedClipMetadataPath(token);
     await fs.rm(metadataPath, { force: true }).catch(() => {});
@@ -3420,6 +3560,55 @@ exports.alignTranscriptSelection = onCall(
     }
 );
 
+exports.prepareSpeechCleanupProxy = onCall(
+    { cors: true, timeoutSeconds: 540, memory: "2GiB" },
+    async (request) => {
+        try {
+            await cleanupExpiredRenderedClips();
+            const token = extractRenderedClipToken(request?.data?.token);
+            if (!token) {
+                throw new HttpsError("invalid-argument", "A valid rendered clip token is required.");
+            }
+
+            const sourceEntry = await loadRenderedClipEntry(token);
+            if (!sourceEntry) {
+                throw new HttpsError("not-found", "Source clip not found or expired. Re-render the source clip first.");
+            }
+
+            const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "speech-cleanup-preview-"));
+            try {
+                const previewPath = await renderSpeechCleanupPreviewProxy({
+                    sourcePath: sourceEntry.filePath,
+                    sourceToken: token,
+                    speechCleanupPreset: request?.data?.speechCleanupPreset,
+                    tempDir,
+                });
+                const storedPreview = await storeRenderedClipFile({
+                    sourcePath: previewPath,
+                    clipTitle: `${path.basename(sourceEntry.fileName, path.extname(sourceEntry.fileName))}-speech-cleanup`,
+                    index: 0,
+                });
+                return {
+                    success: true,
+                    engine: buildSpeechCleanupAudioFilter({
+                        preset: request?.data?.speechCleanupPreset,
+                        modelPath: SPEECH_CLEANUP_MODEL_PATH,
+                    }).engine,
+                    fileName: storedPreview.fileName,
+                    downloadUrl: buildDownloadUrlForRequest(request, storedPreview.token),
+                    expiresAt: new Date(storedPreview.expiresAt).toISOString(),
+                };
+            } finally {
+                await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+            }
+        } catch (error) {
+            console.error("Error preparing Speech Cleanup preview:", error);
+            if (error instanceof HttpsError) throw error;
+            throw new HttpsError("internal", "Unable to prepare Speech Cleanup preview.", error.message);
+        }
+    }
+);
+
 exports.renderTimelineEdits = onCall(
     { cors: true, timeoutSeconds: 540, memory: "2GiB" },
     async (request) => {
@@ -3459,10 +3648,13 @@ exports.renderTimelineEdits = onCall(
 
                         const rendered = await renderEditedClipSegment({
                             sourcePath: sourceEntry.filePath,
+                            sourceToken: token,
                             trimStartSeconds: Number(item?.trimStartSeconds) || 0,
                             trimEndSeconds: item?.trimEndSeconds,
                             effectsPreset: item?.effectsPreset,
                             effectsIntensity: item?.effectsIntensity,
+                            speechCleanupEnabled: item?.speechCleanupEnabled === true,
+                            speechCleanupPreset: item?.speechCleanupPreset,
                             captionCues: item?.captionEnabled === false ? [] : item?.captionCues,
                             captionStylePreset: item?.captionStylePreset,
                             tempDir,

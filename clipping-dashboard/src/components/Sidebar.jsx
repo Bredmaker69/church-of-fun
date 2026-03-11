@@ -38,7 +38,7 @@ const Sidebar = ({
     return (
         <aside
             style={style}
-            className={`flex flex-col w-full border-r border-slate-200 dark:border-slate-800 p-4 gap-6 bg-background-light dark:bg-background-dark/50 backdrop-blur-xl h-screen overflow-y-auto ${className}`}
+            className={`flex flex-col w-full border-r border-slate-200 dark:border-slate-800 p-4 gap-6 bg-background-light dark:bg-background-dark/50 backdrop-blur-xl lg:sticky lg:top-0 lg:h-screen overflow-y-auto ${className}`}
         >
             {ingestPanel ? (
                 <div className="sticky top-0 z-10 pt-1 bg-background-light dark:bg-background-dark/95 backdrop-blur-sm pb-2">
@@ -91,11 +91,10 @@ const Sidebar = ({
                 <button
                     type="button"
                     onClick={() => onWorkspaceChange?.('studio')}
-                    className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-left transition-colors ${
-                        currentWorkspace === 'studio'
-                            ? 'bg-primary/10 text-primary neon-border'
-                            : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50'
-                    }`}
+                    className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-left transition-colors ${currentWorkspace === 'studio'
+                        ? 'bg-primary/10 text-primary neon-border'
+                        : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50'
+                        }`}
                 >
                     <span className="material-symbols-outlined text-[20px]">dashboard</span>
                     Clip Studio
@@ -103,16 +102,18 @@ const Sidebar = ({
                 <button
                     type="button"
                     onClick={() => onWorkspaceChange?.('vault')}
-                    className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-left transition-colors ${
-                        currentWorkspace === 'vault'
-                            ? 'bg-primary/10 text-primary neon-border'
-                            : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50'
-                    }`}
+                    className={`flex items-center gap-3 px-4 py-3 rounded-xl font-medium text-left transition-colors ${currentWorkspace === 'vault'
+                        ? 'bg-primary/10 text-primary neon-border'
+                        : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/50'
+                        }`}
                 >
                     <span className="material-symbols-outlined text-[20px]">inventory_2</span>
                     Clip Vault
                 </button>
             </nav>
+
+            <div id="vault-sidebar-portal-target" className="flex flex-col gap-4" />
+            <div id="vault-sidebar-portal-bottom-target" className="flex flex-col gap-4" />
         </aside>
     );
 };

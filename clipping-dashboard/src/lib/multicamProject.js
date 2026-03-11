@@ -292,104 +292,89 @@ export const estimateScratchAudioSync = ({
   };
 };
 
-export const buildFirstPassMulticamTimeline = ({
-  waveformA,
-  waveformB,
+export const getMulticamCameraIdForShotId = (shotIdRaw) => {
+  const shotId = String(shotIdRaw || '').trim().toUpperCase();
+  return shotId.endsWith('B') ? 'camera2' : 'camera1';
+};
+
+export const createDefaultMulticamShotPresets = () => ([
+  {
+    id: '1A',
+    cameraId: 'camera1',
+    label: 'Full A',
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    enabled: true,
+    locked: true,
+  },
+  {
+    id: '2A',
+    cameraId: 'camera1',
+    label: 'Left A',
+    zoom: 1.85,
+    panX: -22,
+    panY: 0,
+    enabled: true,
+    locked: true,
+  },
+  {
+    id: '3A',
+    cameraId: 'camera1',
+    label: 'Right A',
+    zoom: 1.85,
+    panX: 22,
+    panY: 0,
+    enabled: true,
+    locked: true,
+  },
+  {
+    id: '1B',
+    cameraId: 'camera2',
+    label: 'Full B',
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    enabled: true,
+    locked: true,
+  },
+  {
+    id: '2B',
+    cameraId: 'camera2',
+    label: 'Left B',
+    zoom: 1.85,
+    panX: -22,
+    panY: 0,
+    enabled: true,
+    locked: true,
+  },
+  {
+    id: '3B',
+    cameraId: 'camera2',
+    label: 'Right B',
+    zoom: 1.85,
+    panX: 22,
+    panY: 0,
+    enabled: true,
+    locked: true,
+  },
+]);
+
+export const buildManualMulticamTimeline = ({
   durationSeconds,
-  minShotDurationSeconds = 6,
-  preferInitialCameraId = 'camera1',
+  initialShotId = '1A',
 }) => {
-  const binsA = Array.isArray(waveformA?.bins) ? waveformA.bins : [];
-  const binsB = Array.isArray(waveformB?.bins) ? waveformB.bins : [];
-  const binDurationSeconds = Math.max(
-    Number(waveformA?.binDurationSeconds || 0),
-    Number(waveformB?.binDurationSeconds || 0),
-    0.1
-  );
   const totalDuration = Number(durationSeconds || 0);
-
-  if (binsA.length === 0 || binsB.length === 0 || !Number.isFinite(totalDuration) || totalDuration <= 0) {
-    return [{
-      id: 'segment-1',
-      cameraId: preferInitialCameraId,
-      startSeconds: 0,
-      endSeconds: Number(Math.max(1, totalDuration || 60).toFixed(3)),
-      confidence: 0,
-      silenceCandidate: false,
-      autoDecision: 'fallback-hold',
-    }];
-  }
-
-  const maxBinCount = Math.min(binsA.length, binsB.length, Math.max(1, Math.floor(totalDuration / binDurationSeconds)));
-  const switchThreshold = 0.03;
-  const strongSwitchThreshold = 0.08;
-  const silenceThreshold = 0.018;
-  const minBinsPerShot = Math.max(2, Math.round(minShotDurationSeconds / binDurationSeconds));
-
-  let currentCameraId = preferInitialCameraId;
-  let segmentStartBin = 0;
-  const segments = [];
-
-  const commitSegment = (endBinExclusive, forceCameraId = currentCameraId, autoDecision = 'hold') => {
-    const startSeconds = segmentStartBin * binDurationSeconds;
-    const endSeconds = Math.min(totalDuration, endBinExclusive * binDurationSeconds);
-    if (endSeconds - startSeconds <= 0.05) return;
-
-    const sliceStart = segmentStartBin;
-    const sliceEnd = Math.max(sliceStart + 1, endBinExclusive);
-    let confidenceAccumulator = 0;
-    let silenceBins = 0;
-    for (let binIndex = sliceStart; binIndex < sliceEnd; binIndex += 1) {
-      const a = Number(binsA[binIndex] || 0);
-      const b = Number(binsB[binIndex] || 0);
-      confidenceAccumulator += Math.abs(a - b);
-      if (Math.max(a, b) < silenceThreshold) silenceBins += 1;
-    }
-
-    segments.push({
-      id: `segment-${segments.length + 1}`,
-      cameraId: forceCameraId,
-      startSeconds: Number(startSeconds.toFixed(3)),
-      endSeconds: Number(endSeconds.toFixed(3)),
-      confidence: Number(clamp((confidenceAccumulator / Math.max(1, sliceEnd - sliceStart)) * 8, 0, 1).toFixed(3)),
-      silenceCandidate: silenceBins >= Math.max(2, Math.floor((sliceEnd - sliceStart) * 0.6)),
-      autoDecision,
-    });
-    segmentStartBin = endBinExclusive;
-  };
-
-  for (let binIndex = 0; binIndex < maxBinCount; binIndex += 1) {
-    const a = Number(binsA[binIndex] || 0);
-    const b = Number(binsB[binIndex] || 0);
-    const delta = a - b;
-    const dominantCameraId = Math.abs(delta) < switchThreshold
-      ? currentCameraId
-      : (delta >= 0 ? 'camera1' : 'camera2');
-
-    const segmentBinLength = binIndex - segmentStartBin + 1;
-    const canSwitch = segmentBinLength >= minBinsPerShot;
-    const shouldSwitch = (
-      dominantCameraId !== currentCameraId
-      && canSwitch
-      && Math.abs(delta) >= strongSwitchThreshold
-    );
-
-    if (shouldSwitch) {
-      commitSegment(binIndex, currentCameraId, 'speaker-energy');
-      currentCameraId = dominantCameraId;
-    }
-  }
-
-  commitSegment(maxBinCount, currentCameraId, 'finalize');
-
-  return segments.reduce((merged, segment) => {
-    const previous = merged[merged.length - 1];
-    if (previous && previous.cameraId === segment.cameraId && !previous.silenceCandidate && !segment.silenceCandidate) {
-      previous.endSeconds = segment.endSeconds;
-      previous.confidence = Number(clamp((previous.confidence + segment.confidence) / 2, 0, 1).toFixed(3));
-      return merged;
-    }
-    merged.push(segment);
-    return merged;
-  }, []);
+  const safeDuration = Number(Math.max(1, totalDuration || 60).toFixed(3));
+  const shotId = String(initialShotId || '1A').trim().toUpperCase() || '1A';
+  return [{
+    id: 'segment-1',
+    cameraId: getMulticamCameraIdForShotId(shotId),
+    shotId,
+    startSeconds: 0,
+    endSeconds: safeDuration,
+    confidence: 1,
+    isManual: true,
+    manualShotId: shotId,
+  }];
 };

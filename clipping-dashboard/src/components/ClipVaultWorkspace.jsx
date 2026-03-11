@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { httpsCallable } from 'firebase/functions';
 import { functions } from '../firebase';
 import {
@@ -6,6 +7,16 @@ import {
   normalizeCaptionEditorText,
   normalizeCaptionEditorCues,
 } from '../lib/captionEditor';
+import { createDefaultMulticamShotPresets, getMulticamCameraIdForShotId } from '../lib/multicamProject';
+import {
+  DEFAULT_SPEECH_CLEANUP_PRESET,
+  SPEECH_CLEANUP_PRESET_OPTIONS,
+  createDefaultDialogueTrackDefaults,
+  normalizeDialogueTrackDefaults,
+  normalizeSpeechCleanupMode,
+  normalizeSpeechCleanupPreset,
+  resolveEffectiveSpeechCleanup,
+} from '../lib/speechCleanup';
 
 const DND_PAYLOAD_KEY = 'application/x-clip-vault';
 const MEDIA_BIN_MIN_WIDTH = 240;
@@ -20,6 +31,15 @@ const TIMELINE_MIN_PX_PER_SECOND = 8;
 const TIMELINE_MAX_PX_PER_SECOND = 260;
 const TIMELINE_ROW_HEIGHT_PX = 94;
 const TIMELINE_RULER_HEIGHT_PX = 28;
+const PROGRAM_PREVIEW_DEFAULT_RECT = {
+  x: 96,
+  y: 96,
+  width: 720,
+  height: 405,
+};
+const PROGRAM_RENDER_WIDTH = 1280;
+const PROGRAM_RENDER_HEIGHT = 720;
+const PROGRAM_RENDER_FPS = 30;
 const CAPTION_STYLE_OPTIONS = [
   { value: 'reel-bold', label: 'Reel Bold' },
   { value: 'pop-punch', label: 'Pop Punch' },
@@ -156,6 +176,17 @@ const parseDragPayload = (event) => {
   } catch {
     return null;
   }
+};
+
+const sanitizeFileNamePart = (value, fallback = 'item') => {
+  const normalized = String(value || '')
+    .normalize('NFKD')
+    .replace(/[^\w\s.-]+/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .trim();
+  return normalized || fallback;
 };
 
 const getClipDurationSeconds = (clip) => {
@@ -376,11 +407,84 @@ const getProjectAssetOffsetSeconds = (project, assetId) => {
   return Number(project.syncMap.cameraOffsets[String(assetId || '')] || 0);
 };
 
+const getMulticamSegmentShotId = (segment) => {
+  return String(segment?.manualShotId || segment?.shotId || '').trim().toUpperCase() || '1A';
+};
+
 const getMulticamActiveCameraId = (segment) => {
-  return String(segment?.manualCameraId || segment?.cameraId || 'camera1');
+  return String(segment?.manualCameraId || segment?.cameraId || getMulticamCameraIdForShotId(getMulticamSegmentShotId(segment)) || 'camera1');
+};
+
+const getShotPanLimit = (zoomRaw) => {
+  const zoom = clamp(Number(zoomRaw || 1), 1, 3);
+  return clamp((zoom - 1) * 90, 0, 120);
+};
+
+const getShotTransformStyle = (preset) => {
+  const zoom = clamp(Number(preset?.zoom || 1), 1, 3);
+  const panLimit = getShotPanLimit(zoom);
+  const panX = clamp(Number(preset?.panX || 0), -panLimit, panLimit);
+  const panY = clamp(Number(preset?.panY || 0), -panLimit, panLimit);
+  return {
+    transform: `translate(${panX}%, ${panY}%) scale(${zoom})`,
+    transformOrigin: 'center center',
+  };
+};
+
+const drawProgramShotFrame = ({ canvas, video, preset }) => {
+  const context = canvas?.getContext?.('2d');
+  if (!canvas || !context) return;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.fillStyle = '#020617';
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  if (!video) return;
+
+  const sourceWidth = Number(video?.videoWidth || 0);
+  const sourceHeight = Number(video?.videoHeight || 0);
+  const outputWidth = Math.max(1, Number(canvas.width || 0));
+  const outputHeight = Math.max(1, Number(canvas.height || 0));
+  if (!sourceWidth || !sourceHeight || !outputWidth || !outputHeight) return;
+
+  const containScale = Math.min(outputWidth / sourceWidth, outputHeight / sourceHeight);
+  const baseWidth = sourceWidth * containScale;
+  const baseHeight = sourceHeight * containScale;
+  const zoom = clamp(Number(preset?.zoom || 1), 1, 3);
+  const panLimit = getShotPanLimit(zoom);
+  const panX = clamp(Number(preset?.panX || 0), -panLimit, panLimit);
+  const panY = clamp(Number(preset?.panY || 0), -panLimit, panLimit);
+  const panPixelsX = (panX / 100) * baseWidth;
+  const panPixelsY = (panY / 100) * baseHeight;
+
+  context.save();
+  context.translate((outputWidth / 2) + panPixelsX, (outputHeight / 2) + panPixelsY);
+  context.scale(zoom, zoom);
+  context.drawImage(
+    video,
+    -baseWidth / 2,
+    -baseHeight / 2,
+    baseWidth,
+    baseHeight,
+  );
+  context.restore();
+};
+
+const getSupportedProgramRecorderMimeType = () => {
+  if (typeof window === 'undefined' || typeof window.MediaRecorder === 'undefined') return '';
+  const candidates = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ];
+  return candidates.find((candidate) => window.MediaRecorder.isTypeSupported(candidate)) || '';
 };
 
 const clampPan = (value) => clamp(Number(value), -1, 1);
+
+const buildSpeechCleanupPreviewKey = ({ token, preset }) => {
+  const normalizedToken = String(token || '').trim();
+  if (!normalizedToken) return '';
+  return `${normalizedToken}|${normalizeSpeechCleanupPreset(preset)}`;
+};
 
 const extractRenderedClipToken = (value) => {
   const text = String(value || '').trim();
@@ -394,6 +498,40 @@ const extractRenderedClipToken = (value) => {
   }
 
   return /^[0-9a-fA-F-]{36}$/.test(text) ? text : '';
+};
+
+const formatShotPresetLabel = (shotId) => {
+  const normalized = String(shotId || '').trim().toUpperCase();
+  const match = normalized.match(/^(\d+)([A-Z])$/);
+  if (!match) return normalized || '--';
+  return `${match[2]}${match[1]}`;
+};
+
+const InlineHelpTooltip = ({ label = 'Help', text = '', align = 'center' }) => {
+  const alignmentClassName = align === 'left'
+    ? 'left-0 translate-x-0'
+    : align === 'right'
+      ? 'right-0 translate-x-0'
+      : 'left-1/2 -translate-x-1/2';
+
+  return (
+    <span className="relative inline-flex items-center group">
+      <button
+        type="button"
+        tabIndex={0}
+        aria-label={label}
+        className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-slate-300/80 dark:border-slate-600/80 bg-white/85 dark:bg-slate-900/85 text-[11px] font-bold text-slate-600 dark:text-slate-300 transition-colors hover:border-primary/70 hover:text-primary focus:outline-none focus:ring-2 focus:ring-primary/40"
+      >
+        ?
+      </button>
+      <span
+        role="tooltip"
+        className={`pointer-events-none absolute z-30 ${alignmentClassName} top-full mt-2 hidden w-64 rounded-lg border border-slate-300/80 dark:border-slate-700/80 bg-white/95 dark:bg-slate-950/95 px-3 py-2 text-[11px] font-medium leading-relaxed text-slate-700 dark:text-slate-200 shadow-xl shadow-black/15 group-hover:block group-focus-within:block`}
+      >
+        {text}
+      </span>
+    </span>
+  );
 };
 
 const ClipVaultWorkspace = ({
@@ -419,6 +557,14 @@ const ClipVaultWorkspace = ({
   const multicamAudioRefs = useRef({});
   const multicamAudioContextRef = useRef(null);
   const multicamAudioNodesRef = useRef({});
+  const multicamProgramSecondsRef = useRef(0);
+  const programPreviewCanvasRef = useRef(null);
+  const programPreviewAnimationRef = useRef(null);
+  const programPreviewWindowDragRef = useRef(null);
+  const programPreviewWindowResizeRef = useRef(null);
+  const directorShotDragRef = useRef(null);
+  const directorSuiteSurfaceRef = useRef(null);
+  const directorPaneRefs = useRef({});
   const timelineTrackRef = useRef(null);
   const timelineScrollerRef = useRef(null);
   const paneResizeStateRef = useRef(null);
@@ -427,6 +573,13 @@ const ClipVaultWorkspace = ({
   const timelineAutoPlayRef = useRef(false);
   const timelineAdvanceThrottleRef = useRef(0);
   const selectedPreviewAutoPlayRef = useRef(false);
+
+  const [sidebarPortalNode, setSidebarPortalNode] = useState(null);
+  const [sidebarBottomPortalNode, setSidebarBottomPortalNode] = useState(null);
+  useEffect(() => {
+    setSidebarPortalNode(document.getElementById('vault-sidebar-portal-target'));
+    setSidebarBottomPortalNode(document.getElementById('vault-sidebar-portal-bottom-target'));
+  }, []);
 
   const [newProjectName, setNewProjectName] = useState('');
   const [projectNameDraft, setProjectNameDraft] = useState('');
@@ -446,11 +599,22 @@ const ClipVaultWorkspace = ({
   const [timelinePlayheadSeconds, setTimelinePlayheadSeconds] = useState(0);
   const [clipTranscriptDraft, setClipTranscriptDraft] = useState('');
   const [isClipToolsOpen, setIsClipToolsOpen] = useState(false);
+  const [speechCleanupPreviewByKey, setSpeechCleanupPreviewByKey] = useState({});
   const [selectedMulticamSegmentId, setSelectedMulticamSegmentId] = useState('');
+  const [selectedDirectorShotId, setSelectedDirectorShotId] = useState('1A');
+  const [isDirectorShotSetupActive, setIsDirectorShotSetupActive] = useState(false);
   const [isMulticamPlaying, setIsMulticamPlaying] = useState(false);
+  const [isProgramPreviewOpen, setIsProgramPreviewOpen] = useState(false);
+  const [programPreviewRect, setProgramPreviewRect] = useState(PROGRAM_PREVIEW_DEFAULT_RECT);
+  const [isRenderingMulticamProgram, setIsRenderingMulticamProgram] = useState(false);
+  const [renderedProgramDownload, setRenderedProgramDownload] = useState(null);
 
   const renderTimelineEdits = useMemo(
     () => httpsCallable(functions, 'renderTimelineEdits'),
+    []
+  );
+  const prepareSpeechCleanupProxy = useMemo(
+    () => httpsCallable(functions, 'prepareSpeechCleanupProxy'),
     []
   );
 
@@ -462,6 +626,10 @@ const ClipVaultWorkspace = ({
     return montageProjects.find((project) => project.id === selectedProjectId) || null;
   }, [montageProjects, selectedProjectId]);
   const isMulticamProject = selectedProject?.workflowType === 'multicam';
+  const dialogueTrackDefaults = useMemo(
+    () => normalizeDialogueTrackDefaults(selectedProject?.dialogueTrackDefaults || createDefaultDialogueTrackDefaults()),
+    [selectedProject?.dialogueTrackDefaults]
+  );
 
   const multicamAssets = useMemo(() => {
     if (!isMulticamProject || !Array.isArray(selectedProject?.mediaAssets)) return [];
@@ -472,15 +640,36 @@ const ClipVaultWorkspace = ({
     }));
   }, [clipsById, isMulticamProject, selectedProject?.mediaAssets]);
 
+  const multicamShotPresets = useMemo(() => {
+    if (!isMulticamProject) return [];
+    const presets = Array.isArray(selectedProject?.multicamShotPresets) && selectedProject.multicamShotPresets.length > 0
+      ? selectedProject.multicamShotPresets
+      : createDefaultMulticamShotPresets();
+    return presets.map((preset, index) => ({
+      zoom: clamp(Number(preset?.zoom || 1), 1, 3),
+      panLimit: getShotPanLimit(Number(preset?.zoom || 1)),
+      id: String(preset?.id || `preset-${index + 1}`),
+      cameraId: String(preset?.cameraId || getMulticamCameraIdForShotId(preset?.id || '1A')),
+      label: String(preset?.label || `Shot ${index + 1}`),
+      panX: clamp(Number(preset?.panX || 0), -getShotPanLimit(Number(preset?.zoom || 1)), getShotPanLimit(Number(preset?.zoom || 1))),
+      panY: clamp(Number(preset?.panY || 0), -getShotPanLimit(Number(preset?.zoom || 1)), getShotPanLimit(Number(preset?.zoom || 1))),
+      enabled: preset?.enabled !== false,
+      locked: preset?.locked !== false,
+    }));
+  }, [isMulticamProject, selectedProject?.multicamShotPresets]);
+
   const multicamSegments = useMemo(() => {
     if (!isMulticamProject || !Array.isArray(selectedProject?.multicamTimelineSegments)) return [];
     return [...selectedProject.multicamTimelineSegments]
       .map((segment, index) => ({
         ...segment,
         id: String(segment?.id || `segment-${index + 1}`),
-        cameraId: String(segment?.cameraId || 'camera1'),
+        shotId: getMulticamSegmentShotId(segment),
+        cameraId: String(segment?.cameraId || getMulticamCameraIdForShotId(getMulticamSegmentShotId(segment))),
         manualCameraId: String(segment?.manualCameraId || ''),
+        manualShotId: String(segment?.manualShotId || ''),
         isLocked: Boolean(segment?.isLocked),
+        isManual: segment?.isManual !== false,
       }))
       .sort((left, right) => Number(left.startSeconds || 0) - Number(right.startSeconds || 0));
   }, [isMulticamProject, selectedProject?.multicamTimelineSegments]);
@@ -495,6 +684,26 @@ const ClipVaultWorkspace = ({
     if (!effectiveSelectedMulticamSegmentId) return null;
     return multicamSegments.find((segment) => segment.id === effectiveSelectedMulticamSegmentId) || null;
   }, [effectiveSelectedMulticamSegmentId, multicamSegments]);
+
+  const selectedMulticamSegmentShotId = useMemo(() => (
+    selectedMulticamSegment ? getMulticamSegmentShotId(selectedMulticamSegment) : ''
+  ), [selectedMulticamSegment]);
+  const hasSelectedMulticamSegment = Boolean(selectedMulticamSegment?.id);
+
+  useEffect(() => {
+    if (!isMulticamProject) return;
+    if (hasSelectedMulticamSegment) {
+      setSelectedDirectorShotId(selectedMulticamSegmentShotId || '1A');
+      setIsDirectorShotSetupActive(false);
+      return;
+    }
+    setSelectedDirectorShotId('1A');
+    setIsDirectorShotSetupActive(false);
+  }, [
+    hasSelectedMulticamSegment,
+    isMulticamProject,
+    selectedMulticamSegmentShotId,
+  ]);
 
   const multicamDurationSeconds = useMemo(() => {
     if (multicamSegments.length === 0) return 0;
@@ -512,10 +721,82 @@ const ClipVaultWorkspace = ({
     return byPlayhead || selectedMulticamSegment || multicamSegments[0];
   }, [multicamSegments, selectedMulticamSegment, timelinePlayheadSeconds]);
 
+  const selectedDirectorShotPreset = useMemo(() => {
+    return multicamShotPresets.find((preset) => preset.id === selectedDirectorShotId) || multicamShotPresets[0] || null;
+  }, [multicamShotPresets, selectedDirectorShotId]);
+
+  const unlockedDirectorShotPreset = useMemo(() => (
+    multicamShotPresets.find((preset) => preset.locked === false) || null
+  ), [multicamShotPresets]);
+
+  const getMulticamShotPresetById = useCallback((shotId) => {
+    return multicamShotPresets.find((preset) => preset.id === String(shotId || '').trim().toUpperCase()) || null;
+  }, [multicamShotPresets]);
+
+  const multicamPreviewPresets = useMemo(() => {
+    const activeShotId = getMulticamSegmentShotId(multicamPreviewSegment);
+    const activePreset = getMulticamShotPresetById(activeShotId);
+    const defaultA = getMulticamShotPresetById('1A') || multicamShotPresets.find((preset) => preset.cameraId === 'camera1') || null;
+    const defaultB = getMulticamShotPresetById('1B') || multicamShotPresets.find((preset) => preset.cameraId === 'camera2') || null;
+    const editingPreset = selectedDirectorShotPreset;
+    return {
+      camera1: editingPreset?.cameraId === 'camera1'
+        ? editingPreset
+        : (activePreset?.cameraId === 'camera1' ? activePreset : defaultA),
+      camera2: editingPreset?.cameraId === 'camera2'
+        ? editingPreset
+        : (activePreset?.cameraId === 'camera2' ? activePreset : defaultB),
+    };
+  }, [getMulticamShotPresetById, multicamPreviewSegment, multicamShotPresets, selectedDirectorShotPreset]);
+
   const multicamPreviewUrls = useMemo(() => ({
     camera1: String(multicamAssets.find((asset) => String(asset.id || '') === 'camera1')?.playbackUrl || '').trim(),
     camera2: String(multicamAssets.find((asset) => String(asset.id || '') === 'camera2')?.playbackUrl || '').trim(),
   }), [multicamAssets]);
+
+  const getMulticamSegmentForSeconds = useCallback((programSecondsRaw) => {
+    const programSeconds = Number(programSecondsRaw || 0);
+    if (!multicamSegments.length) return null;
+    return multicamSegments.find((segment) => (
+      programSeconds >= Number(segment.startSeconds || 0)
+      && programSeconds < Number(segment.endSeconds || 0)
+    )) || multicamSegments[multicamSegments.length - 1] || multicamSegments[0] || null;
+  }, [multicamSegments]);
+
+  const drawProgramPreviewFrame = useCallback((programSecondsRaw = timelinePlayheadSeconds) => {
+    const canvas = programPreviewCanvasRef.current;
+    if (!canvas) return;
+    const pixelRatio = typeof window !== 'undefined' ? Math.max(1, window.devicePixelRatio || 1) : 1;
+    const displayWidth = Math.max(320, Math.floor(programPreviewRect.width));
+    const displayHeight = Math.max(180, Math.floor(programPreviewRect.height - 34));
+    const desiredWidth = Math.floor(displayWidth * pixelRatio);
+    const desiredHeight = Math.floor(displayHeight * pixelRatio);
+    if (canvas.width !== desiredWidth || canvas.height !== desiredHeight) {
+      canvas.width = desiredWidth;
+      canvas.height = desiredHeight;
+      canvas.style.width = `${displayWidth}px`;
+      canvas.style.height = `${displayHeight}px`;
+    }
+
+    const activeSegment = getMulticamSegmentForSeconds(programSecondsRaw);
+    const activeShotId = getMulticamSegmentShotId(activeSegment);
+    const activePreset = getMulticamShotPresetById(activeShotId) || selectedDirectorShotPreset || multicamShotPresets[0] || null;
+    const activeCameraId = activePreset?.cameraId || getMulticamCameraIdForShotId(activeShotId);
+    const activeVideo = multicamPreviewRefs.current[activeCameraId];
+    drawProgramShotFrame({
+      canvas,
+      video: activeVideo,
+      preset: activePreset,
+    });
+  }, [
+    getMulticamSegmentForSeconds,
+    getMulticamShotPresetById,
+    multicamShotPresets,
+    programPreviewRect.height,
+    programPreviewRect.width,
+    selectedDirectorShotPreset,
+    timelinePlayheadSeconds,
+  ]);
   const multicamAudioMixMode = String(selectedProject?.audioMixMode || 'single_master');
   const multicamAudioMixSettings = useMemo(() => ({
     camera1Volume: Number(selectedProject?.audioMixSettings?.camera1Volume || 100),
@@ -694,6 +975,15 @@ const ClipVaultWorkspace = ({
     });
 
     applyMulticamSegments(nextSegments, 'Inserted a new multicam cut at the playhead.');
+    const nextSelectedSegment = nextSegments.find((segment) => (
+      Number(segment.startSeconds || 0) >= Number(splitSeconds.toFixed(3)) - 0.0005
+      && segment.id.includes('-b-')
+    )) || nextSegments.find((segment) => Number(segment.startSeconds || 0) >= Number(splitSeconds.toFixed(3)) - 0.0005)
+      || null;
+    if (nextSelectedSegment?.id) {
+      setSelectedMulticamSegmentId(nextSelectedSegment.id);
+      setSelectedDirectorShotId(getMulticamSegmentShotId(nextSelectedSegment));
+    }
   }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment, timelinePlayheadSeconds]);
 
   const joinSelectedMulticamSegment = useCallback(() => {
@@ -709,6 +999,7 @@ const ClipVaultWorkspace = ({
       id: `${selectedMulticamSegment.id}-join-${Date.now()}`,
       endSeconds: Number(nextSegment.endSeconds || selectedMulticamSegment.endSeconds || 0),
       manualCameraId: String(selectedMulticamSegment.manualCameraId || selectedMulticamSegment.cameraId || 'camera1'),
+      manualShotId: String(selectedMulticamSegment.manualShotId || selectedMulticamSegment.shotId || '1A'),
       isLocked: Boolean(selectedMulticamSegment.isLocked || nextSegment.isLocked),
     };
     const nextSegments = [
@@ -720,18 +1011,22 @@ const ClipVaultWorkspace = ({
     setSelectedMulticamSegmentId(mergedSegment.id);
   }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment]);
 
-  const setSelectedMulticamCamera = useCallback((cameraId) => {
+  const setSelectedMulticamShot = useCallback((shotId) => {
     if (!selectedMulticamSegment) return;
-    const normalizedCameraId = String(cameraId || '').trim() || 'camera1';
+    const normalizedShotId = String(shotId || '').trim().toUpperCase() || '1A';
+    const normalizedCameraId = getMulticamCameraIdForShotId(normalizedShotId);
     const nextSegments = multicamSegments.map((segment) => {
       if (segment.id !== selectedMulticamSegment.id) return segment;
       return {
         ...segment,
+        shotId: normalizedShotId,
+        cameraId: normalizedCameraId,
         manualCameraId: normalizedCameraId,
+        manualShotId: normalizedShotId,
         isLocked: true,
       };
     });
-    applyMulticamSegments(nextSegments, `Locked ${normalizedCameraId === 'camera2' ? 'Camera 2' : 'Camera 1'} on the selected segment.`);
+    applyMulticamSegments(nextSegments, `Locked ${normalizedShotId} on the selected segment.`);
   }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment]);
 
   const clearSelectedMulticamOverride = useCallback(() => {
@@ -741,11 +1036,125 @@ const ClipVaultWorkspace = ({
       return {
         ...segment,
         manualCameraId: '',
+        manualShotId: '',
         isLocked: false,
       };
     });
     applyMulticamSegments(nextSegments, 'Removed manual override from the selected segment.');
   }, [applyMulticamSegments, multicamSegments, selectedMulticamSegment]);
+
+  const updateMulticamShotPreset = useCallback((shotId, patch = {}) => {
+    if (!selectedProject) return;
+    const normalizedShotId = String(shotId || '').trim().toUpperCase();
+    if (!normalizedShotId) return;
+    const nextPresets = multicamShotPresets.map((preset) => {
+      if (preset.id !== normalizedShotId) return preset;
+      return {
+        ...preset,
+        ...patch,
+        id: preset.id,
+        cameraId: preset.cameraId,
+      };
+    });
+    onUpdateProject?.(selectedProject.id, {
+      multicamShotPresets: nextPresets,
+      updatedAt: new Date().toISOString(),
+    });
+  }, [multicamShotPresets, onUpdateProject, selectedProject]);
+
+  const armDirectorShotSetup = useCallback(() => {
+    if (!selectedProject || !selectedDirectorShotPreset) return;
+    const nextPresets = multicamShotPresets.map((preset) => (
+      preset.id === selectedDirectorShotPreset.id
+        ? { ...preset, locked: false }
+        : { ...preset, locked: true }
+    ));
+    onUpdateProject?.(selectedProject.id, {
+      multicamShotPresets: nextPresets,
+      updatedAt: new Date().toISOString(),
+    });
+    setSelectedDirectorShotId(selectedDirectorShotPreset.id);
+    setIsDirectorShotSetupActive(true);
+  }, [multicamShotPresets, onUpdateProject, selectedDirectorShotPreset, selectedProject]);
+
+  const lockDirectorShotSetup = useCallback(() => {
+    if (!selectedProject || !selectedDirectorShotPreset) return;
+    const nextPresets = multicamShotPresets.map((preset) => (
+      preset.id === selectedDirectorShotPreset.id
+        ? { ...preset, locked: true }
+        : preset
+    ));
+    onUpdateProject?.(selectedProject.id, {
+      multicamShotPresets: nextPresets,
+      updatedAt: new Date().toISOString(),
+    });
+    setIsDirectorShotSetupActive(false);
+  }, [multicamShotPresets, onUpdateProject, selectedDirectorShotPreset, selectedProject]);
+
+  const handleSelectDirectorShotPreset = useCallback((shotId) => {
+    const normalizedShotId = String(shotId || '').trim().toUpperCase();
+    if (!normalizedShotId) return;
+    if (isDirectorShotSetupActive && unlockedDirectorShotPreset?.id && unlockedDirectorShotPreset.id !== normalizedShotId) {
+      setLocalStatus(`Lock ${unlockedDirectorShotPreset.id} before selecting another shot preset.`);
+      return;
+    }
+    setSelectedDirectorShotId(normalizedShotId);
+    if (!isDirectorShotSetupActive) {
+      setIsDirectorShotSetupActive(false);
+    }
+  }, [isDirectorShotSetupActive, unlockedDirectorShotPreset]);
+
+  const handleDirectorShotPointerDown = useCallback((event, cameraId) => {
+    if (!isDirectorShotSetupActive || !selectedDirectorShotPreset || selectedDirectorShotPreset.locked) return;
+    if (selectedDirectorShotPreset.cameraId !== cameraId) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    directorShotDragRef.current = {
+      pointerId: event.pointerId,
+      shotId: selectedDirectorShotPreset.id,
+      startX: event.clientX,
+      startY: event.clientY,
+      startPanX: Number(selectedDirectorShotPreset.panX || 0),
+      startPanY: Number(selectedDirectorShotPreset.panY || 0),
+    };
+    document.body.style.cursor = 'grabbing';
+    document.body.style.userSelect = 'none';
+  }, [isDirectorShotSetupActive, selectedDirectorShotPreset]);
+
+  const handleDirectorShotWheel = useCallback((event, cameraId) => {
+    if (!isDirectorShotSetupActive || !selectedDirectorShotPreset || selectedDirectorShotPreset.locked) return;
+    if (selectedDirectorShotPreset.cameraId !== cameraId) return;
+    event.preventDefault();
+    event.stopPropagation?.();
+
+    const deltaX = Number(event.deltaX || 0);
+    const deltaY = Number(event.deltaY || 0);
+    const dominantHorizontal = Math.abs(deltaX) > Math.abs(deltaY);
+
+    if (event.ctrlKey || !dominantHorizontal) {
+      const nextZoom = clamp(
+        Number(selectedDirectorShotPreset.zoom || 1) - (deltaY * 0.0015),
+        1,
+        3,
+      );
+      const nextPanLimit = getShotPanLimit(nextZoom);
+      updateMulticamShotPreset(selectedDirectorShotPreset.id, {
+        zoom: Number(nextZoom.toFixed(3)),
+        panX: Number(clamp(Number(selectedDirectorShotPreset.panX || 0), -nextPanLimit, nextPanLimit).toFixed(2)),
+        panY: Number(clamp(Number(selectedDirectorShotPreset.panY || 0), -nextPanLimit, nextPanLimit).toFixed(2)),
+      });
+      return;
+    }
+
+    const panLimit = getShotPanLimit(selectedDirectorShotPreset.zoom);
+    const nextPanX = clamp(Number(selectedDirectorShotPreset.panX || 0) - (deltaX * 0.08), -panLimit, panLimit);
+    const nextPanY = clamp(Number(selectedDirectorShotPreset.panY || 0) - (deltaY * 0.08), -panLimit, panLimit);
+    updateMulticamShotPreset(selectedDirectorShotPreset.id, {
+      panX: Number(nextPanX.toFixed(2)),
+      panY: Number(nextPanY.toFixed(2)),
+    });
+  }, [isDirectorShotSetupActive, selectedDirectorShotPreset, updateMulticamShotPreset]);
 
   const getMulticamSourceTimeForAsset = useCallback((programSeconds, assetId, fallbackDuration = 0) => {
     const offset = getProjectAssetOffsetSeconds(selectedProject, assetId);
@@ -904,6 +1313,364 @@ const ClipVaultWorkspace = ({
     setLocalStatus('Paused multicam program playback.');
   }, []);
 
+  const handleOpenProgramPreview = useCallback(() => {
+    setIsProgramPreviewOpen(true);
+    setLocalStatus('Program preview opened. Drag the window and resize it from the lower-right corner.');
+  }, []);
+
+  const handleCloseProgramPreview = useCallback(() => {
+    setIsProgramPreviewOpen(false);
+  }, []);
+
+  const handleProgramPreviewWindowPointerDown = useCallback((event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    programPreviewWindowDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startRect: { ...programPreviewRect },
+    };
+  }, [programPreviewRect]);
+
+  const handleProgramPreviewResizePointerDown = useCallback((event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    programPreviewWindowResizeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startRect: { ...programPreviewRect },
+    };
+  }, [programPreviewRect]);
+
+  const seekMulticamMediaToProgramSeconds = useCallback((programSecondsRaw, { play = false } = {}) => {
+    const programSeconds = clamp(Number(programSecondsRaw) || 0, 0, multicamTrackDurationSeconds);
+    Object.entries(multicamPreviewRefs.current).forEach(([assetId, video]) => {
+      if (!video) return;
+      const assetDuration = Number(
+        multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
+      );
+      try {
+        video.currentTime = getMulticamSourceTimeForAsset(programSeconds, assetId, assetDuration);
+      } catch {
+        // ignore seek edge cases
+      }
+      if (play) {
+        video.play().catch(() => { });
+      } else {
+        video.pause();
+      }
+    });
+    Object.entries(multicamAudioRefs.current).forEach(([assetId, audio]) => {
+      if (!audio) return;
+      const assetDuration = Number(
+        multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
+      );
+      try {
+        audio.currentTime = getMulticamSourceTimeForAsset(programSeconds, assetId, assetDuration);
+      } catch {
+        // ignore seek edge cases
+      }
+      if (play) {
+        audio.play().catch(() => { });
+      } else {
+        audio.pause();
+      }
+    });
+  }, [getMulticamSourceTimeForAsset, multicamAssets, multicamTrackDurationSeconds]);
+
+  const renderFinishedMulticamProgram = useCallback(async () => {
+    if (!isMulticamProject) return;
+    if (!multicamPreviewUrls.camera1 && !multicamPreviewUrls.camera2) {
+      setLocalStatus('No synced camera media is available to render.');
+      return;
+    }
+    if (typeof window === 'undefined' || typeof window.MediaRecorder === 'undefined') {
+      setLocalStatus('This browser does not support local program recording.');
+      return;
+    }
+
+    const recorderMimeType = getSupportedProgramRecorderMimeType();
+    if (!recorderMimeType) {
+      setLocalStatus('No supported browser recording codec is available for program render.');
+      return;
+    }
+
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) {
+      setLocalStatus('This browser does not support Web Audio output capture.');
+      return;
+    }
+
+    pauseSelectedMulticamProgram();
+    setIsRenderingMulticamProgram(true);
+    setLocalStatus('Rendering finished program locally. This runs in real time.');
+
+    const renderCanvas = document.createElement('canvas');
+    renderCanvas.width = PROGRAM_RENDER_WIDTH;
+    renderCanvas.height = PROGRAM_RENDER_HEIGHT;
+    const videoStream = renderCanvas.captureStream(PROGRAM_RENDER_FPS);
+    const audioContext = new AudioContextCtor();
+    const audioDestination = audioContext.createMediaStreamDestination();
+    const renderHost = document.createElement('div');
+    renderHost.style.position = 'fixed';
+    renderHost.style.left = '-99999px';
+    renderHost.style.top = '-99999px';
+    renderHost.style.width = '1px';
+    renderHost.style.height = '1px';
+    renderHost.style.opacity = '0';
+    renderHost.style.pointerEvents = 'none';
+    renderHost.style.overflow = 'hidden';
+    document.body.appendChild(renderHost);
+    const renderVideos = {};
+    const renderAudios = {};
+    const renderNodes = {};
+    const cleanupTasks = [];
+    let recorder = null;
+    let animationFrameId = null;
+
+    try {
+      await audioContext.resume();
+
+      const createMediaElement = (tagName, src, muted = false) => {
+        const element = document.createElement(tagName);
+        element.src = src;
+        element.crossOrigin = 'anonymous';
+        element.preload = 'auto';
+        element.playsInline = true;
+        element.muted = muted;
+        element.volume = muted ? 0 : 1;
+        return element;
+      };
+
+      const waitForMetadata = (media) => new Promise((resolve, reject) => {
+        if (media.readyState >= 1) {
+          resolve();
+          return;
+        }
+        const handleReady = () => {
+          media.removeEventListener('loadedmetadata', handleReady);
+          media.removeEventListener('error', handleError);
+          resolve();
+        };
+        const handleError = () => {
+          media.removeEventListener('loadedmetadata', handleReady);
+          media.removeEventListener('error', handleError);
+          reject(new Error(`Unable to load media: ${media.currentSrc || media.src || 'unknown source'}`));
+        };
+        media.addEventListener('loadedmetadata', handleReady);
+        media.addEventListener('error', handleError);
+      });
+
+      const assetIds = ['camera1', 'camera2'];
+      for (const assetId of assetIds) {
+        const src = multicamPreviewUrls[assetId];
+        if (!src) continue;
+        const video = createMediaElement('video', src, true);
+        const audio = createMediaElement('audio', src, false);
+        renderVideos[assetId] = video;
+        renderAudios[assetId] = audio;
+        renderHost.appendChild(video);
+        renderHost.appendChild(audio);
+        cleanupTasks.push(() => {
+          try { video.pause(); } catch { /* no-op */ }
+          try { audio.pause(); } catch { /* no-op */ }
+          video.removeAttribute('src');
+          audio.removeAttribute('src');
+          video.load?.();
+          audio.load?.();
+        });
+        video.load?.();
+        audio.load?.();
+        await Promise.all([waitForMetadata(video), waitForMetadata(audio)]);
+        const sourceNode = audioContext.createMediaElementSource(audio);
+        const gainNode = audioContext.createGain();
+        let panNode = null;
+        sourceNode.connect(gainNode);
+        if (typeof audioContext.createStereoPanner === 'function') {
+          panNode = audioContext.createStereoPanner();
+          gainNode.connect(panNode);
+          panNode.connect(audioDestination);
+        } else {
+          gainNode.connect(audioDestination);
+        }
+        renderNodes[assetId] = { gainNode, panNode };
+      }
+
+      const applyRenderTrack = (assetId, volumePercent, panValue, enabled) => {
+        const nodes = renderNodes[assetId];
+        const audio = renderAudios[assetId];
+        if (!nodes || !audio) return;
+        audio.volume = 1;
+        nodes.gainNode.gain.value = enabled ? clamp(Number(volumePercent || 0) / 100, 0, 1) : 0;
+        if (nodes.panNode) {
+          nodes.panNode.pan.value = clampPan(panValue);
+        }
+      };
+
+      if (multicamAudioMixMode === 'stereo_mix') {
+        applyRenderTrack('camera1', multicamAudioMixSettings.camera1Volume, multicamAudioMixSettings.camera1Pan, Boolean(renderAudios.camera1));
+        applyRenderTrack('camera2', multicamAudioMixSettings.camera2Volume, multicamAudioMixSettings.camera2Pan, Boolean(renderAudios.camera2));
+      } else {
+        applyRenderTrack('camera1', 100, 0, multicamClockAssetId === 'camera1' && Boolean(renderAudios.camera1));
+        applyRenderTrack('camera2', 100, 0, multicamClockAssetId === 'camera2' && Boolean(renderAudios.camera2));
+      }
+
+      const combinedStream = new MediaStream([
+        ...videoStream.getVideoTracks(),
+        ...audioDestination.stream.getAudioTracks(),
+      ]);
+
+      const chunks = [];
+      recorder = new window.MediaRecorder(combinedStream, { mimeType: recorderMimeType });
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+
+      const renderComplete = new Promise((resolve, reject) => {
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, { type: recorderMimeType });
+          if (!blob.size) {
+            reject(new Error('The browser recorder did not produce output.'));
+            return;
+          }
+          const extension = recorderMimeType.includes('webm') ? 'webm' : 'mp4';
+          const fileName = `${sanitizeFileNamePart(selectedProject?.name || 'program', 'program')}-director-render.${extension}`;
+          const downloadUrl = URL.createObjectURL(blob);
+          setRenderedProgramDownload((previous) => {
+            if (previous?.url) URL.revokeObjectURL(previous.url);
+            return { url: downloadUrl, fileName };
+          });
+          const anchor = document.createElement('a');
+          anchor.href = downloadUrl;
+          anchor.download = fileName;
+          document.body.appendChild(anchor);
+          anchor.click();
+          anchor.remove();
+          resolve({ fileName });
+        };
+        recorder.onerror = (event) => {
+          reject(event?.error || new Error('The browser recorder failed during program render.'));
+        };
+      });
+
+      const initialProgramSeconds = 0;
+      Object.entries(renderVideos).forEach(([assetId, video]) => {
+        const assetDuration = Number(multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || video.duration || 0);
+        video.currentTime = getMulticamSourceTimeForAsset(initialProgramSeconds, assetId, assetDuration);
+      });
+      Object.entries(renderAudios).forEach(([assetId, audio]) => {
+        const assetDuration = Number(multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || audio.duration || 0);
+        audio.currentTime = getMulticamSourceTimeForAsset(initialProgramSeconds, assetId, assetDuration);
+      });
+
+      const initialSegment = getMulticamSegmentForSeconds(initialProgramSeconds);
+      const initialShotId = getMulticamSegmentShotId(initialSegment);
+      const initialPreset = getMulticamShotPresetById(initialShotId) || multicamShotPresets[0] || null;
+      const initialCameraId = initialPreset?.cameraId || getMulticamCameraIdForShotId(initialShotId);
+      drawProgramShotFrame({
+        canvas: renderCanvas,
+        video: renderVideos[initialCameraId],
+        preset: initialPreset,
+      });
+
+      const videoPlayResults = await Promise.all(
+        Object.values(renderVideos).map((video) => video.play().then(() => true).catch(() => false))
+      );
+      const audioPlayResults = await Promise.all(
+        Object.values(renderAudios).map((audio) => audio.play().then(() => true).catch(() => false))
+      );
+      const clockVideo = renderVideos[multicamClockAssetId] || renderVideos.camera1 || renderVideos.camera2;
+      if (!clockVideo || !videoPlayResults.some(Boolean) || !audioPlayResults.some(Boolean)) {
+        throw new Error('Browser media playback did not start for the program render.');
+      }
+
+      await new Promise((resolve) => window.setTimeout(resolve, 200));
+      if (clockVideo.paused || clockVideo.ended) {
+        throw new Error('Program render transport did not advance. Browser blocked hidden media playback.');
+      }
+
+      recorder.start(1000);
+
+      const drawRenderFrame = () => {
+        const activeClockVideo = renderVideos[multicamClockAssetId] || renderVideos.camera1 || renderVideos.camera2;
+        if (!activeClockVideo) return;
+        const nextProgramSeconds = clamp(
+          Number(activeClockVideo.currentTime || 0) + getProjectAssetOffsetSeconds(selectedProject, multicamClockAssetId),
+          0,
+          multicamTrackDurationSeconds,
+        );
+        const activeSegment = getMulticamSegmentForSeconds(nextProgramSeconds);
+        const activeShotId = getMulticamSegmentShotId(activeSegment);
+        const activePreset = getMulticamShotPresetById(activeShotId) || multicamShotPresets[0] || null;
+        const activeCameraId = activePreset?.cameraId || getMulticamCameraIdForShotId(activeShotId);
+        const activeVideo = renderVideos[activeCameraId];
+        drawProgramShotFrame({
+          canvas: renderCanvas,
+          video: activeVideo,
+          preset: activePreset,
+        });
+
+        if (nextProgramSeconds >= multicamTrackDurationSeconds - 0.02) {
+          recorder.stop();
+          return;
+        }
+        animationFrameId = window.requestAnimationFrame(drawRenderFrame);
+      };
+
+      drawRenderFrame();
+      const result = await renderComplete;
+      setLocalStatus(`Finished program render: ${result.fileName}`);
+    } catch (error) {
+      console.error('Failed rendering multicam program:', error);
+      setLocalStatus(`Unable to render finished program. ${String(error?.message || error || 'Unknown error')}`);
+    } finally {
+      if (animationFrameId) {
+        cancelAnimationFrame(animationFrameId);
+      }
+      try {
+        recorder?.state === 'recording' && recorder.stop();
+      } catch {
+        // no-op
+      }
+      Object.values(renderVideos).forEach((video) => {
+        try { video.pause(); } catch { /* no-op */ }
+      });
+      Object.values(renderAudios).forEach((audio) => {
+        try { audio.pause(); } catch { /* no-op */ }
+      });
+      cleanupTasks.forEach((task) => task());
+      renderHost.remove();
+      try {
+        await audioContext.close();
+      } catch {
+        // no-op
+      }
+      setIsRenderingMulticamProgram(false);
+    }
+  }, [
+    getMulticamSegmentForSeconds,
+    getMulticamShotPresetById,
+    getMulticamSourceTimeForAsset,
+    isMulticamProject,
+    multicamAssets,
+    multicamAudioMixMode,
+    multicamAudioMixSettings.camera1Pan,
+    multicamAudioMixSettings.camera1Volume,
+    multicamAudioMixSettings.camera2Pan,
+    multicamAudioMixSettings.camera2Volume,
+    multicamClockAssetId,
+    multicamShotPresets,
+    multicamTrackDurationSeconds,
+    pauseSelectedMulticamProgram,
+    multicamPreviewUrls,
+    selectedProject,
+  ]);
+
   const handleMulticamLoadedMetadata = useCallback((assetId, event) => {
     const video = event.currentTarget;
     const assetDuration = Number(
@@ -915,7 +1682,7 @@ const ClipVaultWorkspace = ({
       // ignore seek edge cases
     }
     if (isMulticamPlaying) {
-      video.play().catch(() => {});
+      video.play().catch(() => { });
     }
   }, [getMulticamSourceTimeForAsset, isMulticamPlaying, multicamAssets, timelinePlayheadSeconds]);
 
@@ -924,6 +1691,10 @@ const ClipVaultWorkspace = ({
       applyMulticamAudioMix();
     });
   }, [applyMulticamAudioMix, ensureMulticamAudioRouting]);
+
+  useEffect(() => {
+    multicamProgramSecondsRef.current = timelinePlayheadSeconds;
+  }, [timelinePlayheadSeconds]);
 
   const handleCaptionStyleChange = useCallback((event) => {
     const nextValue = String(event.target.value || 'reel-bold').trim() || 'reel-bold';
@@ -934,6 +1705,49 @@ const ClipVaultWorkspace = ({
     const currentlyEnabled = selectedTimelineEntry?.item?.captionEnabled !== false;
     updateSelectedTimelineItem({ captionEnabled: !currentlyEnabled });
   }, [selectedTimelineEntry?.item?.captionEnabled, updateSelectedTimelineItem]);
+
+  const handleDialogueTrackDefaultToggle = useCallback(() => {
+    updateSelectedProject((project) => {
+      const currentDefaults = normalizeDialogueTrackDefaults(project?.dialogueTrackDefaults || createDefaultDialogueTrackDefaults());
+      return {
+        dialogueTrackDefaults: {
+          ...currentDefaults,
+          speechCleanupEnabled: !currentDefaults.speechCleanupEnabled,
+        },
+      };
+    });
+  }, [updateSelectedProject]);
+
+  const handleDialogueTrackDefaultPresetChange = useCallback((event) => {
+    const nextPreset = normalizeSpeechCleanupPreset(event.target.value);
+    updateSelectedProject((project) => {
+      const currentDefaults = normalizeDialogueTrackDefaults(project?.dialogueTrackDefaults || createDefaultDialogueTrackDefaults());
+      return {
+        dialogueTrackDefaults: {
+          ...currentDefaults,
+          speechCleanupPreset: nextPreset,
+        },
+      };
+    });
+  }, [updateSelectedProject]);
+
+  const handleSpeechCleanupModeChange = useCallback((event) => {
+    const nextMode = normalizeSpeechCleanupMode(event.target.value);
+    const currentPreset = normalizeSpeechCleanupPreset(selectedTimelineEntry?.item?.speechCleanupPreset || DEFAULT_SPEECH_CLEANUP_PRESET);
+    updateSelectedTimelineItem({
+      speechCleanupMode: nextMode,
+      speechCleanupPreset: currentPreset,
+    });
+  }, [selectedTimelineEntry?.item?.speechCleanupPreset, updateSelectedTimelineItem]);
+
+  const handleSpeechCleanupPresetChange = useCallback((event) => {
+    const nextPreset = normalizeSpeechCleanupPreset(event.target.value);
+    const currentMode = normalizeSpeechCleanupMode(selectedTimelineEntry?.item?.speechCleanupMode);
+    updateSelectedTimelineItem({
+      speechCleanupMode: currentMode === 'inherit' ? 'on' : currentMode,
+      speechCleanupPreset: nextPreset,
+    });
+  }, [selectedTimelineEntry?.item?.speechCleanupMode, updateSelectedTimelineItem]);
 
   const applyClipTranscriptEdit = useCallback(() => {
     if (!selectedEditableClip?.id || !onUpdateClip) return;
@@ -1002,6 +1816,94 @@ const ClipVaultWorkspace = ({
   }, [timelineEntries, previewTimelineEntry]);
 
   const previewClip = previewTimelineEntry?.clip || null;
+  const effectiveSelectedSpeechCleanup = useMemo(() => (
+    resolveEffectiveSpeechCleanup({
+      item: selectedTimelineEntry?.item,
+      projectDefaults: dialogueTrackDefaults,
+    })
+  ), [dialogueTrackDefaults, selectedTimelineEntry?.item]);
+  const effectivePreviewSpeechCleanup = useMemo(() => (
+    resolveEffectiveSpeechCleanup({
+      item: previewTimelineEntry?.item,
+      projectDefaults: dialogueTrackDefaults,
+    })
+  ), [dialogueTrackDefaults, previewTimelineEntry?.item]);
+  const previewCleanupToken = useMemo(
+    () => extractRenderedClipToken(getClipRenderUrl(previewClip)),
+    [previewClip]
+  );
+  const previewCleanupKey = useMemo(() => (
+    effectivePreviewSpeechCleanup.enabled
+      ? buildSpeechCleanupPreviewKey({
+        token: previewCleanupToken,
+        preset: effectivePreviewSpeechCleanup.preset,
+      })
+      : ''
+  ), [effectivePreviewSpeechCleanup.enabled, effectivePreviewSpeechCleanup.preset, previewCleanupToken]);
+  const previewCleanupEntry = previewCleanupKey ? speechCleanupPreviewByKey[previewCleanupKey] : null;
+  const previewClipPlaybackUrl = useMemo(() => {
+    if (effectivePreviewSpeechCleanup.enabled && previewCleanupEntry?.status === 'ready' && previewCleanupEntry?.url) {
+      return previewCleanupEntry.url;
+    }
+    return getClipPlaybackUrl(previewClip);
+  }, [effectivePreviewSpeechCleanup.enabled, previewCleanupEntry?.status, previewCleanupEntry?.url, previewClip]);
+
+  useEffect(() => {
+    if (!previewCleanupKey || !effectivePreviewSpeechCleanup.enabled || !previewCleanupToken) return undefined;
+    const existing = speechCleanupPreviewByKey[previewCleanupKey];
+    if (existing?.status === 'ready' || existing?.status === 'loading') return undefined;
+
+    let cancelled = false;
+    setSpeechCleanupPreviewByKey((previous) => ({
+      ...previous,
+      [previewCleanupKey]: {
+        status: 'loading',
+        url: previous[previewCleanupKey]?.url || '',
+        error: '',
+      },
+    }));
+
+    void prepareSpeechCleanupProxy({
+      token: previewCleanupToken,
+      speechCleanupPreset: effectivePreviewSpeechCleanup.preset,
+    }).then((result) => {
+      if (cancelled) return;
+      const downloadUrl = String(result?.data?.downloadUrl || '').trim();
+      if (!downloadUrl) {
+        throw new Error('Speech Cleanup preview did not return a proxy URL.');
+      }
+      setSpeechCleanupPreviewByKey((previous) => ({
+        ...previous,
+        [previewCleanupKey]: {
+          status: 'ready',
+          url: downloadUrl,
+          error: '',
+        },
+      }));
+    }).catch((error) => {
+      if (cancelled) return;
+      console.error('Speech Cleanup preview failed:', error);
+      setSpeechCleanupPreviewByKey((previous) => ({
+        ...previous,
+        [previewCleanupKey]: {
+          status: 'failed',
+          url: '',
+          error: String(error?.message || 'Unable to prepare Speech Cleanup preview.'),
+        },
+      }));
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    effectivePreviewSpeechCleanup.enabled,
+    effectivePreviewSpeechCleanup.preset,
+    prepareSpeechCleanupProxy,
+    previewCleanupKey,
+    previewCleanupToken,
+    speechCleanupPreviewByKey,
+  ]);
   const previewTrimRange = useMemo(() => {
     if (!previewTimelineEntry) return null;
     return getTimelineEntryTrimRange(previewTimelineEntry);
@@ -1028,36 +1930,36 @@ const ClipVaultWorkspace = ({
     const cueEnd = Number(cue.endSeconds);
     const cueWords = Array.isArray(cue?.words) && cue.words.length > 0
       ? cue.words
-          .map((word, index) => {
-            const text = normalizeCaptionText(word?.text || '');
-            const startSeconds = Number(word?.startSeconds);
-            const endSeconds = Number(word?.endSeconds);
-            if (!text || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) {
-              return null;
-            }
-            return {
-              id: String(word?.id || `${cue.id || 'cue'}-word-${index + 1}`),
-              text,
-              startSeconds,
-              endSeconds,
-            };
-          })
-          .filter(Boolean)
-      : splitCaptionWords(normalizeCaptionText(cue?.text || '')).map((word, index, words) => {
-          const safeCueStart = Number.isFinite(cueStart) ? cueStart : 0;
-          const safeCueEnd = Number.isFinite(cueEnd) && cueEnd > safeCueStart ? cueEnd : safeCueStart + 0.1;
-          const perWordDuration = Math.max(0.08, (safeCueEnd - safeCueStart) / Math.max(1, words.length));
-          const wordStart = safeCueStart + perWordDuration * index;
-          const wordEnd = index === words.length - 1
-            ? safeCueEnd
-            : safeCueStart + perWordDuration * (index + 1);
+        .map((word, index) => {
+          const text = normalizeCaptionText(word?.text || '');
+          const startSeconds = Number(word?.startSeconds);
+          const endSeconds = Number(word?.endSeconds);
+          if (!text || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) {
+            return null;
+          }
           return {
-            id: `${cue.id || 'cue'}-word-${index + 1}`,
-            text: word,
-            startSeconds: wordStart,
-            endSeconds: wordEnd,
+            id: String(word?.id || `${cue.id || 'cue'}-word-${index + 1}`),
+            text,
+            startSeconds,
+            endSeconds,
           };
-        });
+        })
+        .filter(Boolean)
+      : splitCaptionWords(normalizeCaptionText(cue?.text || '')).map((word, index, words) => {
+        const safeCueStart = Number.isFinite(cueStart) ? cueStart : 0;
+        const safeCueEnd = Number.isFinite(cueEnd) && cueEnd > safeCueStart ? cueEnd : safeCueStart + 0.1;
+        const perWordDuration = Math.max(0.08, (safeCueEnd - safeCueStart) / Math.max(1, words.length));
+        const wordStart = safeCueStart + perWordDuration * index;
+        const wordEnd = index === words.length - 1
+          ? safeCueEnd
+          : safeCueStart + perWordDuration * (index + 1);
+        return {
+          id: `${cue.id || 'cue'}-word-${index + 1}`,
+          text: word,
+          startSeconds: wordStart,
+          endSeconds: wordEnd,
+        };
+      });
 
     if (
       !Number.isFinite(cueStart)
@@ -1286,7 +2188,7 @@ const ClipVaultWorkspace = ({
 
     setIsTimelinePlaying(true);
     timelineAutoPlayRef.current = true;
-    previewRef.current?.play?.().catch(() => {});
+    previewRef.current?.play?.().catch(() => { });
     setLocalStatus('Resumed grouped timeline playback.');
   }, [playbackTimelineItemId, previewMode, startTimelinePlayback]);
 
@@ -1381,7 +2283,7 @@ const ClipVaultWorkspace = ({
         // ignore seek edge cases
       }
       if (options.resumePlayback === true) {
-        previewRef.current.play?.().catch(() => {});
+        previewRef.current.play?.().catch(() => { });
       }
     }
   }, [previewMode, timelineSequenceEntries, timelineTrackDurationSeconds]);
@@ -1517,6 +2419,10 @@ const ClipVaultWorkspace = ({
     const title = String(entry?.clip?.title || `Edited Clip ${index + 1}`).trim() || `Edited Clip ${index + 1}`;
     const effectsPreset = String(entry?.item?.effectsPreset || 'none').trim() || 'none';
     const effectsIntensity = clamp(Number(entry?.item?.effectsIntensity) || 100, 0, 100);
+    const speechCleanup = resolveEffectiveSpeechCleanup({
+      item: entry?.item,
+      projectDefaults: dialogueTrackDefaults,
+    });
     const captionPayload = buildCaptionPayloadForEntry(entry);
     return {
       token,
@@ -1525,6 +2431,8 @@ const ClipVaultWorkspace = ({
       trimEndSeconds: Number(range.end.toFixed(2)),
       effectsPreset,
       effectsIntensity: Number(effectsIntensity.toFixed(0)),
+      speechCleanupEnabled: Boolean(speechCleanup.enabled),
+      speechCleanupPreset: String(speechCleanup.preset || DEFAULT_SPEECH_CLEANUP_PRESET),
       captionEnabled: Boolean(captionPayload.enabled),
       captionStylePreset: String(captionPayload.stylePreset || 'reel-bold'),
       captionCues: Array.isArray(captionPayload.cues)
@@ -1542,7 +2450,7 @@ const ClipVaultWorkspace = ({
         }))
         : [],
     };
-  }, []);
+  }, [dialogueTrackDefaults]);
 
   const renderEditedGroup = useCallback(async () => {
     const allItems = timelineEntries
@@ -1634,7 +2542,7 @@ const ClipVaultWorkspace = ({
 
     if (previewMode === 'selected' && selectedPreviewAutoPlayRef.current) {
       selectedPreviewAutoPlayRef.current = false;
-      video.play().catch(() => {});
+      video.play().catch(() => { });
       return;
     }
 
@@ -1642,70 +2550,200 @@ const ClipVaultWorkspace = ({
       if (timelineAutoPlayRef.current) {
         timelineAutoPlayRef.current = false;
       }
-      video.play().catch(() => {});
+      video.play().catch(() => { });
     }
   }, [isTimelinePlaying, previewMode, previewTimelineEntry, timelineEntryById]);
 
   useEffect(() => {
-    if (!isMulticamProject) return undefined;
-
-    if (!isMulticamPlaying) {
-      if (multicamPreviewAnimationRef.current) {
-        cancelAnimationFrame(multicamPreviewAnimationRef.current);
-        multicamPreviewAnimationRef.current = null;
-      }
-      Object.entries(multicamPreviewRefs.current).forEach(([assetId, video]) => {
-        if (!video) return;
-        const assetDuration = Number(
-          multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
-        );
-        try {
-          video.pause();
-          video.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
-        } catch {
-          // ignore seek edge cases
-        }
-      });
-      Object.entries(multicamAudioRefs.current).forEach(([assetId, audio]) => {
-        if (!audio) return;
-        const assetDuration = Number(
-          multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
-        );
-        try {
-          audio.pause();
-          audio.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
-        } catch {
-          // ignore seek edge cases
-        }
-      });
-      return undefined;
+    if (!isMulticamProject || isMulticamPlaying) return undefined;
+    if (multicamPreviewAnimationRef.current) {
+      cancelAnimationFrame(multicamPreviewAnimationRef.current);
+      multicamPreviewAnimationRef.current = null;
     }
+    seekMulticamMediaToProgramSeconds(timelinePlayheadSeconds, { play: false });
+    return undefined;
+  }, [
+    isMulticamPlaying,
+    isMulticamProject,
+    seekMulticamMediaToProgramSeconds,
+    timelinePlayheadSeconds,
+  ]);
 
-    Object.entries(multicamPreviewRefs.current).forEach(([assetId, video]) => {
-      if (!video) return;
-      const assetDuration = Number(
-        multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
-      );
-      try {
-        video.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
-      } catch {
-        // ignore seek edge cases
-      }
-      video.play().catch(() => {});
-    });
-    Object.entries(multicamAudioRefs.current).forEach(([assetId, audio]) => {
-      if (!audio) return;
-      const assetDuration = Number(
-        multicamAssets.find((asset) => String(asset.id || '') === String(assetId || ''))?.durationSeconds || 0
-      );
-      try {
-        audio.currentTime = getMulticamSourceTimeForAsset(timelinePlayheadSeconds, assetId, assetDuration);
-      } catch {
-        // ignore seek edge cases
-      }
-      audio.play().catch(() => {});
-    });
+  useEffect(() => {
+    const handlePointerMove = (event) => {
+      const dragState = directorShotDragRef.current;
+      if (!dragState) return;
+      if (event.pointerId !== dragState.pointerId) return;
+      const deltaX = event.clientX - dragState.startX;
+      const deltaY = event.clientY - dragState.startY;
+      const activePreset = multicamShotPresets.find((preset) => preset.id === dragState.shotId);
+      const panLimit = getShotPanLimit(activePreset?.zoom || 1);
+      const nextPanX = clamp(dragState.startPanX + (deltaX * 0.18), -panLimit, panLimit);
+      const nextPanY = clamp(dragState.startPanY + (deltaY * 0.18), -panLimit, panLimit);
+      updateMulticamShotPreset(dragState.shotId, {
+        panX: Number(nextPanX.toFixed(2)),
+        panY: Number(nextPanY.toFixed(2)),
+      });
+    };
 
+    const finishDrag = (event) => {
+      const dragState = directorShotDragRef.current;
+      if (!dragState) return;
+      if (event.pointerId !== dragState.pointerId) return;
+      directorShotDragRef.current = null;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', finishDrag);
+    window.addEventListener('pointercancel', finishDrag);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', finishDrag);
+      window.removeEventListener('pointercancel', finishDrag);
+    };
+  }, [multicamShotPresets, updateMulticamShotPreset]);
+
+  useEffect(() => {
+    if (!isMulticamProject || !isProgramPreviewOpen) return undefined;
+    const render = () => {
+      drawProgramPreviewFrame();
+      programPreviewAnimationRef.current = window.requestAnimationFrame(render);
+    };
+    render();
+    return () => {
+      if (programPreviewAnimationRef.current) {
+        cancelAnimationFrame(programPreviewAnimationRef.current);
+        programPreviewAnimationRef.current = null;
+      }
+    };
+  }, [drawProgramPreviewFrame, isMulticamProject, isProgramPreviewOpen]);
+
+  useEffect(() => {
+    if (isMulticamProject) return;
+    setIsProgramPreviewOpen(false);
+  }, [isMulticamProject]);
+
+  useEffect(() => {
+    return () => {
+      if (renderedProgramDownload?.url) {
+        URL.revokeObjectURL(renderedProgramDownload.url);
+      }
+    };
+  }, [renderedProgramDownload]);
+
+  useEffect(() => {
+    const handleWindowPointerMove = (event) => {
+      const dragState = programPreviewWindowDragRef.current;
+      if (dragState && event.pointerId === dragState.pointerId) {
+        const deltaX = event.clientX - dragState.startX;
+        const deltaY = event.clientY - dragState.startY;
+        setProgramPreviewRect((current) => ({
+          ...current,
+          x: dragState.startRect.x + deltaX,
+          y: dragState.startRect.y + deltaY,
+        }));
+        return;
+      }
+
+      const resizeState = programPreviewWindowResizeRef.current;
+      if (resizeState && event.pointerId === resizeState.pointerId) {
+        const deltaX = event.clientX - resizeState.startX;
+        const deltaY = event.clientY - resizeState.startY;
+        const aspectRatio = Math.max(0.1, Number(resizeState.startRect.width || 720) / Math.max(1, Number(resizeState.startRect.height || 405)));
+        const widthFromX = resizeState.startRect.width + deltaX;
+        const heightFromY = resizeState.startRect.height + deltaY;
+        const useWidthAsDriver = Math.abs(deltaX) >= Math.abs(deltaY * aspectRatio);
+
+        let nextWidth;
+        let nextHeight;
+        if (useWidthAsDriver) {
+          nextWidth = clamp(widthFromX, 360, 1400);
+          nextHeight = clamp(nextWidth / aspectRatio, 220, 900);
+          nextWidth = clamp(nextHeight * aspectRatio, 360, 1400);
+        } else {
+          nextHeight = clamp(heightFromY, 220, 900);
+          nextWidth = clamp(nextHeight * aspectRatio, 360, 1400);
+          nextHeight = clamp(nextWidth / aspectRatio, 220, 900);
+        }
+
+        setProgramPreviewRect((current) => ({
+          ...current,
+          width: nextWidth,
+          height: nextHeight,
+        }));
+      }
+    };
+
+    const clearWindowPointerState = (event) => {
+      if (programPreviewWindowDragRef.current?.pointerId === event.pointerId) {
+        programPreviewWindowDragRef.current = null;
+      }
+      if (programPreviewWindowResizeRef.current?.pointerId === event.pointerId) {
+        programPreviewWindowResizeRef.current = null;
+      }
+    };
+
+    window.addEventListener('pointermove', handleWindowPointerMove);
+    window.addEventListener('pointerup', clearWindowPointerState);
+    window.addEventListener('pointercancel', clearWindowPointerState);
+    return () => {
+      window.removeEventListener('pointermove', handleWindowPointerMove);
+      window.removeEventListener('pointerup', clearWindowPointerState);
+      window.removeEventListener('pointercancel', clearWindowPointerState);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isDirectorShotSetupActive || !selectedDirectorShotPreset || selectedDirectorShotPreset.locked) return undefined;
+
+    const surfaceElement = directorSuiteSurfaceRef.current;
+    const activePaneElement = directorPaneRefs.current[selectedDirectorShotPreset.cameraId];
+    const rootElement = document.documentElement;
+    const bodyElement = document.body;
+    if (!surfaceElement || !activePaneElement || !rootElement || !bodyElement) return undefined;
+
+    const previousRootOverscroll = rootElement.style.overscrollBehavior;
+    const previousRootOverscrollX = rootElement.style.overscrollBehaviorX;
+    const previousBodyOverscroll = bodyElement.style.overscrollBehavior;
+    const previousBodyOverscrollX = bodyElement.style.overscrollBehaviorX;
+    const previousSurfaceOverscroll = surfaceElement.style.overscrollBehavior;
+    const previousSurfaceOverscrollX = surfaceElement.style.overscrollBehaviorX;
+
+    rootElement.style.overscrollBehavior = 'none';
+    rootElement.style.overscrollBehaviorX = 'none';
+    bodyElement.style.overscrollBehavior = 'none';
+    bodyElement.style.overscrollBehaviorX = 'none';
+    surfaceElement.style.overscrollBehavior = 'none';
+    surfaceElement.style.overscrollBehaviorX = 'none';
+
+    const onWindowWheel = (event) => {
+      const eventTarget = event.target;
+      if (!(eventTarget instanceof Node)) return;
+      if (!surfaceElement.contains(eventTarget)) return;
+      event.preventDefault();
+      event.stopPropagation?.();
+      if (!activePaneElement.contains(eventTarget)) return;
+      handleDirectorShotWheel(event, selectedDirectorShotPreset.cameraId);
+    };
+
+    window.addEventListener('wheel', onWindowWheel, { passive: false, capture: true });
+
+    return () => {
+      window.removeEventListener('wheel', onWindowWheel, { capture: true });
+      rootElement.style.overscrollBehavior = previousRootOverscroll;
+      rootElement.style.overscrollBehaviorX = previousRootOverscrollX;
+      bodyElement.style.overscrollBehavior = previousBodyOverscroll;
+      bodyElement.style.overscrollBehaviorX = previousBodyOverscrollX;
+      surfaceElement.style.overscrollBehavior = previousSurfaceOverscroll;
+      surfaceElement.style.overscrollBehaviorX = previousSurfaceOverscrollX;
+    };
+  }, [handleDirectorShotWheel, isDirectorShotSetupActive, selectedDirectorShotPreset]);
+
+  useEffect(() => {
+    if (!isMulticamProject || !isMulticamPlaying) return undefined;
+    seekMulticamMediaToProgramSeconds(multicamProgramSecondsRef.current, { play: true });
     multicamPreviewAnimationRef.current = window.requestAnimationFrame(syncMulticamPreviewFrame);
     return () => {
       if (multicamPreviewAnimationRef.current) {
@@ -1714,13 +2752,100 @@ const ClipVaultWorkspace = ({
       }
     };
   }, [
-    getMulticamSourceTimeForAsset,
     isMulticamPlaying,
     isMulticamProject,
-    multicamAssets,
+    seekMulticamMediaToProgramSeconds,
     syncMulticamPreviewFrame,
-    timelinePlayheadSeconds,
   ]);
+
+  useEffect(() => {
+    if (!isMulticamProject) return undefined;
+
+    const handleKeyDown = (event) => {
+      const target = event.target;
+      const isEditable = target instanceof HTMLElement && (
+        target.tagName === 'INPUT'
+        || target.tagName === 'TEXTAREA'
+        || target.tagName === 'SELECT'
+        || target.isContentEditable
+      );
+      if (isEditable) return;
+
+      if (event.code === 'Space') {
+        event.preventDefault();
+        if (isMulticamPlaying) {
+          pauseSelectedMulticamProgram();
+        } else {
+          playSelectedMulticamProgram();
+        }
+        return;
+      }
+
+      if (event.ctrlKey && !event.metaKey && event.code === 'KeyT') {
+        event.preventDefault();
+        splitSelectedMulticamSegment();
+        return;
+      }
+
+      if (event.ctrlKey && !event.metaKey && event.code === 'KeyJ') {
+        event.preventDefault();
+        joinSelectedMulticamSegment();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [
+    isMulticamPlaying,
+    isMulticamProject,
+    joinSelectedMulticamSegment,
+    pauseSelectedMulticamProgram,
+    playSelectedMulticamProgram,
+    splitSelectedMulticamSegment,
+  ]);
+
+  useEffect(() => {
+    if (!isMulticamProject || isDirectorShotSetupActive) return undefined;
+
+    const scroller = timelineScrollerRef.current;
+    const rootElement = document.documentElement;
+    const bodyElement = document.body;
+    if (!scroller || !rootElement || !bodyElement) return undefined;
+
+    const previousRootOverscroll = rootElement.style.overscrollBehaviorX;
+    const previousBodyOverscroll = bodyElement.style.overscrollBehaviorX;
+    const previousScrollerOverscroll = scroller.style.overscrollBehaviorX;
+
+    rootElement.style.overscrollBehaviorX = 'none';
+    bodyElement.style.overscrollBehaviorX = 'none';
+    scroller.style.overscrollBehaviorX = 'none';
+
+    const onWheel = (event) => {
+      const eventTarget = event.target;
+      if (!(eventTarget instanceof Node)) return;
+      if (!scroller.contains(eventTarget)) return;
+      if (event.ctrlKey || event.metaKey) return;
+
+      const deltaX = Number(event.deltaX || 0);
+      const deltaY = Number(event.deltaY || 0);
+      if (Math.abs(deltaX) < 0.5 && Math.abs(deltaY) < 0.5) return;
+
+      event.preventDefault();
+      event.stopPropagation?.();
+      const nextScrollLeft = scroller.scrollLeft + deltaX + (Math.abs(deltaX) < Math.abs(deltaY) ? deltaY : 0);
+      scroller.scrollLeft = Math.max(0, nextScrollLeft);
+    };
+
+    window.addEventListener('wheel', onWheel, { passive: false, capture: true });
+    return () => {
+      window.removeEventListener('wheel', onWheel, { capture: true });
+      rootElement.style.overscrollBehaviorX = previousRootOverscroll;
+      bodyElement.style.overscrollBehaviorX = previousBodyOverscroll;
+      scroller.style.overscrollBehaviorX = previousScrollerOverscroll;
+    };
+  }, [isDirectorShotSetupActive, isMulticamProject]);
 
   const handlePreviewTimeUpdate = useCallback((event) => {
     const video = event.currentTarget;
@@ -1779,7 +2904,7 @@ const ClipVaultWorkspace = ({
     }
 
     if (isTimelinePlaying) {
-      previewRef.current.play().catch(() => {});
+      previewRef.current.play().catch(() => { });
     }
   }, [isTimelinePlaying, playbackTimelineEntry, playbackTimelineItemId, previewMode, timelineEntryById]);
 
@@ -1964,191 +3089,189 @@ const ClipVaultWorkspace = ({
   }, [isMediaBinCollapsed, mediaBinWidth, monitorHeight]);
 
   return (
-    <section className="glass rounded-3xl p-5 lg:p-6 space-y-4">
-      {isMulticamProject && (
-        <div className="rounded-2xl border border-emerald-300/70 dark:border-emerald-700/70 bg-emerald-50/80 dark:bg-emerald-950/20 px-4 py-3">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="material-symbols-outlined text-[18px] text-emerald-700 dark:text-emerald-300">video_camera_front</span>
-                <div className="text-sm font-semibold text-emerald-900 dark:text-emerald-100">Multicam Mode</div>
+    <>
+      <section className="glass rounded-3xl p-5 lg:p-6 space-y-4 min-h-[200vh]">
+        {isMulticamProject && sidebarBottomPortalNode ? createPortal(
+          <div className="rounded-2xl border border-emerald-300/70 dark:border-emerald-700/70 bg-emerald-50/80 dark:bg-emerald-950/20 px-4 py-3 mx-4 mb-4">
+            <div className="flex flex-col gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-[18px] text-emerald-700 dark:text-emerald-300">video_camera_front</span>
+                  <div className="text-sm font-semibold text-emerald-900 dark:text-emerald-100">Multicam Mode</div>
+                </div>
+                <div className="mt-1 text-[11px] leading-relaxed text-emerald-800/80 dark:text-emerald-200/80">
+                  Editing a synced two-camera project. Camera A is the top track, Camera B is the bottom track, and each segment controls which shot preset is live in the program output.
+                </div>
               </div>
-              <div className="mt-1 text-xs text-emerald-800/80 dark:text-emerald-200/80">
-                Editing a synced two-camera project. Camera 1 is the top track, Camera 2 is the bottom track, and each segment controls which camera is live in the program output.
+              <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-semibold">
+                <span className="rounded-md bg-emerald-600/90 text-white px-2 py-0.5">Green = Active</span>
+                <span className="rounded-md bg-rose-600/90 text-white px-2 py-0.5">Red = Inactive</span>
+                <span className="rounded-md bg-slate-800/90 text-white px-2 py-0.5">Ctrl+T Cut</span>
+                <span className="rounded-md bg-slate-800/90 text-white px-2 py-0.5">Ctrl+J Join</span>
               </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold">
-              <span className="rounded-full bg-emerald-600 text-white px-2.5 py-1">Green = Active</span>
-              <span className="rounded-full bg-rose-600 text-white px-2.5 py-1">Red = Inactive</span>
-              <span className="rounded-full bg-slate-900 text-white px-2.5 py-1">Ctrl+T Cut</span>
-              <span className="rounded-full bg-slate-900 text-white px-2.5 py-1">Ctrl+J Join</span>
-            </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          sidebarBottomPortalNode
+        ) : null}
 
-      {isMediaBinCollapsed && (
-        <div className="flex flex-wrap items-center gap-2">
-          {isMediaBinCollapsed && (
-            <button
-              type="button"
-              onClick={() => setIsMediaBinCollapsed(false)}
-              className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200"
-            >
-              <span className="material-symbols-outlined text-[16px]">chevron_right</span>
-              Show Media Bin
-            </button>
-          )}
-        </div>
-      )}
+        <div className="flex flex-col lg:flex-row gap-4 lg:gap-0 h-full">
+          {isMulticamProject && sidebarPortalNode ? createPortal(
+            <div className="px-4 pb-4 space-y-4">
+              <div className="space-y-2">
+                <label htmlFor="new-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  New Montage
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    id="new-montage-project"
+                    name="newMontageProject"
+                    type="text"
+                    value={newProjectName}
+                    onChange={(event) => setNewProjectName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        handleCreateProject();
+                      }
+                    }}
+                    placeholder="Best Of Session"
+                    className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
+                  />
+                  <button
+                    onClick={handleCreateProject}
+                    className="bg-primary text-white px-3 py-2 rounded-lg text-xs font-semibold"
+                  >
+                    Create
+                  </button>
+                </div>
+              </div>
 
-      <div className="flex flex-col lg:flex-row gap-4 lg:gap-0 min-h-[74vh]">
-        {!isMediaBinCollapsed && (
-          <aside
-            className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 space-y-3 lg:shrink-0"
-            style={{ width: `min(100%, ${mediaBinWidth}px)` }}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Media Bin</div>
-              <button
-                type="button"
-                onClick={() => setIsMediaBinCollapsed(true)}
-                className="inline-flex items-center justify-center rounded-md p-1.5 text-slate-500 hover:bg-slate-200/70 dark:hover:bg-slate-800/70"
-                aria-label="Collapse media bin"
-                title="Collapse media bin"
-              >
-                <span className="material-symbols-outlined text-[18px]">left_panel_close</span>
-              </button>
-            </div>
-
-            <div className="space-y-2">
-              <label htmlFor="new-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                New Montage
-              </label>
-              <div className="flex gap-2">
-                <input
-                  id="new-montage-project"
-                  name="newMontageProject"
-                  type="text"
-                  value={newProjectName}
-                  onChange={(event) => setNewProjectName(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault();
-                      handleCreateProject();
-                    }
-                  }}
-                  placeholder="Best Of Session"
-                  className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
-                />
-                <button
-                  onClick={handleCreateProject}
-                  className="bg-primary text-white px-3 py-2 rounded-lg text-xs font-semibold"
+              <div className="space-y-2">
+                <label htmlFor="select-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Active Project
+                </label>
+                <select
+                  id="select-montage-project"
+                  name="selectMontageProject"
+                  value={selectedProjectId}
+                  onChange={(event) => onSelectedProjectChange?.(event.target.value)}
+                  className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
                 >
-                  Create
-                </button>
+                  <option value="">Select project...</option>
+                  {montageProjects.map((project) => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
               </div>
-            </div>
 
-            <div className="space-y-2">
-              <label htmlFor="select-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                Active Project
-              </label>
-              <select
-                id="select-montage-project"
-                name="selectMontageProject"
-                value={selectedProjectId}
-                onChange={(event) => onSelectedProjectChange?.(event.target.value)}
-                className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
-              >
-                <option value="">Select project...</option>
-                {montageProjects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+              <div className="space-y-2">
+                <label htmlFor="rename-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Project Name
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    id="rename-montage-project"
+                    name="renameMontageProject"
+                    type="text"
+                    value={projectNameDraft}
+                    onChange={(event) => setProjectNameDraft(event.target.value)}
+                    placeholder="Project name"
+                    className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleRenameProject}
+                    disabled={!selectedProjectId}
+                    className="bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-100 px-3 py-2 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Rename
+                  </button>
+                </div>
+              </div>
 
-            <div className="space-y-2">
-              <label htmlFor="rename-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                Project Name
-              </label>
-              <div className="flex gap-2">
-                <input
-                  id="rename-montage-project"
-                  name="renameMontageProject"
-                  type="text"
-                  value={projectNameDraft}
-                  onChange={(event) => setProjectNameDraft(event.target.value)}
-                  placeholder="Project name"
-                  className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
-                />
+              <div className="grid grid-cols-3 gap-2">
                 <button
                   type="button"
-                  onClick={handleRenameProject}
-                  disabled={!selectedProjectId}
-                  className="bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-100 px-3 py-2 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={!selectedProjectId || isRenderingMulticamProgram}
+                  onClick={async () => {
+                    if (!selectedProjectId) return;
+                    await renderFinishedMulticamProgram();
+                  }}
+                  className="rounded-md border border-emerald-300/70 text-emerald-700 dark:text-emerald-300 dark:border-emerald-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Rename
+                  {isRenderingMulticamProgram ? 'Rendering…' : 'Render Finished Product'}
+                </button>
+                <button
+                  type="button"
+                  disabled={!selectedProjectId}
+                  onClick={async () => {
+                    if (!selectedProjectId) return;
+                    const confirmed = window.confirm('Flush cached clip files for this project?');
+                    if (!confirmed) return;
+                    const ok = await onFlushProjectMedia?.(selectedProjectId);
+                    setLocalStatus(ok ? 'Project media cache cleared.' : 'Unable to clear project media cache.');
+                  }}
+                  className="rounded-md border border-amber-300/70 text-amber-700 dark:text-amber-300 dark:border-amber-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Flush Media
+                </button>
+                <button
+                  type="button"
+                  disabled={!selectedProjectId}
+                  onClick={async () => {
+                    if (!selectedProjectId) return;
+                    const confirmed = window.confirm('Delete this project and all clips in it?');
+                    if (!confirmed) return;
+                    const ok = await onDeleteProject?.(selectedProjectId);
+                    setLocalStatus(ok ? 'Project deleted.' : 'Unable to delete project.');
+                  }}
+                  className="rounded-md border border-rose-300/70 text-rose-700 dark:text-rose-300 dark:border-rose-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Delete Project
                 </button>
               </div>
-            </div>
 
-            <div className="grid grid-cols-3 gap-2">
-              <button
-                type="button"
-                disabled={!selectedProjectId}
-                onClick={async () => {
-                  if (!selectedProjectId) return;
-                  const result = await onExportProject?.(selectedProjectId);
-                  const ok = typeof result === 'object'
-                    ? Boolean(result?.success)
-                    : Boolean(result);
-                  const message = typeof result === 'object'
-                    ? String(result?.message || '')
-                    : '';
-                  setLocalStatus(message || (ok ? 'Project export started.' : 'Unable to export project.'));
-                }}
-                className="rounded-md border border-emerald-300/70 text-emerald-700 dark:text-emerald-300 dark:border-emerald-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Export Project
-              </button>
-              <button
-                type="button"
-                disabled={!selectedProjectId}
-                onClick={async () => {
-                  if (!selectedProjectId) return;
-                  const confirmed = window.confirm('Flush cached clip files for this project?');
-                  if (!confirmed) return;
-                  const ok = await onFlushProjectMedia?.(selectedProjectId);
-                  setLocalStatus(ok ? 'Project media cache cleared.' : 'Unable to clear project media cache.');
-                }}
-                className="rounded-md border border-amber-300/70 text-amber-700 dark:text-amber-300 dark:border-amber-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Flush Media
-              </button>
-              <button
-                type="button"
-                disabled={!selectedProjectId}
-                onClick={async () => {
-                  if (!selectedProjectId) return;
-                  const confirmed = window.confirm('Delete this project and all clips in it?');
-                  if (!confirmed) return;
-                  const ok = await onDeleteProject?.(selectedProjectId);
-                  setLocalStatus(ok ? 'Project deleted.' : 'Unable to delete project.');
-                }}
-                className="rounded-md border border-rose-300/70 text-rose-700 dark:text-rose-300 dark:border-rose-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Delete Project
-              </button>
-            </div>
+              <div className="space-y-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/40 p-3">
+                <div>
+                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Dialogue Track Default</div>
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                    Speech Cleanup runs during backend render and export. New timeline clips inherit this by default.
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDialogueTrackDefaultToggle}
+                    disabled={!selectedProjectId}
+                    className={`rounded-md px-3 py-2 text-xs font-semibold disabled:opacity-50 ${dialogueTrackDefaults.speechCleanupEnabled
+                      ? 'bg-emerald-600 text-white'
+                      : 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
+                      }`}
+                  >
+                    {dialogueTrackDefaults.speechCleanupEnabled ? 'Speech Cleanup On' : 'Speech Cleanup Off'}
+                  </button>
+                  <select
+                    value={dialogueTrackDefaults.speechCleanupPreset}
+                    onChange={handleDialogueTrackDefaultPresetChange}
+                    disabled={!selectedProjectId || !dialogueTrackDefaults.speechCleanupEnabled}
+                    className="rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-100 disabled:opacity-50"
+                    aria-label="Dialogue track default speech cleanup preset"
+                  >
+                    {SPEECH_CLEANUP_PRESET_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
 
-            <div className="rounded-lg border border-slate-200/70 dark:border-slate-700/70 px-2.5 py-2 text-[11px] text-slate-600 dark:text-slate-300">
-              Cached Media: <span className="font-semibold">{formatBytesLabel(mediaStats?.totalBytes)}</span> ({Number(mediaStats?.clipCount || 0)} clips)
-            </div>
+              <div className="rounded-lg border border-slate-200/70 dark:border-slate-700/70 px-2.5 py-2 text-[11px] text-slate-600 dark:text-slate-300">
+                Cached Media: <span className="font-semibold">{formatBytesLabel(mediaStats?.totalBytes)}</span> ({Number(mediaStats?.clipCount || 0)} clips)
+              </div>
 
-            {selectedProject?.workflowType === 'multicam' ? (
               <div className="rounded-lg border border-sky-300/40 dark:border-sky-500/35 bg-sky-50/70 dark:bg-sky-950/20 px-3 py-2 grid grid-cols-2 gap-2 text-[11px] text-slate-600 dark:text-slate-300">
                 <div>
                   Workflow: <span className="font-semibold text-slate-800 dark:text-slate-100">Two-Camera Podcast</span>
@@ -2163,837 +3286,1308 @@ const ClipVaultWorkspace = ({
                   Project Audio: <span className="font-semibold text-slate-800 dark:text-slate-100">{multicamAudioMixMode === 'stereo_mix' ? 'Synced Stereo Mix' : (String(selectedProject?.masterAudioAssetId || '').trim() || '--')}</span>
                 </div>
               </div>
-            ) : null}
+            </div>,
+            sidebarPortalNode
+          ) : null}
 
-            <div className="space-y-2">
-              <label htmlFor="vault-search" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                Search Clips
-              </label>
-              <input
-                id="vault-search"
-                name="vaultSearch"
-                type="text"
-                value={mediaSearchQuery}
-                onChange={(event) => setMediaSearchQuery(event.target.value)}
-                placeholder="Title, source, keyword..."
-                className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
-              />
-            </div>
+          {!isMulticamProject && isMediaBinCollapsed && (
+            <button
+              type="button"
+              onClick={() => setIsMediaBinCollapsed(false)}
+              className="hidden lg:inline-flex absolute left-4 top-[11.5rem] z-30 items-center justify-center rounded-r-xl rounded-l-md border border-slate-300/80 dark:border-slate-700/80 bg-white/90 dark:bg-slate-900/90 px-2 py-5 text-slate-700 dark:text-slate-200 shadow-lg shadow-black/10"
+              aria-label="Open left control pane"
+              title="Open left control pane"
+            >
+              <span className="material-symbols-outlined text-[18px]">left_panel_open</span>
+            </button>
+          )}
+          {!isMulticamProject && !isMediaBinCollapsed && (
+            <aside
+              className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 space-y-3 lg:shrink-0"
+              style={{ width: `min(100%, ${mediaBinWidth}px)` }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">{isMulticamProject ? 'Director Suite' : 'Media Bin'}</div>
+                <button
+                  type="button"
+                  onClick={() => setIsMediaBinCollapsed(true)}
+                  className="inline-flex items-center justify-center rounded-md p-1.5 text-slate-500 hover:bg-slate-200/70 dark:hover:bg-slate-800/70"
+                  aria-label="Collapse media bin"
+                  title="Collapse media bin"
+                >
+                  <span className="material-symbols-outlined text-[18px]">left_panel_close</span>
+                </button>
+              </div>
 
-            <div className="space-y-2 overflow-y-auto pr-1 max-h-[52vh]">
-              {!selectedProjectId ? (
-                <div className="text-sm text-slate-500 dark:text-slate-400">
-                  Select or create a project to view its clips.
-                </div>
-              ) : filteredVaultClips.length === 0 ? (
-                <div className="text-sm text-slate-500 dark:text-slate-400">
-                  No clips in this project yet.
-                </div>
-              ) : (
-                filteredVaultClips.map((clip) => (
-                  <article
-                    key={clip.id}
-                    draggable
-                    onDragStart={(event) => handleMediaDragStart(event, clip.id)}
-                    className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/60 p-3 space-y-2 cursor-grab active:cursor-grabbing"
-                  >
-                    <div className="aspect-video rounded-lg bg-gradient-to-br from-slate-300/70 to-slate-500/60 dark:from-slate-700/70 dark:to-slate-900/70 flex items-center justify-center">
-                      <span className="material-symbols-outlined text-slate-800 dark:text-slate-200 text-[30px]">movie</span>
+              {sidebarPortalNode ? createPortal(
+                <div className="px-4 pb-4 space-y-4">
+                  <div className="space-y-2">
+                    <label htmlFor="new-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      New Montage
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        id="new-montage-project"
+                        name="newMontageProject"
+                        type="text"
+                        value={newProjectName}
+                        onChange={(event) => setNewProjectName(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault();
+                            handleCreateProject();
+                          }
+                        }}
+                        placeholder="Best Of Session"
+                        className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
+                      />
+                      <button
+                        onClick={handleCreateProject}
+                        className="bg-primary text-white px-3 py-2 rounded-lg text-xs font-semibold"
+                      >
+                        Create
+                      </button>
                     </div>
-                    <div className="text-sm font-semibold text-slate-800 dark:text-slate-100 line-clamp-2">{clip.title || 'Untitled Clip'}</div>
-                    <div className="text-xs text-slate-500 dark:text-slate-400">
-                      {clip.startTimestamp || '--:--'} - {clip.endTimestamp || '--:--'} ({formatDurationLabel(clip.startTimestamp, clip.endTimestamp)})
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-1 break-all">{clip.sourceTitle || 'Unknown source'}</div>
-                  </article>
-                ))
-              )}
-            </div>
-          </aside>
-        )}
+                  </div>
 
-        {!isMediaBinCollapsed && (
-          <button
-            type="button"
-            onMouseDown={startPaneResize('media')}
-            aria-label="Resize media bin"
-            className="hidden lg:block w-1.5 mx-1 cursor-col-resize bg-transparent hover:bg-primary/30 transition-colors"
-          />
-        )}
+                  <div className="space-y-2">
+                    <label htmlFor="select-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      Active Project
+                    </label>
+                    <select
+                      id="select-montage-project"
+                      name="selectMontageProject"
+                      value={selectedProjectId}
+                      onChange={(event) => onSelectedProjectChange?.(event.target.value)}
+                      className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
+                    >
+                      <option value="">Select project...</option>
+                      {montageProjects.map((project) => (
+                        <option key={project.id} value={project.id}>
+                          {project.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
 
-        <div className="min-w-0 flex-1 flex flex-col">
-          {isMulticamProject ? (
-            <>
-              <section
-                className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-0"
-                style={{ height: `${monitorHeight}px` }}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Program Monitor</div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {isMulticamPlaying ? (
+                  <div className="space-y-2">
+                    <label htmlFor="rename-montage-project" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      Project Name
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        id="rename-montage-project"
+                        name="renameMontageProject"
+                        type="text"
+                        value={projectNameDraft}
+                        onChange={(event) => setProjectNameDraft(event.target.value)}
+                        placeholder="Project name"
+                        className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
+                      />
                       <button
                         type="button"
-                        onClick={pauseSelectedMulticamProgram}
-                        className="inline-flex items-center gap-1 rounded-lg bg-slate-800 text-white px-3 py-2 text-xs font-semibold"
+                        onClick={handleRenameProject}
+                        disabled={!selectedProjectId}
+                        className="bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-100 px-3 py-2 rounded-lg text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
                       >
-                        <span className="material-symbols-outlined text-[14px]">pause</span>
-                        Pause Program
+                        Rename
                       </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={playSelectedMulticamProgram}
-                    disabled={!multicamPreviewUrls.camera1 && !multicamPreviewUrls.camera2}
-                        className="inline-flex items-center gap-1 rounded-lg bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
-                      >
-                        <span className="material-symbols-outlined text-[14px]">play_arrow</span>
-                        Play Program
-                      </button>
-                    )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
                     <button
                       type="button"
-                      onClick={splitSelectedMulticamSegment}
-                      disabled={!selectedMulticamSegment}
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                      disabled={!selectedProjectId || isRenderingMulticamProgram}
+                      onClick={async () => {
+                        if (!selectedProjectId) return;
+                        if (isMulticamProject) {
+                          await renderFinishedMulticamProgram();
+                          return;
+                        }
+                        const result = await onExportProject?.(selectedProjectId);
+                        const ok = typeof result === 'object'
+                          ? Boolean(result?.success)
+                          : Boolean(result);
+                        const message = typeof result === 'object'
+                          ? String(result?.message || '')
+                          : '';
+                        setLocalStatus(message || (ok ? 'Project export started.' : 'Unable to export project.'));
+                      }}
+                      className="rounded-md border border-emerald-300/70 text-emerald-700 dark:text-emerald-300 dark:border-emerald-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      <span className="material-symbols-outlined text-[14px]">content_cut</span>
-                      Cut At Playhead
+                      {isMulticamProject ? (isRenderingMulticamProgram ? 'Rendering…' : 'Render Finished Product') : 'Export Project'}
                     </button>
                     <button
                       type="button"
-                      onClick={joinSelectedMulticamSegment}
-                      disabled={!selectedMulticamSegment}
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                      disabled={!selectedProjectId}
+                      onClick={async () => {
+                        if (!selectedProjectId) return;
+                        const confirmed = window.confirm('Flush cached clip files for this project?');
+                        if (!confirmed) return;
+                        const ok = await onFlushProjectMedia?.(selectedProjectId);
+                        setLocalStatus(ok ? 'Project media cache cleared.' : 'Unable to clear project media cache.');
+                      }}
+                      className="rounded-md border border-amber-300/70 text-amber-700 dark:text-amber-300 dark:border-amber-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
                     >
-                      <span className="material-symbols-outlined text-[14px]">join_inner</span>
-                      Join Next
+                      Flush Media
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!selectedProjectId}
+                      onClick={async () => {
+                        if (!selectedProjectId) return;
+                        const confirmed = window.confirm('Delete this project and all clips in it?');
+                        if (!confirmed) return;
+                        const ok = await onDeleteProject?.(selectedProjectId);
+                        setLocalStatus(ok ? 'Project deleted.' : 'Unable to delete project.');
+                      }}
+                      className="rounded-md border border-rose-300/70 text-rose-700 dark:text-rose-300 dark:border-rose-500/40 px-2 py-1.5 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Delete Project
                     </button>
                   </div>
-                </div>
 
-                <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-                  <span>{selectedProject ? selectedProject.name : 'No Project Selected'}</span>
-                  {selectedMulticamSegment ? (
-                    <span className="font-semibold text-slate-700 dark:text-slate-200">
-                      Segment {multicamSegments.findIndex((segment) => segment.id === selectedMulticamSegment.id) + 1}/{multicamSegments.length}
-                    </span>
-                  ) : null}
-                  {multicamPreviewSegment ? (
-                    <span className="font-semibold text-emerald-600 dark:text-emerald-300">
-                      Active {getMulticamActiveCameraId(multicamPreviewSegment) === 'camera2' ? 'Camera 2' : 'Camera 1'}
-                    </span>
-                  ) : null}
-                </div>
-
-                <div className="mt-3 flex-1 min-h-0">
-                  <div className="relative w-full h-full rounded-xl overflow-hidden bg-black/90 border border-slate-300/60 dark:border-slate-700/60">
-                    {multicamPreviewUrls.camera1 || multicamPreviewUrls.camera2 ? (
-                      <>
-                        {(['camera1', 'camera2']).map((assetId) => {
-                          const src = multicamPreviewUrls[assetId];
-                          if (!src) return null;
-                          const isActive = getMulticamActiveCameraId(multicamPreviewSegment) === assetId;
-                          return (
-                            <video
-                              key={assetId}
-                              ref={(node) => {
-                                multicamPreviewRefs.current[assetId] = node;
-                              }}
-                              src={src}
-                              playsInline
-                              muted
-                              className={`absolute inset-0 w-full h-full object-contain transition-opacity duration-75 ${
-                                isActive ? 'opacity-100' : 'opacity-0 pointer-events-none'
-                              }`}
-                              onLoadedMetadata={(event) => handleMulticamLoadedMetadata(assetId, event)}
-                            />
-                          );
-                        })}
-                        {(['camera1', 'camera2']).map((assetId) => {
-                          const src = multicamPreviewUrls[assetId];
-                          if (!src) return null;
-                          return (
-                            <audio
-                              key={`audio-${assetId}`}
-                              ref={(node) => {
-                                multicamAudioRefs.current[assetId] = node;
-                              }}
-                              src={src}
-                              preload="auto"
-                              className="hidden"
-                            />
-                          );
-                        })}
-                      </>
-                    ) : (
-                      <div className="w-full h-full flex flex-col items-center justify-center text-slate-300 text-sm gap-2">
-                        <span className="material-symbols-outlined text-[34px]">videocam_off</span>
-                        Select a multicam segment with a valid source file to preview.
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-                  <span>
-                    Program Playhead: <span className="font-semibold">{formatTimelineTickLabel(timelinePlayheadSeconds)}</span>
-                  </span>
-                  {selectedMulticamSegment ? (
-                    <span>
-                      Segment Range: <span className="font-semibold">{formatTimelineTickLabel(selectedMulticamSegment.startSeconds)} - {formatTimelineTickLabel(selectedMulticamSegment.endSeconds)}</span>
-                    </span>
-                  ) : null}
-                </div>
-
-                <div className="mt-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/30 p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/40 p-3">
                     <div>
-                      <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Active Camera Override</div>
+                      <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Dialogue Track Default</div>
                       <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                        Green track is active. Red track is inactive. Switching a segment locks a manual override.
+                        Speech Cleanup runs during backend render and export. New timeline clips inherit this by default.
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
-                        onClick={() => setSelectedMulticamCamera('camera1')}
-                        disabled={!selectedMulticamSegment}
-                        className="rounded-md bg-emerald-600 text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                        onClick={handleDialogueTrackDefaultToggle}
+                        disabled={!selectedProjectId}
+                        className={`rounded-md px-3 py-2 text-xs font-semibold disabled:opacity-50 ${dialogueTrackDefaults.speechCleanupEnabled
+                          ? 'bg-emerald-600 text-white'
+                          : 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
+                          }`}
                       >
-                        Camera 1 Active
+                        {dialogueTrackDefaults.speechCleanupEnabled ? 'Speech Cleanup On' : 'Speech Cleanup Off'}
+                      </button>
+                      <select
+                        value={dialogueTrackDefaults.speechCleanupPreset}
+                        onChange={handleDialogueTrackDefaultPresetChange}
+                        disabled={!selectedProjectId || !dialogueTrackDefaults.speechCleanupEnabled}
+                        className="rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-100 disabled:opacity-50"
+                        aria-label="Dialogue track default speech cleanup preset"
+                      >
+                        {SPEECH_CLEANUP_PRESET_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border border-slate-200/70 dark:border-slate-700/70 px-2.5 py-2 text-[11px] text-slate-600 dark:text-slate-300">
+                    Cached Media: <span className="font-semibold">{formatBytesLabel(mediaStats?.totalBytes)}</span> ({Number(mediaStats?.clipCount || 0)} clips)
+                  </div>
+
+                  {selectedProject?.workflowType === 'multicam' ? (
+                    <div className="rounded-lg border border-sky-300/40 dark:border-sky-500/35 bg-sky-50/70 dark:bg-sky-950/20 px-3 py-2 grid grid-cols-2 gap-2 text-[11px] text-slate-600 dark:text-slate-300">
+                      <div>
+                        Workflow: <span className="font-semibold text-slate-800 dark:text-slate-100">Two-Camera Podcast</span>
+                      </div>
+                      <div>
+                        Assets: <span className="font-semibold text-slate-800 dark:text-slate-100">{Array.isArray(selectedProject?.mediaAssets) ? selectedProject.mediaAssets.length : 0}</span>
+                      </div>
+                      <div>
+                        Sync: <span className="font-semibold text-slate-800 dark:text-slate-100">{Number.isFinite(Number(selectedProject?.syncMap?.offsetSeconds)) ? `${Number(selectedProject.syncMap.offsetSeconds).toFixed(2)}s` : '--'}</span>
+                      </div>
+                      <div>
+                        Project Audio: <span className="font-semibold text-slate-800 dark:text-slate-100">{multicamAudioMixMode === 'stereo_mix' ? 'Synced Stereo Mix' : (String(selectedProject?.masterAudioAssetId || '').trim() || '--')}</span>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>,
+                sidebarPortalNode
+              ) : null}
+              {isMulticamProject ? null : (
+                <>
+                  <div className="space-y-2">
+                    <label htmlFor="vault-search" className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      Search Clips
+                    </label>
+                    <input
+                      id="vault-search"
+                      name="vaultSearch"
+                      type="text"
+                      value={mediaSearchQuery}
+                      onChange={(event) => setMediaSearchQuery(event.target.value)}
+                      placeholder="Title, source, keyword..."
+                      className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    {!selectedProjectId ? (
+                      <div className="text-sm text-slate-500 dark:text-slate-400">
+                        Select or create a project to view its clips.
+                      </div>
+                    ) : filteredVaultClips.length === 0 ? (
+                      <div className="text-sm text-slate-500 dark:text-slate-400">
+                        No clips in this project yet.
+                      </div>
+                    ) : (
+                      filteredVaultClips.map((clip) => (
+                        <article
+                          key={clip.id}
+                          draggable
+                          onDragStart={(event) => handleMediaDragStart(event, clip.id)}
+                          className="rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800/60 p-3 space-y-2 cursor-grab active:cursor-grabbing"
+                        >
+                          <div className="aspect-video rounded-lg bg-gradient-to-br from-slate-300/70 to-slate-500/60 dark:from-slate-700/70 dark:to-slate-900/70 flex items-center justify-center">
+                            <span className="material-symbols-outlined text-slate-800 dark:text-slate-200 text-[30px]">movie</span>
+                          </div>
+                          <div className="text-sm font-semibold text-slate-800 dark:text-slate-100 line-clamp-2">{clip.title || 'Untitled Clip'}</div>
+                          <div className="text-xs text-slate-500 dark:text-slate-400">
+                            {clip.startTimestamp || '--:--'} - {clip.endTimestamp || '--:--'} ({formatDurationLabel(clip.startTimestamp, clip.endTimestamp)})
+                          </div>
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-1 break-all">{clip.sourceTitle || 'Unknown source'}</div>
+                        </article>
+                      ))
+                    )}
+                  </div>
+                </>
+              )}
+            </aside>
+          )}
+
+          {!isMulticamProject && !isMediaBinCollapsed && (
+            <button
+              type="button"
+              onMouseDown={startPaneResize('media')}
+              aria-label="Resize media bin"
+              className="hidden lg:block w-1.5 mx-1 cursor-col-resize bg-transparent hover:bg-primary/30 transition-colors"
+            />
+          )}
+
+          <div className="min-w-0 flex-1 flex flex-col">
+            {isMulticamProject ? (
+              <>
+                <section
+                  ref={directorSuiteSurfaceRef}
+                  className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-[460px]"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Director Suite</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={isProgramPreviewOpen ? handleCloseProgramPreview : handleOpenProgramPreview}
+                        className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">{isProgramPreviewOpen ? 'picture_in_picture_alt_off' : 'picture_in_picture_alt'}</span>
+                        {isProgramPreviewOpen ? 'Hide Program Preview' : 'Open Program Preview'}
+                      </button>
+                      {isMulticamPlaying ? (
+                        <button
+                          type="button"
+                          onClick={pauseSelectedMulticamProgram}
+                          className="inline-flex items-center gap-1 rounded-lg bg-slate-800 text-white px-3 py-2 text-xs font-semibold"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">pause</span>
+                          Pause Program
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={playSelectedMulticamProgram}
+                          disabled={!multicamPreviewUrls.camera1 && !multicamPreviewUrls.camera2}
+                          className="inline-flex items-center gap-1 rounded-lg bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">play_arrow</span>
+                          Play Program
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={splitSelectedMulticamSegment}
+                        disabled={!selectedMulticamSegment}
+                        className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">content_cut</span>
+                        Cut At Playhead
                       </button>
                       <button
                         type="button"
-                        onClick={() => setSelectedMulticamCamera('camera2')}
+                        onClick={joinSelectedMulticamSegment}
                         disabled={!selectedMulticamSegment}
+                        className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">join_inner</span>
+                        Join Next
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                    <span>{selectedProject ? selectedProject.name : 'No Project Selected'}</span>
+                    {selectedMulticamSegment ? (
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">
+                        Segment {multicamSegments.findIndex((segment) => segment.id === selectedMulticamSegment.id) + 1}/{multicamSegments.length}
+                      </span>
+                    ) : null}
+                    {multicamPreviewSegment ? (
+                      <span className="font-semibold text-emerald-600 dark:text-emerald-300">
+                        Active {formatShotPresetLabel(getMulticamSegmentShotId(multicamPreviewSegment))}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  <div className="mt-3 flex-1 min-h-0">
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 w-full h-full">
+                      {multicamPreviewUrls.camera1 || multicamPreviewUrls.camera2 ? (
+                        <>
+                          {(['camera1', 'camera2']).map((assetId) => {
+                            const src = multicamPreviewUrls[assetId];
+                            if (!src) return null;
+                            const isActive = getMulticamActiveCameraId(multicamPreviewSegment) === assetId;
+                            const preset = multicamPreviewPresets[assetId];
+                            const displayLabel = assetId === 'camera2' ? 'Camera B' : 'Camera A';
+                            return (
+                              <div
+                                key={assetId}
+                                ref={(node) => {
+                                  directorPaneRefs.current[assetId] = node;
+                                }}
+                                className={`relative min-h-[220px] rounded-xl overflow-hidden bg-black/90 border ${isActive ? 'border-emerald-400/80 shadow-[0_0_0_1px_rgba(52,211,153,0.45)]' : 'border-slate-300/60 dark:border-slate-700/60'}`}
+                                onPointerDown={(event) => handleDirectorShotPointerDown(event, assetId)}
+                                onWheel={(event) => handleDirectorShotWheel(event, assetId)}
+                              >
+                                <div className="absolute left-3 top-3 z-20 rounded-md bg-black/55 px-2 py-1 text-[11px] font-semibold text-white">
+                                  {displayLabel} {preset?.id ? `• ${formatShotPresetLabel(preset.id)}` : ''}
+                                </div>
+                                <div className="absolute right-3 top-3 z-20 rounded-md bg-black/55 px-2 py-1 text-[11px] text-white/90">
+                                  {isActive ? 'LIVE' : 'standby'}
+                                </div>
+                                {isDirectorShotSetupActive && selectedDirectorShotPreset?.cameraId === assetId ? (
+                                  <div className="absolute inset-0 z-10 border-2 border-dashed border-cyan-300/80 pointer-events-none">
+                                    <div className="absolute inset-0 flex items-center justify-center">
+                                      <div className="rounded-md bg-cyan-400/15 px-3 py-1 text-[11px] font-semibold text-cyan-100 backdrop-blur-sm">
+                                        Setting {selectedDirectorShotPreset.id}: drag to pan, wheel to zoom
+                                      </div>
+                                    </div>
+                                  </div>
+                                ) : null}
+                                <div className="absolute inset-0 overflow-hidden">
+                                  <video
+                                    ref={(node) => {
+                                      multicamPreviewRefs.current[assetId] = node;
+                                    }}
+                                    src={src}
+                                    playsInline
+                                    muted
+                                    className="absolute inset-0 w-full h-full object-contain"
+                                    style={getShotTransformStyle(preset)}
+                                    onLoadedMetadata={(event) => handleMulticamLoadedMetadata(assetId, event)}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                          {(['camera1', 'camera2']).map((assetId) => {
+                            const src = multicamPreviewUrls[assetId];
+                            if (!src) return null;
+                            return (
+                              <audio
+                                key={`audio-${assetId}`}
+                                ref={(node) => {
+                                  multicamAudioRefs.current[assetId] = node;
+                                }}
+                                src={src}
+                                preload="auto"
+                                className="hidden"
+                              />
+                            );
+                          })}
+                        </>
+                      ) : (
+                        <div className="w-full h-full col-span-full flex flex-col items-center justify-center text-slate-300 text-sm gap-2">
+                          <span className="material-symbols-outlined text-[34px]">videocam_off</span>
+                          Select a multicam segment with a valid source file to preview.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                </section>
+
+                <section className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4">
+                  <div className="flex flex-col xl:flex-row xl:items-center xl:justify-center gap-4 xl:gap-6">
+                    <div className="flex flex-wrap items-center justify-center gap-2">
+                      {multicamShotPresets
+                        .filter((preset) => preset.cameraId === 'camera1')
+                        .map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onClick={() => handleSelectDirectorShotPreset(preset.id)}
+                            className={`rounded-lg border px-3 py-2 text-xs font-semibold ${selectedDirectorShotId === preset.id
+                              ? (preset.locked
+                                ? 'border-emerald-500 bg-emerald-600 text-white'
+                                : 'border-cyan-400 bg-cyan-500 text-white')
+                              : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200'
+                              }`}
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              {formatShotPresetLabel(preset.id)}
+                              <span className="material-symbols-outlined text-[13px]">
+                                {preset.locked ? 'lock' : 'tune'}
+                              </span>
+                            </span>
+                          </button>
+                        ))}
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-center gap-3">
+                      <div className="inline-flex items-center gap-2">
+                        <InlineHelpTooltip
+                          label="Shot setup help"
+                          text="Choose a preset, press Set Shot, then drag in the matching camera view and use the wheel to zoom. Press Lock Shot when the framing is right."
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={armDirectorShotSetup}
+                        disabled={!selectedDirectorShotPreset}
+                        className="rounded-lg bg-primary text-white px-5 py-2 text-xs font-semibold disabled:opacity-50"
+                      >
+                        Set Shot
+                      </button>
+                      <button
+                        type="button"
+                        onClick={lockDirectorShotSetup}
+                        disabled={!selectedDirectorShotPreset}
+                        className={`rounded-lg px-5 py-2 text-xs font-semibold disabled:opacity-50 ${selectedDirectorShotPreset?.locked
+                          ? 'bg-emerald-600 text-white'
+                          : 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
+                          }`}
+                      >
+                        Lock Shot
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-center gap-2">
+                      {multicamShotPresets
+                        .filter((preset) => preset.cameraId === 'camera2')
+                        .map((preset) => (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onClick={() => handleSelectDirectorShotPreset(preset.id)}
+                            className={`rounded-lg border px-3 py-2 text-xs font-semibold ${selectedDirectorShotId === preset.id
+                              ? (preset.locked
+                                ? 'border-emerald-500 bg-emerald-600 text-white'
+                                : 'border-cyan-400 bg-cyan-500 text-white')
+                              : 'border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-200'
+                              }`}
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              {formatShotPresetLabel(preset.id)}
+                              <span className="material-symbols-outlined text-[13px]">
+                                {preset.locked ? 'lock' : 'tune'}
+                              </span>
+                            </span>
+                          </button>
+                        ))}
+                    </div>
+                  </div>
+                </section>
+
+                <button
+                  type="button"
+                  onMouseDown={startPaneResize('monitor')}
+                  aria-label="Resize monitor and timeline panes"
+                  className="hidden lg:block h-2 my-2 cursor-row-resize rounded bg-transparent hover:bg-primary/30 transition-colors"
+                />
+
+                <section className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-[280px] flex-1">
+                  <div className="flex flex-col gap-3 xl:grid xl:grid-cols-[auto_1fr_auto] xl:items-center">
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Multicam Timeline</div>
+                      <button
+                        type="button"
+                        onClick={() => selectedDirectorShotPreset && selectedMulticamSegment && setSelectedMulticamShot(selectedDirectorShotPreset.id)}
+                        disabled={!selectedDirectorShotPreset || !selectedMulticamSegment}
                         className="rounded-md bg-emerald-600 text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
                       >
-                        Camera 2 Active
+                        Apply Shot
                       </button>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-xs text-slate-500 dark:text-slate-400 xl:px-4">
+                      <div className="inline-flex items-center gap-2">
+                        <span className="font-semibold text-slate-700 dark:text-slate-200">Director Status</span>
+                        <InlineHelpTooltip
+                          label="Timeline shot assignment help"
+                          text="Split the timeline where you want the cut, select the segment, then assign a shot preset here."
+                        />
+                      </div>
+                      {selectedMulticamSegment ? (
+                        <span>
+                          Segment shot: <span className="font-semibold text-slate-800 dark:text-slate-100">{formatShotPresetLabel(getMulticamSegmentShotId(selectedMulticamSegment))}</span>
+                        </span>
+                      ) : null}
+                      {selectedMulticamSegment ? (
+                        <span>
+                          Segment range: <span className="font-semibold text-slate-800 dark:text-slate-100">{formatTimelineTickLabel(selectedMulticamSegment.startSeconds)} - {formatTimelineTickLabel(selectedMulticamSegment.endSeconds)}</span>
+                        </span>
+                      ) : null}
+                      {selectedDirectorShotPreset ? (
+                        <span>
+                          Setup preset: <span className="font-semibold text-slate-800 dark:text-slate-100">{formatShotPresetLabel(selectedDirectorShotPreset.id)}</span>
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400 xl:justify-end">
                       <button
                         type="button"
                         onClick={clearSelectedMulticamOverride}
-                        disabled={!selectedMulticamSegment || (!selectedMulticamSegment?.manualCameraId && !selectedMulticamSegment?.isLocked)}
+                        disabled={!selectedMulticamSegment || (!selectedMulticamSegment?.manualShotId && !selectedMulticamSegment?.isLocked)}
                         className="rounded-md border border-slate-300 dark:border-slate-600 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
                       >
                         Clear Override
                       </button>
+                      <span>Playhead {formatTimelineTickLabel(timelinePlayheadSeconds)}</span>
+                      <div className="inline-flex items-center gap-1">
+                        <span>Zoom</span>
+                        <input
+                          type="range"
+                          min="0.6"
+                          max="4"
+                          step="0.1"
+                          value={timelineZoom}
+                          onChange={(event) => setTimelineZoom(clamp(Number(event.target.value), 0.6, 4))}
+                          className="w-24 accent-primary"
+                          aria-label="Timeline zoom"
+                        />
+                        <span className="font-semibold text-slate-700 dark:text-slate-200">{timelineZoom.toFixed(1)}x</span>
+                      </div>
                     </div>
                   </div>
-                </div>
-              </section>
 
-              <button
-                type="button"
-                onMouseDown={startPaneResize('monitor')}
-                aria-label="Resize monitor and timeline panes"
-                className="hidden lg:block h-2 my-2 cursor-row-resize rounded bg-transparent hover:bg-primary/30 transition-colors"
-              />
-
-              <section className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-[280px] flex-1">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Multicam Timeline</div>
-                  <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-                    <span>Playhead {formatTimelineTickLabel(timelinePlayheadSeconds)}</span>
-                    <div className="inline-flex items-center gap-1">
-                      <span>Zoom</span>
-                      <input
-                        type="range"
-                        min="0.6"
-                        max="4"
-                        step="0.1"
-                        value={timelineZoom}
-                        onChange={(event) => setTimelineZoom(clamp(Number(event.target.value), 0.6, 4))}
-                        className="w-24 accent-primary"
-                        aria-label="Timeline zoom"
-                      />
-                      <span className="font-semibold text-slate-700 dark:text-slate-200">{timelineZoom.toFixed(1)}x</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div
-                  ref={timelineScrollerRef}
-                  className="mt-3 rounded-xl border border-slate-300/70 dark:border-slate-700/70 bg-slate-950/80 overflow-x-auto overflow-y-hidden flex-1 min-h-0"
-                >
-                  {multicamSegments.length === 0 ? (
-                    <div className="h-full min-h-[240px] flex items-center justify-center text-slate-400 text-sm">
-                      Multicam segments will appear here after Sermon Prep sync.
-                    </div>
-                  ) : (
-                    <div
-                      ref={timelineTrackRef}
-                      className="relative min-h-[240px] select-none"
-                      style={{ width: `${multicamTrackWidthPx}px` }}
-                      onPointerDown={handleMulticamRulerPointerDown}
-                    >
+                  <div
+                    ref={timelineScrollerRef}
+                    className="mt-3 rounded-xl border border-slate-300/70 dark:border-slate-700/70 bg-slate-950/80 overflow-x-auto overflow-y-hidden flex-1 min-h-0"
+                  >
+                    {multicamSegments.length === 0 ? (
+                      <div className="h-full min-h-[240px] flex items-center justify-center text-slate-400 text-sm">
+                        Multicam segments will appear here after Sermon Prep sync.
+                      </div>
+                    ) : (
                       <div
-                        className="absolute left-0 right-0 top-0 bg-slate-900/95 border-b border-slate-700"
-                        style={{ height: `${TIMELINE_RULER_HEIGHT_PX}px` }}
+                        ref={timelineTrackRef}
+                        className="relative min-h-[240px] select-none"
+                        style={{ width: `${multicamTrackWidthPx}px` }}
+                        onPointerDown={handleMulticamRulerPointerDown}
                       >
-                        {multicamRulerTicks.map((tick) => {
-                          const leftPx = tick.seconds * timelinePixelsPerSecond;
+                        <div
+                          className="absolute left-0 right-0 top-0 bg-slate-900/95 border-b border-slate-700"
+                          style={{ height: `${TIMELINE_RULER_HEIGHT_PX}px` }}
+                        >
+                          {multicamRulerTicks.map((tick) => {
+                            const leftPx = tick.seconds * timelinePixelsPerSecond;
+                            return (
+                              <div
+                                key={`multicam-tick-${tick.seconds}`}
+                                className="absolute top-0 bottom-0 text-[10px] text-slate-400"
+                                style={{ left: `${leftPx}px` }}
+                              >
+                                <div className={`w-px bg-slate-500/70 ${tick.isMajor ? 'h-4' : 'h-2.5'}`} />
+                                {tick.isMajor && (
+                                  <div className="mt-0.5 -translate-x-1/2 whitespace-nowrap">
+                                    {formatTimelineTickLabel(tick.seconds)}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        <div className="absolute left-0 right-0 border-b border-slate-700/80 bg-slate-900/45" style={{ top: `${TIMELINE_RULER_HEIGHT_PX}px`, height: `${TIMELINE_ROW_HEIGHT_PX}px` }} />
+                        <div className="absolute left-0 right-0 border-b border-slate-700/80 bg-slate-900/35" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX}px`, height: `${TIMELINE_ROW_HEIGHT_PX}px` }} />
+                        <div className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + 6}px` }}>Camera A</div>
+                        <div className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX + 6}px` }}>Camera B</div>
+
+                        {multicamSegments.map((segment, index) => {
+                          const start = Number(segment.startSeconds || 0);
+                          const end = Number(segment.endSeconds || 0);
+                          const duration = Math.max(TRIM_MIN_GAP_SECONDS, end - start);
+                          const activeCameraId = getMulticamActiveCameraId(segment);
+                          const leftPx = start * timelinePixelsPerSecond;
+                          const widthPx = Math.max(24, duration * timelinePixelsPerSecond);
+                          const isSelected = segment.id === effectiveSelectedMulticamSegmentId;
+                          const shotId = getMulticamSegmentShotId(segment);
+                          const topSegmentStyle = activeCameraId === 'camera1'
+                            ? 'bg-emerald-500/85 border-emerald-200 text-emerald-50'
+                            : 'bg-rose-500/70 border-rose-200/70 text-rose-50';
+                          const bottomSegmentStyle = activeCameraId === 'camera2'
+                            ? 'bg-emerald-500/85 border-emerald-200 text-emerald-50'
+                            : 'bg-rose-500/70 border-rose-200/70 text-rose-50';
                           return (
-                            <div
-                              key={`multicam-tick-${tick.seconds}`}
-                              className="absolute top-0 bottom-0 text-[10px] text-slate-400"
-                              style={{ left: `${leftPx}px` }}
-                            >
-                              <div className={`w-px bg-slate-500/70 ${tick.isMajor ? 'h-4' : 'h-2.5'}`} />
-                              {tick.isMajor && (
-                                <div className="mt-0.5 -translate-x-1/2 whitespace-nowrap">
-                                  {formatTimelineTickLabel(tick.seconds)}
-                                </div>
-                              )}
-                            </div>
+                            <React.Fragment key={segment.id}>
+                              <button
+                                type="button"
+                                onClick={() => handleSelectMulticamSegment(segment.id)}
+                                className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${topSegmentStyle} ${isSelected ? 'ring-2 ring-white/90' : ''}`}
+                                style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${TIMELINE_RULER_HEIGHT_PX + 10}px`, height: `${TIMELINE_ROW_HEIGHT_PX - 20}px` }}
+                                title={`Segment ${index + 1} • Camera A • ${formatShotPresetLabel(shotId)} • ${formatTimelineTickLabel(start)} - ${formatTimelineTickLabel(end)}`}
+                              >
+                                <div className="text-[10px] font-bold opacity-80">#{index + 1}</div>
+                                <div className="text-xs font-semibold truncate">{activeCameraId === 'camera1' ? `${formatShotPresetLabel(shotId)} LIVE` : formatShotPresetLabel(shotId)}</div>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleSelectMulticamSegment(segment.id)}
+                                className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${bottomSegmentStyle} ${isSelected ? 'ring-2 ring-white/90' : ''}`}
+                                style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX + 10}px`, height: `${TIMELINE_ROW_HEIGHT_PX - 20}px` }}
+                                title={`Segment ${index + 1} • Camera B • ${formatShotPresetLabel(shotId)} • ${formatTimelineTickLabel(start)} - ${formatTimelineTickLabel(end)}`}
+                              >
+                                <div className="text-[10px] font-bold opacity-80">#{index + 1}</div>
+                                <div className="text-xs font-semibold truncate">{activeCameraId === 'camera2' ? `${formatShotPresetLabel(shotId)} LIVE` : formatShotPresetLabel(shotId)}</div>
+                              </button>
+                              <div
+                                className="pointer-events-none absolute top-[28px] bottom-0 z-30 w-px bg-white/50"
+                                style={{ left: `${leftPx}px` }}
+                              />
+                            </React.Fragment>
                           );
                         })}
+
+                        <div
+                          className="pointer-events-none absolute top-0 bottom-0 z-40"
+                          style={{ left: `${timelinePlayheadSeconds * timelinePixelsPerSecond}px` }}
+                        >
+                          <div className="w-[2px] h-full bg-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.6)]" />
+                          <div className="absolute -top-0.5 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[7px] border-r-[7px] border-t-[10px] border-l-transparent border-r-transparent border-t-white/95" />
+                        </div>
                       </div>
+                    )}
+                  </div>
 
-                      <div className="absolute left-0 right-0 border-b border-slate-700/80 bg-slate-900/45" style={{ top: `${TIMELINE_RULER_HEIGHT_PX}px`, height: `${TIMELINE_ROW_HEIGHT_PX}px` }} />
-                      <div className="absolute left-0 right-0 border-b border-slate-700/80 bg-slate-900/35" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX}px`, height: `${TIMELINE_ROW_HEIGHT_PX}px` }} />
-                      <div className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + 6}px` }}>Camera 1</div>
-                      <div className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400" style={{ top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX + 6}px` }}>Camera 2</div>
-
-                      {multicamSegments.map((segment, index) => {
-                        const start = Number(segment.startSeconds || 0);
-                        const end = Number(segment.endSeconds || 0);
-                        const duration = Math.max(TRIM_MIN_GAP_SECONDS, end - start);
-                        const activeCameraId = getMulticamActiveCameraId(segment);
-                        const leftPx = start * timelinePixelsPerSecond;
-                        const widthPx = Math.max(24, duration * timelinePixelsPerSecond);
-                        const isSelected = segment.id === effectiveSelectedMulticamSegmentId;
-                        const topSegmentStyle = activeCameraId === 'camera1'
-                          ? 'bg-emerald-500/85 border-emerald-200 text-emerald-50'
-                          : 'bg-rose-500/70 border-rose-200/70 text-rose-50';
-                        const bottomSegmentStyle = activeCameraId === 'camera2'
-                          ? 'bg-emerald-500/85 border-emerald-200 text-emerald-50'
-                          : 'bg-rose-500/70 border-rose-200/70 text-rose-50';
-                        return (
-                          <React.Fragment key={segment.id}>
-                            <button
-                              type="button"
-                              onClick={() => handleSelectMulticamSegment(segment.id)}
-                              className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${topSegmentStyle} ${isSelected ? 'ring-2 ring-white/90' : ''}`}
-                              style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${TIMELINE_RULER_HEIGHT_PX + 10}px`, height: `${TIMELINE_ROW_HEIGHT_PX - 20}px` }}
-                              title={`Segment ${index + 1} • Camera 1 • ${formatTimelineTickLabel(start)} - ${formatTimelineTickLabel(end)}`}
-                            >
-                              <div className="text-[10px] font-bold opacity-80">#{index + 1}</div>
-                              <div className="text-xs font-semibold truncate">{activeCameraId === 'camera1' ? 'ACTIVE' : 'inactive'}</div>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleSelectMulticamSegment(segment.id)}
-                              className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${bottomSegmentStyle} ${isSelected ? 'ring-2 ring-white/90' : ''}`}
-                              style={{ left: `${leftPx}px`, width: `${widthPx}px`, top: `${TIMELINE_RULER_HEIGHT_PX + TIMELINE_ROW_HEIGHT_PX + 10}px`, height: `${TIMELINE_ROW_HEIGHT_PX - 20}px` }}
-                              title={`Segment ${index + 1} • Camera 2 • ${formatTimelineTickLabel(start)} - ${formatTimelineTickLabel(end)}`}
-                            >
-                              <div className="text-[10px] font-bold opacity-80">#{index + 1}</div>
-                              <div className="text-xs font-semibold truncate">{activeCameraId === 'camera2' ? 'ACTIVE' : 'inactive'}</div>
-                            </button>
-                            <div
-                              className="pointer-events-none absolute top-[28px] bottom-0 z-30 w-px bg-white/50"
-                              style={{ left: `${leftPx}px` }}
-                            />
-                          </React.Fragment>
-                        );
-                      })}
-
-                      <div
-                        className="pointer-events-none absolute top-0 bottom-0 z-40"
-                        style={{ left: `${timelinePlayheadSeconds * timelinePixelsPerSecond}px` }}
+                </section>
+              </>
+            ) : (
+              <>
+                <section
+                  className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-0"
+                  style={{ height: `${monitorHeight}px` }}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Program Monitor</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => startTimelinePlayback(true)}
+                        disabled={!hasPlayableTimelineClip}
+                        className="inline-flex items-center gap-1 rounded-lg bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
                       >
-                        <div className="w-[2px] h-full bg-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.6)]" />
-                        <div className="absolute -top-0.5 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[7px] border-r-[7px] border-t-[10px] border-l-transparent border-r-transparent border-t-white/95" />
+                        <span className="material-symbols-outlined text-[14px]">linked_camera</span>
+                        Play As One
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={renderEditedGroup}
+                        disabled={isRenderingEditedGroup || renderableTimelineItemCount < 2}
+                        className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 text-white px-3 py-2 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">movie_edit</span>
+                        {isRenderingEditedGroup ? 'Rendering Montage...' : 'Render Montage (2-100)'}
+                      </button>
+
+                      {previewMode === 'timeline' && (
+                        <>
+                          {isTimelinePlaying ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsTimelinePlaying(false);
+                                timelineAutoPlayRef.current = false;
+                                previewRef.current?.pause?.();
+                                setLocalStatus('Paused grouped timeline playback.');
+                              }}
+                              className="inline-flex items-center gap-1 rounded-lg bg-slate-800 text-white px-3 py-2 text-xs font-semibold"
+                            >
+                              <span className="material-symbols-outlined text-[14px]">pause</span>
+                              Pause Group
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={resumeTimelinePlayback}
+                              className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 text-white px-3 py-2 text-xs font-semibold"
+                            >
+                              <span className="material-symbols-outlined text-[14px]">play_arrow</span>
+                              Resume Group
+                            </button>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              stopTimelinePlayback('Grouped timeline playback stopped.');
+                              setPreviewMode('selected');
+                              setPlaybackTimelineItemId('');
+                            }}
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                          >
+                            <span className="material-symbols-outlined text-[14px]">stop</span>
+                            Stop Group
+                          </button>
+                        </>
+                      )}
+
+                      {previewMode !== 'selected' && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            stopTimelinePlayback('Switched to selected clip preview mode.');
+                            setPreviewMode('selected');
+                            setPlaybackTimelineItemId('');
+                          }}
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">movie</span>
+                          Preview Selected
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                    <span>{selectedProject ? selectedProject.name : 'No Project Selected'}</span>
+                    {previewTimelineIndex >= 0 && (
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">
+                        Clip {previewTimelineIndex + 1}/{timelineEntries.length}
+                      </span>
+                    )}
+                    {previewMode === 'timeline' && (
+                      <span className="font-semibold text-primary">
+                        Grouped Playback {isTimelinePlaying ? 'ON' : 'Paused'}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="mt-3 flex-1 min-h-0">
+                    <div className="relative w-full h-full rounded-xl overflow-hidden bg-black/90 border border-slate-300/60 dark:border-slate-700/60">
+                      {previewClipPlaybackUrl ? (
+                        <video
+                          ref={previewRef}
+                          src={previewClipPlaybackUrl}
+                          controls
+                          className="w-full h-full object-contain"
+                          onLoadedMetadata={handlePreviewLoadedMetadata}
+                          onTimeUpdate={handlePreviewTimeUpdate}
+                          onEnded={handlePreviewEnded}
+                        />
+                      ) : (
+                        <div className="w-full h-full flex flex-col items-center justify-center text-slate-300 text-sm gap-2">
+                          <span className="material-symbols-outlined text-[34px]">videocam_off</span>
+                          Select a timeline clip with a rendered file to preview.
+                        </div>
+                      )}
+                      {previewCaptionLines.length > 0 && (
+                        <div className="pointer-events-none absolute inset-x-0 bottom-4 flex items-end justify-center px-4">
+                          <div className={getCaptionOverlayClassName(previewCaptionPayload?.stylePreset)}>
+                            <div className="space-y-1.5 text-center leading-tight">
+                              {previewCaptionLines.map((line, lineIndex) => (
+                                <div
+                                  key={`vault-caption-line-${lineIndex}`}
+                                  className="flex flex-wrap justify-center items-baseline gap-x-1.5 gap-y-1"
+                                >
+                                  {line.map((word) => (
+                                    <span
+                                      key={word.id}
+                                      className={`inline-block px-1 rounded transition-all duration-100 ${getCaptionWordClassName({
+                                        stylePreset: previewCaptionPayload?.stylePreset,
+                                        isActive: word.isActive,
+                                      })}`}
+                                    >
+                                      {word.text}
+                                    </span>
+                                  ))}
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                    <span>
+                      Playhead: <span className="font-semibold">{formatSecondsLabel(currentPreviewTime)}</span>
+                    </span>
+                    {previewTrimRange && (
+                      <span>
+                        Trim Range: <span className="font-semibold">{formatSecondsLabel(previewTrimRange.start)} - {formatSecondsLabel(previewTrimRange.end)}</span>
+                      </span>
+                    )}
+                    {effectivePreviewSpeechCleanup.enabled && (
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">
+                        Speech Cleanup {previewCleanupEntry?.status === 'loading'
+                          ? 'proxying…'
+                          : (previewCleanupEntry?.status === 'failed'
+                            ? 'preview unavailable'
+                            : `on (${effectivePreviewSpeechCleanup.preset})`)}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="mt-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/30 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Caption Style</div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Changes look only. Word timing and cue sync stay intact.
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleCaptionEnabledToggle}
+                          disabled={!selectedTimelineEntry}
+                          className={`rounded-md px-3 py-2 text-xs font-semibold disabled:opacity-50 ${selectedTimelineEntry?.item?.captionEnabled === false
+                            ? 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
+                            : 'bg-emerald-600 text-white'
+                            }`}
+                        >
+                          {selectedTimelineEntry?.item?.captionEnabled === false ? 'Captions Off' : 'Captions On'}
+                        </button>
+                        <select
+                          value={selectedCaptionStylePreset}
+                          onChange={handleCaptionStyleChange}
+                          disabled={!selectedTimelineEntry}
+                          className="rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-100 disabled:opacity-50"
+                          aria-label="Caption style preset"
+                        >
+                          {CAPTION_STYLE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/30 p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Speech Cleanup</div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Backend speech-focused denoise for noisy dialogue. Preview proxies are prepared lazily when enabled.
+                        </div>
+                      </div>
+                      <div className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+                        Effective: {effectiveSelectedSpeechCleanup.enabled ? effectiveSelectedSpeechCleanup.preset : 'off'} ({effectiveSelectedSpeechCleanup.source})
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <select
+                        value={normalizeSpeechCleanupMode(selectedTimelineEntry?.item?.speechCleanupMode)}
+                        onChange={handleSpeechCleanupModeChange}
+                        disabled={!selectedTimelineEntry}
+                        className="rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-100 disabled:opacity-50"
+                        aria-label="Speech Cleanup mode"
+                      >
+                        <option value="inherit">Use Project Default</option>
+                        <option value="off">Off For This Clip</option>
+                        <option value="on">On For This Clip</option>
+                      </select>
+                      <select
+                        value={normalizeSpeechCleanupPreset(selectedTimelineEntry?.item?.speechCleanupPreset || DEFAULT_SPEECH_CLEANUP_PRESET)}
+                        onChange={handleSpeechCleanupPresetChange}
+                        disabled={!selectedTimelineEntry || normalizeSpeechCleanupMode(selectedTimelineEntry?.item?.speechCleanupMode) === 'inherit'}
+                        className="rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-100 disabled:opacity-50"
+                        aria-label="Speech Cleanup preset"
+                      >
+                        {SPEECH_CLEANUP_PRESET_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                      {effectivePreviewSpeechCleanup.enabled && previewCleanupEntry?.status === 'failed' && (
+                        <span className="text-[11px] font-semibold text-amber-600 dark:text-amber-300">
+                          Preview fallback: original audio
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                </section>
+
+                <section className="mt-4 rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20">
+                  <button
+                    type="button"
+                    onClick={() => setIsClipToolsOpen((previous) => !previous)}
+                    className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left"
+                  >
+                    <div>
+                      <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Clip Tools</div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400">
+                        Advanced transcript correction and reflow.
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {selectedEditableClip && (
+                        <span className={`text-[11px] font-semibold px-2 py-1 rounded-md ${selectedClipHasTranscriptEdit
+                          ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200'
+                          : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'
+                          }`}>
+                          {selectedClipHasTranscriptEdit ? 'Edited text active' : 'Hidden'}
+                        </span>
+                      )}
+                      <span className="material-symbols-outlined text-slate-500 dark:text-slate-300">
+                        {isClipToolsOpen ? 'expand_less' : 'expand_more'}
+                      </span>
+                    </div>
+                  </button>
+                  {isClipToolsOpen && (
+                    <div className="border-t border-slate-200/70 dark:border-slate-700/70 p-4 space-y-3">
+                      <textarea
+                        value={clipTranscriptDraft}
+                        onChange={(event) => setClipTranscriptDraft(event.target.value)}
+                        disabled={!selectedEditableClip}
+                        rows={4}
+                        className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm"
+                        placeholder={selectedEditableClip ? 'Edit the clip transcript here' : 'Select a clip in the timeline to edit its transcript'}
+                      />
+                      <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {selectedEditableClip
+                            ? 'Apply Text + Reflow regenerates timed caption cues from the selected clip timing.'
+                            : 'Select a timeline clip to enable transcript editing.'}
+                        </div>
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={resetClipTranscriptEdit}
+                            disabled={!selectedEditableClip}
+                            className="rounded-md border border-slate-300 dark:border-slate-600 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
+                          >
+                            Reset to Source
+                          </button>
+                          <button
+                            type="button"
+                            onClick={applyClipTranscriptEdit}
+                            disabled={!selectedEditableClip}
+                            className="rounded-md bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                          >
+                            Apply Text + Reflow
+                          </button>
+                        </div>
                       </div>
                     </div>
                   )}
-                </div>
-
-                <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400">
-                  <span>Click a segment to target it. Green is active camera, red is inactive.</span>
-                  <span>Click the ruler to move the playhead. Use Cut At Playhead and Join Next to reshape the edit.</span>
-                </div>
-              </section>
-            </>
-          ) : (
-            <>
-          <section
-            className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-0"
-            style={{ height: `${monitorHeight}px` }}
-          >
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Program Monitor</div>
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => startTimelinePlayback(true)}
-                  disabled={!hasPlayableTimelineClip}
-                  className="inline-flex items-center gap-1 rounded-lg bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <span className="material-symbols-outlined text-[14px]">linked_camera</span>
-                  Play As One
-                </button>
+                </section>
 
                 <button
                   type="button"
-                  onClick={renderEditedGroup}
-                  disabled={isRenderingEditedGroup || renderableTimelineItemCount < 2}
-                  className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 text-white px-3 py-2 text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <span className="material-symbols-outlined text-[14px]">movie_edit</span>
-                  {isRenderingEditedGroup ? 'Rendering Montage...' : 'Render Montage (2-100)'}
-                </button>
+                  onMouseDown={startPaneResize('monitor')}
+                  aria-label="Resize monitor and timeline panes"
+                  className="hidden lg:block h-2 my-2 cursor-row-resize rounded bg-transparent hover:bg-primary/30 transition-colors"
+                />
 
-                {previewMode === 'timeline' && (
-                  <>
-                    {isTimelinePlaying ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsTimelinePlaying(false);
-                          timelineAutoPlayRef.current = false;
-                          previewRef.current?.pause?.();
-                          setLocalStatus('Paused grouped timeline playback.');
-                        }}
-                        className="inline-flex items-center gap-1 rounded-lg bg-slate-800 text-white px-3 py-2 text-xs font-semibold"
-                      >
-                        <span className="material-symbols-outlined text-[14px]">pause</span>
-                        Pause Group
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={resumeTimelinePlayback}
-                        className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 text-white px-3 py-2 text-xs font-semibold"
-                      >
-                        <span className="material-symbols-outlined text-[14px]">play_arrow</span>
-                        Resume Group
-                      </button>
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        stopTimelinePlayback('Grouped timeline playback stopped.');
-                        setPreviewMode('selected');
-                        setPlaybackTimelineItemId('');
-                      }}
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                    >
-                      <span className="material-symbols-outlined text-[14px]">stop</span>
-                      Stop Group
-                    </button>
-                  </>
-                )}
-
-                {previewMode !== 'selected' && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      stopTimelinePlayback('Switched to selected clip preview mode.');
-                      setPreviewMode('selected');
-                      setPlaybackTimelineItemId('');
-                    }}
-                    className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200"
-                  >
-                    <span className="material-symbols-outlined text-[14px]">movie</span>
-                    Preview Selected
-                  </button>
-                )}
-              </div>
-            </div>
-
-            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-              <span>{selectedProject ? selectedProject.name : 'No Project Selected'}</span>
-              {previewTimelineIndex >= 0 && (
-                <span className="font-semibold text-slate-700 dark:text-slate-200">
-                  Clip {previewTimelineIndex + 1}/{timelineEntries.length}
-                </span>
-              )}
-              {previewMode === 'timeline' && (
-                <span className="font-semibold text-primary">
-                  Grouped Playback {isTimelinePlaying ? 'ON' : 'Paused'}
-                </span>
-              )}
-            </div>
-
-            <div className="mt-3 flex-1 min-h-0">
-              <div className="relative w-full h-full rounded-xl overflow-hidden bg-black/90 border border-slate-300/60 dark:border-slate-700/60">
-                {getClipPlaybackUrl(previewClip) ? (
-                  <video
-                    ref={previewRef}
-                    src={getClipPlaybackUrl(previewClip)}
-                    controls
-                    className="w-full h-full object-contain"
-                    onLoadedMetadata={handlePreviewLoadedMetadata}
-                    onTimeUpdate={handlePreviewTimeUpdate}
-                    onEnded={handlePreviewEnded}
-                  />
-                ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center text-slate-300 text-sm gap-2">
-                    <span className="material-symbols-outlined text-[34px]">videocam_off</span>
-                    Select a timeline clip with a rendered file to preview.
-                  </div>
-                )}
-                {previewCaptionLines.length > 0 && (
-                  <div className="pointer-events-none absolute inset-x-0 bottom-4 flex items-end justify-center px-4">
-                    <div className={getCaptionOverlayClassName(previewCaptionPayload?.stylePreset)}>
-                      <div className="space-y-1.5 text-center leading-tight">
-                        {previewCaptionLines.map((line, lineIndex) => (
-                          <div
-                            key={`vault-caption-line-${lineIndex}`}
-                            className="flex flex-wrap justify-center items-baseline gap-x-1.5 gap-y-1"
-                          >
-                            {line.map((word) => (
-                              <span
-                                key={word.id}
-                                className={`inline-block px-1 rounded transition-all duration-100 ${getCaptionWordClassName({
-                                  stylePreset: previewCaptionPayload?.stylePreset,
-                                  isActive: word.isActive,
-                                })}`}
-                              >
-                                {word.text}
-                              </span>
-                            ))}
-                          </div>
-                        ))}
+                <section className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-[280px] flex-1">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Timeline Editor</div>
+                    <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+                      <span>Playhead {formatTimelineTickLabel(timelinePlayheadSeconds)}</span>
+                      <div className="inline-flex items-center gap-1">
+                        <span>Zoom</span>
+                        <input
+                          type="range"
+                          min="0.6"
+                          max="4"
+                          step="0.1"
+                          value={timelineZoom}
+                          onChange={(event) => setTimelineZoom(clamp(Number(event.target.value), 0.6, 4))}
+                          className="w-24 accent-primary"
+                          aria-label="Timeline zoom"
+                        />
+                        <span className="font-semibold text-slate-700 dark:text-slate-200">{timelineZoom.toFixed(1)}x</span>
                       </div>
                     </div>
                   </div>
-                )}
-              </div>
-            </div>
-
-            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-              <span>
-                Playhead: <span className="font-semibold">{formatSecondsLabel(currentPreviewTime)}</span>
-              </span>
-              {previewTrimRange && (
-                <span>
-                  Trim Range: <span className="font-semibold">{formatSecondsLabel(previewTrimRange.start)} - {formatSecondsLabel(previewTrimRange.end)}</span>
-                </span>
-              )}
-            </div>
-
-            <div className="mt-3 rounded-xl border border-slate-200/70 dark:border-slate-700/70 bg-slate-50/70 dark:bg-slate-900/30 p-3">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Caption Style</div>
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                    Changes look only. Word timing and cue sync stay intact.
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleCaptionEnabledToggle}
-                    disabled={!selectedTimelineEntry}
-                    className={`rounded-md px-3 py-2 text-xs font-semibold disabled:opacity-50 ${
-                      selectedTimelineEntry?.item?.captionEnabled === false
-                        ? 'border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200'
-                        : 'bg-emerald-600 text-white'
-                    }`}
-                  >
-                    {selectedTimelineEntry?.item?.captionEnabled === false ? 'Captions Off' : 'Captions On'}
-                  </button>
-                  <select
-                    value={selectedCaptionStylePreset}
-                    onChange={handleCaptionStyleChange}
-                    disabled={!selectedTimelineEntry}
-                    className="rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-100 disabled:opacity-50"
-                    aria-label="Caption style preset"
-                  >
-                    {CAPTION_STYLE_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </div>
-
-          </section>
-
-          <section className="mt-4 rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20">
-            <button
-              type="button"
-              onClick={() => setIsClipToolsOpen((previous) => !previous)}
-              className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left"
-            >
-              <div>
-                <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Clip Tools</div>
-                <div className="text-xs text-slate-500 dark:text-slate-400">
-                  Advanced transcript correction and reflow.
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                {selectedEditableClip && (
-                  <span className={`text-[11px] font-semibold px-2 py-1 rounded-md ${
-                    selectedClipHasTranscriptEdit
-                      ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200'
-                      : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'
-                  }`}>
-                    {selectedClipHasTranscriptEdit ? 'Edited text active' : 'Hidden'}
-                  </span>
-                )}
-                <span className="material-symbols-outlined text-slate-500 dark:text-slate-300">
-                  {isClipToolsOpen ? 'expand_less' : 'expand_more'}
-                </span>
-              </div>
-            </button>
-            {isClipToolsOpen && (
-              <div className="border-t border-slate-200/70 dark:border-slate-700/70 p-4 space-y-3">
-                <textarea
-                  value={clipTranscriptDraft}
-                  onChange={(event) => setClipTranscriptDraft(event.target.value)}
-                  disabled={!selectedEditableClip}
-                  rows={4}
-                  className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm"
-                  placeholder={selectedEditableClip ? 'Edit the clip transcript here' : 'Select a clip in the timeline to edit its transcript'}
-                />
-                <div className="flex items-center justify-between gap-3 flex-wrap">
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                    {selectedEditableClip
-                      ? 'Apply Text + Reflow regenerates timed caption cues from the selected clip timing.'
-                      : 'Select a timeline clip to enable transcript editing.'}
-                  </div>
-                  <div className="inline-flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={resetClipTranscriptEdit}
-                      disabled={!selectedEditableClip}
-                      className="rounded-md border border-slate-300 dark:border-slate-600 px-3 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-50"
-                    >
-                      Reset to Source
-                    </button>
-                    <button
-                      type="button"
-                      onClick={applyClipTranscriptEdit}
-                      disabled={!selectedEditableClip}
-                      className="rounded-md bg-primary text-white px-3 py-2 text-xs font-semibold disabled:opacity-50"
-                    >
-                      Apply Text + Reflow
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </section>
-
-          <button
-            type="button"
-            onMouseDown={startPaneResize('monitor')}
-            aria-label="Resize monitor and timeline panes"
-            className="hidden lg:block h-2 my-2 cursor-row-resize rounded bg-transparent hover:bg-primary/30 transition-colors"
-          />
-
-          <section className="rounded-2xl border border-slate-200/70 dark:border-slate-700/70 bg-white/40 dark:bg-slate-900/20 p-4 flex flex-col min-h-[280px] flex-1">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="text-sm font-semibold text-slate-800 dark:text-slate-100">Timeline Editor</div>
-              <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-                <span>Playhead {formatTimelineTickLabel(timelinePlayheadSeconds)}</span>
-                <div className="inline-flex items-center gap-1">
-                  <span>Zoom</span>
-                  <input
-                    type="range"
-                    min="0.6"
-                    max="4"
-                    step="0.1"
-                    value={timelineZoom}
-                    onChange={(event) => setTimelineZoom(clamp(Number(event.target.value), 0.6, 4))}
-                    className="w-24 accent-primary"
-                    aria-label="Timeline zoom"
-                  />
-                  <span className="font-semibold text-slate-700 dark:text-slate-200">{timelineZoom.toFixed(1)}x</span>
-                </div>
-              </div>
-            </div>
-
-            <div
-              ref={timelineScrollerRef}
-              className="mt-3 rounded-xl border border-slate-300/70 dark:border-slate-700/70 bg-slate-950/80 overflow-x-auto overflow-y-hidden flex-1 min-h-0"
-            >
-              {timelineSequenceEntries.length === 0 ? (
-                <div
-                  className="h-full min-h-[210px] rounded-xl border border-dashed border-slate-600 flex items-center justify-center text-slate-400 text-sm"
-                  onDragOver={(event) => event.preventDefault()}
-                  onDrop={handleTimelineTrackDrop}
-                >
-                  Drop clips here to start your montage timeline.
-                </div>
-              ) : (
-                <div
-                  ref={timelineTrackRef}
-                  className="relative min-h-[210px] select-none"
-                  style={{ width: `${timelineTrackWidthPx}px` }}
-                  onPointerDown={handleTimelineRulerPointerDown}
-                  onDragOver={(event) => event.preventDefault()}
-                  onDrop={handleTimelineTrackDrop}
-                >
-                  <div
-                    className="absolute left-0 right-0 top-0 bg-slate-900/95 border-b border-slate-700"
-                    style={{ height: `${TIMELINE_RULER_HEIGHT_PX}px` }}
-                  >
-                    {timelineRulerTicks.map((tick) => {
-                      const leftPx = tick.seconds * timelinePixelsPerSecond;
-                      return (
-                        <div
-                          key={`tick-${tick.seconds}`}
-                          className="absolute top-0 bottom-0 text-[10px] text-slate-400"
-                          style={{ left: `${leftPx}px` }}
-                        >
-                          <div className={`w-px bg-slate-500/70 ${tick.isMajor ? 'h-4' : 'h-2.5'}`} />
-                          {tick.isMajor && (
-                            <div className="mt-0.5 -translate-x-1/2 whitespace-nowrap">
-                              {formatTimelineTickLabel(tick.seconds)}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
 
                   <div
-                    className="absolute left-0 right-0 bg-slate-900/45 border-b border-slate-700/80"
-                    style={{
-                      top: `${TIMELINE_RULER_HEIGHT_PX}px`,
-                      height: `${TIMELINE_ROW_HEIGHT_PX}px`,
-                    }}
-                  />
-                  <div
-                    className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400"
-                    style={{ top: `${TIMELINE_RULER_HEIGHT_PX + 6}px` }}
+                    ref={timelineScrollerRef}
+                    className="mt-3 rounded-xl border border-slate-300/70 dark:border-slate-700/70 bg-slate-950/80 overflow-x-auto overflow-y-hidden flex-1 min-h-0"
                   >
-                    V1
-                  </div>
-
-                  {timelineSequenceEntries.map((entry, index) => {
-                    const isSelected = entry.item.id === effectiveSelectedTimelineItemId;
-                    const isPlaybackEntry = entry.item.id === effectivePlaybackTimelineItemId && previewMode === 'timeline';
-                    const trimRange = getTimelineEntryTrimRange(entry);
-                    const clipDuration = Number(trimRange.clipDuration);
-                    const trimStartPercent = Number.isFinite(clipDuration) && clipDuration > 0
-                      ? (trimRange.start / clipDuration) * 100
-                      : 0;
-                    const trimEndPercent = Number.isFinite(clipDuration) && clipDuration > 0
-                      ? (trimRange.end / clipDuration) * 100
-                      : 100;
-                    const segmentLeftPx = entry.sequenceStart * timelinePixelsPerSecond;
-                    const segmentWidthPx = Math.max(28, entry.sequenceDuration * timelinePixelsPerSecond);
-                    const segmentTopPx = TIMELINE_RULER_HEIGHT_PX + 9;
-                    const segmentHeightPx = TIMELINE_ROW_HEIGHT_PX - 18;
-                    return (
-                      <button
-                        key={entry.item.id}
-                        type="button"
-                        draggable
-                        onDragStart={(event) => handleTimelineDragStart(event, entry.item.id)}
-                        onClick={() => handleSelectTimelineItem(entry.item.id)}
-                        onDoubleClick={() => handleTimelineItemDoubleClick(entry)}
-                        className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${
-                          isSelected
-                            ? 'border-primary bg-primary/20 text-white shadow-[0_0_0_1px_rgba(255,255,255,0.12)]'
-                            : 'border-slate-600 bg-slate-800/90 text-slate-100 hover:border-slate-500'
-                        }`}
-                        style={{
-                          left: `${segmentLeftPx}px`,
-                          width: `${segmentWidthPx}px`,
-                          top: `${segmentTopPx}px`,
-                          height: `${segmentHeightPx}px`,
-                        }}
-                        title={`${entry.clip.title || 'Clip'} • ${entry.sequenceDuration.toFixed(2)}s`}
+                    {timelineSequenceEntries.length === 0 ? (
+                      <div
+                        className="h-full min-h-[210px] rounded-xl border border-dashed border-slate-600 flex items-center justify-center text-slate-400 text-sm"
+                        onDragOver={(event) => event.preventDefault()}
+                        onDrop={handleTimelineTrackDrop}
                       >
-                        <div className="pointer-events-none absolute left-1 right-1 bottom-1 h-1 rounded-full bg-white/10">
-                          <div
-                            className="absolute h-full rounded-full bg-accent-neon/80"
-                            style={{
-                              left: `${trimStartPercent}%`,
-                              right: `${Math.max(0, 100 - trimEndPercent)}%`,
-                            }}
-                          />
+                        Drop clips here to start your montage timeline.
+                      </div>
+                    ) : (
+                      <div
+                        ref={timelineTrackRef}
+                        className="relative min-h-[210px] select-none"
+                        style={{ width: `${timelineTrackWidthPx}px` }}
+                        onPointerDown={handleTimelineRulerPointerDown}
+                        onDragOver={(event) => event.preventDefault()}
+                        onDrop={handleTimelineTrackDrop}
+                      >
+                        <div
+                          className="absolute left-0 right-0 top-0 bg-slate-900/95 border-b border-slate-700"
+                          style={{ height: `${TIMELINE_RULER_HEIGHT_PX}px` }}
+                        >
+                          {timelineRulerTicks.map((tick) => {
+                            const leftPx = tick.seconds * timelinePixelsPerSecond;
+                            return (
+                              <div
+                                key={`tick-${tick.seconds}`}
+                                className="absolute top-0 bottom-0 text-[10px] text-slate-400"
+                                style={{ left: `${leftPx}px` }}
+                              >
+                                <div className={`w-px bg-slate-500/70 ${tick.isMajor ? 'h-4' : 'h-2.5'}`} />
+                                {tick.isMajor && (
+                                  <div className="mt-0.5 -translate-x-1/2 whitespace-nowrap">
+                                    {formatTimelineTickLabel(tick.seconds)}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
 
-                        <span
-                          role="presentation"
-                          title="Drag to trim start"
-                          onPointerDown={(event) => startTimelineTrimDrag(event, entry, 'start', segmentWidthPx)}
-                          className="absolute left-0 top-0 bottom-0 z-20 cursor-ew-resize border-r border-accent-neon/80 bg-accent-neon/25 hover:bg-accent-neon/40"
-                          style={{ width: `${TRIM_HANDLE_WIDTH_PX}px` }}
+                        <div
+                          className="absolute left-0 right-0 bg-slate-900/45 border-b border-slate-700/80"
+                          style={{
+                            top: `${TIMELINE_RULER_HEIGHT_PX}px`,
+                            height: `${TIMELINE_ROW_HEIGHT_PX}px`,
+                          }}
                         />
-                        <span
-                          role="presentation"
-                          title="Drag to trim end"
-                          onPointerDown={(event) => startTimelineTrimDrag(event, entry, 'end', segmentWidthPx)}
-                          className="absolute right-0 top-0 bottom-0 z-20 cursor-ew-resize border-l border-accent-neon/80 bg-accent-neon/25 hover:bg-accent-neon/40"
-                          style={{ width: `${TRIM_HANDLE_WIDTH_PX}px` }}
-                        />
-
-                        <div className="relative z-10 flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <div className="text-[10px] font-bold opacity-75">#{index + 1}</div>
-                            <div className="text-xs font-semibold truncate">{entry.clip.title || 'Untitled Clip'}</div>
-                          </div>
-                          {isPlaybackEntry && (
-                            <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-300">
-                              <span className="material-symbols-outlined text-[12px]">play_arrow</span>
-                              LIVE
-                            </span>
-                          )}
+                        <div
+                          className="absolute left-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400"
+                          style={{ top: `${TIMELINE_RULER_HEIGHT_PX + 6}px` }}
+                        >
+                          V1
                         </div>
-                      </button>
-                    );
-                  })}
 
-                  <div
-                    className="pointer-events-none absolute top-0 bottom-0 z-40"
-                    style={{ left: `${timelinePlayheadSeconds * timelinePixelsPerSecond}px` }}
-                  >
-                    <div className="w-[2px] h-full bg-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.6)]" />
-                    <div className="absolute -top-0.5 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[7px] border-r-[7px] border-t-[10px] border-l-transparent border-r-transparent border-t-white/95" />
+                        {timelineSequenceEntries.map((entry, index) => {
+                          const isSelected = entry.item.id === effectiveSelectedTimelineItemId;
+                          const isPlaybackEntry = entry.item.id === effectivePlaybackTimelineItemId && previewMode === 'timeline';
+                          const trimRange = getTimelineEntryTrimRange(entry);
+                          const clipDuration = Number(trimRange.clipDuration);
+                          const trimStartPercent = Number.isFinite(clipDuration) && clipDuration > 0
+                            ? (trimRange.start / clipDuration) * 100
+                            : 0;
+                          const trimEndPercent = Number.isFinite(clipDuration) && clipDuration > 0
+                            ? (trimRange.end / clipDuration) * 100
+                            : 100;
+                          const segmentLeftPx = entry.sequenceStart * timelinePixelsPerSecond;
+                          const segmentWidthPx = Math.max(28, entry.sequenceDuration * timelinePixelsPerSecond);
+                          const segmentTopPx = TIMELINE_RULER_HEIGHT_PX + 9;
+                          const segmentHeightPx = TIMELINE_ROW_HEIGHT_PX - 18;
+                          return (
+                            <button
+                              key={entry.item.id}
+                              type="button"
+                              draggable
+                              onDragStart={(event) => handleTimelineDragStart(event, entry.item.id)}
+                              onClick={() => handleSelectTimelineItem(entry.item.id)}
+                              onDoubleClick={() => handleTimelineItemDoubleClick(entry)}
+                              className={`absolute overflow-hidden rounded-lg border px-2 py-1 text-left transition-colors ${isSelected
+                                ? 'border-primary bg-primary/20 text-white shadow-[0_0_0_1px_rgba(255,255,255,0.12)]'
+                                : 'border-slate-600 bg-slate-800/90 text-slate-100 hover:border-slate-500'
+                                }`}
+                              style={{
+                                left: `${segmentLeftPx}px`,
+                                width: `${segmentWidthPx}px`,
+                                top: `${segmentTopPx}px`,
+                                height: `${segmentHeightPx}px`,
+                              }}
+                              title={`${entry.clip.title || 'Clip'} • ${entry.sequenceDuration.toFixed(2)}s`}
+                            >
+                              <div className="pointer-events-none absolute left-1 right-1 bottom-1 h-1 rounded-full bg-white/10">
+                                <div
+                                  className="absolute h-full rounded-full bg-accent-neon/80"
+                                  style={{
+                                    left: `${trimStartPercent}%`,
+                                    right: `${Math.max(0, 100 - trimEndPercent)}%`,
+                                  }}
+                                />
+                              </div>
+
+                              <span
+                                role="presentation"
+                                title="Drag to trim start"
+                                onPointerDown={(event) => startTimelineTrimDrag(event, entry, 'start', segmentWidthPx)}
+                                className="absolute left-0 top-0 bottom-0 z-20 cursor-ew-resize border-r border-accent-neon/80 bg-accent-neon/25 hover:bg-accent-neon/40"
+                                style={{ width: `${TRIM_HANDLE_WIDTH_PX}px` }}
+                              />
+                              <span
+                                role="presentation"
+                                title="Drag to trim end"
+                                onPointerDown={(event) => startTimelineTrimDrag(event, entry, 'end', segmentWidthPx)}
+                                className="absolute right-0 top-0 bottom-0 z-20 cursor-ew-resize border-l border-accent-neon/80 bg-accent-neon/25 hover:bg-accent-neon/40"
+                                style={{ width: `${TRIM_HANDLE_WIDTH_PX}px` }}
+                              />
+
+                              <div className="relative z-10 flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="text-[10px] font-bold opacity-75">#{index + 1}</div>
+                                  <div className="text-xs font-semibold truncate">{entry.clip.title || 'Untitled Clip'}</div>
+                                </div>
+                                {isPlaybackEntry && (
+                                  <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-300">
+                                    <span className="material-symbols-outlined text-[12px]">play_arrow</span>
+                                    LIVE
+                                  </span>
+                                )}
+                              </div>
+                            </button>
+                          );
+                        })}
+
+                        <div
+                          className="pointer-events-none absolute top-0 bottom-0 z-40"
+                          style={{ left: `${timelinePlayheadSeconds * timelinePixelsPerSecond}px` }}
+                        >
+                          <div className="w-[2px] h-full bg-white/95 shadow-[0_0_0_1px_rgba(0,0,0,0.6)]" />
+                          <div className="absolute -top-0.5 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[7px] border-r-[7px] border-t-[10px] border-l-transparent border-r-transparent border-t-white/95" />
+                        </div>
+                      </div>
+                    )}
                   </div>
-                </div>
-              )}
-            </div>
 
-            <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400">
-              <span>Trim by dragging clip edges in the bottom timeline.</span>
-              <span>Click anywhere on the ruler/track to move the playhead and update the monitor.</span>
-            </div>
-          </section>
-            </>
-          )}
+                  <div className="mt-2 flex flex-wrap items-center gap-3 text-[11px] text-slate-500 dark:text-slate-400">
+                    <span>Trim by dragging clip edges in the bottom timeline.</span>
+                    <span>Click anywhere on the ruler/track to move the playhead and update the monitor.</span>
+                  </div>
+                </section>
+              </>
+            )}
+          </div>
+
         </div>
 
-      </div>
 
-      {renderedEditDownloads.length > 0 && (
-        <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 space-y-2">
-          <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Rendered Outputs</div>
-          <div className="flex flex-wrap gap-2">
-            {renderedEditDownloads.map((item, index) => (
+
+        {renderedProgramDownload && (
+          <div className="rounded-xl border border-emerald-200/70 dark:border-emerald-700/60 p-3 space-y-2">
+            <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Finished Program</div>
+            <div className="flex flex-wrap gap-2">
               <a
-                key={`${item.downloadUrl || item.fileName}-${index}`}
-                href={item.downloadUrl}
-                download={item.fileName || `edited-output-${index + 1}.mp4`}
-                className="inline-flex items-center gap-1 rounded-md bg-primary/15 text-primary hover:bg-primary/25 transition-colors px-2.5 py-1.5 text-xs font-semibold"
+                href={renderedProgramDownload.url}
+                download={renderedProgramDownload.fileName}
+                className="inline-flex items-center gap-1 rounded-md bg-emerald-600/15 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-600/25 transition-colors px-2.5 py-1.5 text-xs font-semibold"
               >
                 <span className="material-symbols-outlined text-[14px]">download</span>
-                {item.fileName || item.title || `Output ${index + 1}`}
+                {renderedProgramDownload.fileName}
               </a>
-            ))}
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {localStatus && (
-        <div className="rounded-xl border border-slate-200 dark:border-slate-700 px-3 py-2 text-xs text-slate-700 dark:text-slate-200">
-          {localStatus}
+        {renderedEditDownloads.length > 0 && (
+          <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 space-y-2">
+            <div className="text-xs font-semibold text-slate-700 dark:text-slate-200">Rendered Outputs</div>
+            <div className="flex flex-wrap gap-2">
+              {renderedEditDownloads.map((item, index) => (
+                <a
+                  key={`${item.downloadUrl || item.fileName}-${index}`}
+                  href={item.downloadUrl}
+                  download={item.fileName || `edited-output-${index + 1}.mp4`}
+                  className="inline-flex items-center gap-1 rounded-md bg-primary/15 text-primary hover:bg-primary/25 transition-colors px-2.5 py-1.5 text-xs font-semibold"
+                >
+                  <span className="material-symbols-outlined text-[14px]">download</span>
+                  {item.fileName || item.title || `Output ${index + 1}`}
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {localStatus && (
+          <div className="rounded-xl border border-slate-200 dark:border-slate-700 px-3 py-2 text-xs text-slate-700 dark:text-slate-200">
+            {localStatus}
+          </div>
+        )}
+      </section>
+
+      {isMulticamProject && isProgramPreviewOpen && (
+        <div
+          className="fixed z-[90] rounded-2xl border border-slate-300/70 dark:border-slate-700/80 bg-slate-950/92 shadow-2xl shadow-black/50 overflow-hidden"
+          style={{
+            left: `${programPreviewRect.x}px`,
+            top: `${programPreviewRect.y}px`,
+            width: `${programPreviewRect.width}px`,
+            height: `${programPreviewRect.height}px`,
+          }}
+        >
+          <div
+            className="flex items-center justify-between gap-3 px-3 py-2 border-b border-slate-700/80 bg-slate-900/95 cursor-move"
+            onPointerDown={handleProgramPreviewWindowPointerDown}
+          >
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-slate-100">Program Preview</div>
+              <div className="text-[11px] text-slate-400">
+                Live cut preview of the current timeline and shot presets
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {isMulticamPlaying ? (
+                <button
+                  type="button"
+                  onClick={pauseSelectedMulticamProgram}
+                  className="inline-flex items-center gap-1 rounded-md bg-slate-800 text-white px-2 py-1 text-[11px] font-semibold"
+                >
+                  <span className="material-symbols-outlined text-[13px]">pause</span>
+                  Pause
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={playSelectedMulticamProgram}
+                  className="inline-flex items-center gap-1 rounded-md bg-primary text-white px-2 py-1 text-[11px] font-semibold"
+                >
+                  <span className="material-symbols-outlined text-[13px]">play_arrow</span>
+                  Play
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleCloseProgramPreview}
+                className="inline-flex items-center justify-center rounded-md border border-slate-700 px-2 py-1 text-slate-200"
+                aria-label="Close program preview"
+              >
+                <span className="material-symbols-outlined text-[14px]">close</span>
+              </button>
+            </div>
+          </div>
+          <div className="relative bg-black" style={{ height: `${Math.max(180, programPreviewRect.height - 34)}px` }}>
+            <canvas
+              ref={programPreviewCanvasRef}
+              className="block w-full h-full"
+            />
+            <div className="pointer-events-none absolute left-3 top-3 rounded-md bg-black/55 px-2 py-1 text-[11px] font-semibold text-white">
+              {multicamPreviewSegment ? `LIVE ${formatShotPresetLabel(getMulticamSegmentShotId(multicamPreviewSegment))}` : 'Awaiting segment'}
+            </div>
+          </div>
+          <button
+            type="button"
+            onPointerDown={handleProgramPreviewResizePointerDown}
+            className="absolute right-1 bottom-1 inline-flex items-center justify-center rounded-md bg-slate-900/80 text-slate-200"
+            aria-label="Resize program preview"
+          >
+            <span className="material-symbols-outlined text-[18px]">drag_handle</span>
+          </button>
         </div>
       )}
-    </section>
+    </>
   );
 };
 

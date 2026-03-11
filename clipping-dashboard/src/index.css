@@ -11,17 +11,20 @@
     backdrop-filter: blur(12px);
     border: 1px solid rgba(255, 255, 255, 0.1);
   }
-  
+
   .neon-border {
     transition: all 0.3s ease;
   }
-  
+
   .neon-border:hover {
     box-shadow: 0 0 15px rgba(31, 104, 249, 0.4);
     border-color: #1f68f9;
   }
 }
 
-body {
+html,
+body,
+#root {
   min-height: max(884px, 100dvh);
+  overscroll-behavior-x: none;
 }

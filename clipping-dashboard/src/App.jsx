@@ -10,6 +10,14 @@ import ManualClipLab from './components/ManualClipLab';
 import ClipVaultWorkspace from './components/ClipVaultWorkspace';
 import AppErrorBoundary from './components/AppErrorBoundary';
 import { renderLocalClipFiles } from './lib/localClipper';
+import { createDefaultMulticamShotPresets, getMulticamCameraIdForShotId } from './lib/multicamProject';
+import {
+  createDefaultDialogueTrackDefaults,
+  createDefaultSpeechCleanupState,
+  normalizeDialogueTrackDefaults,
+  normalizeSpeechCleanupMode,
+  normalizeSpeechCleanupPreset,
+} from './lib/speechCleanup';
 import {
   storeClipMedia,
   getClipMedia,
@@ -27,6 +35,8 @@ const SIDEBAR_MAX_WIDTH = 440;
 const SIDEBAR_DEFAULT_WIDTH = 288;
 const TIMELINE_MIN_GAP_SECONDS = 0.1;
 const CLIP_MEDIA_MAX_BYTES = Number(import.meta.env.VITE_CLIP_MEDIA_MAX_BYTES || (800 * 1024 * 1024));
+const DEFAULT_MULTICAM_SHOT_PRESETS = createDefaultMulticamShotPresets();
+const DEFAULT_DIALOGUE_TRACK_DEFAULTS = createDefaultDialogueTrackDefaults();
 
 const parseHttpUrl = (value) => {
   try {
@@ -165,7 +175,7 @@ const normalizeClipTextAndCaptionState = (clip = {}) => {
   const captionTextOverride = cleanClipText(clip.captionTextOverride || '');
   const captionEditMode = String(
     clip.captionEditMode
-      || (captionCuesEdited.length > 0 ? 'cue-edit' : (transcriptEditedText || captionTextOverride ? 'text-edit' : 'source'))
+    || (captionCuesEdited.length > 0 ? 'cue-edit' : (transcriptEditedText || captionTextOverride ? 'text-edit' : 'source'))
   );
   const transcriptEditedAt = String(clip.transcriptEditedAt || '');
 
@@ -306,6 +316,7 @@ const createTimelineItem = (clipId) => ({
   trimEndSeconds: null,
   effectsPreset: 'none',
   effectsIntensity: 100,
+  ...createDefaultSpeechCleanupState(),
   captionEnabled: true,
   captionStylePreset: 'reel-bold',
   captionTextOverride: '',
@@ -327,6 +338,8 @@ const normalizeProject = (project, index = 0) => {
       trimEndSeconds: Number.isFinite(Number(item?.trimEndSeconds)) ? Number(item.trimEndSeconds) : null,
       effectsPreset: String(item?.effectsPreset || 'none'),
       effectsIntensity: Number.isFinite(Number(item?.effectsIntensity)) ? Number(item.effectsIntensity) : 100,
+      speechCleanupMode: normalizeSpeechCleanupMode(item?.speechCleanupMode),
+      speechCleanupPreset: normalizeSpeechCleanupPreset(item?.speechCleanupPreset),
       captionEnabled: item?.captionEnabled !== false,
       captionStylePreset: String(item?.captionStylePreset || 'reel-bold'),
       captionTextOverride: String(item?.captionTextOverride || ''),
@@ -368,6 +381,7 @@ const normalizeProject = (project, index = 0) => {
       }
       : null,
     masterAudioAssetId: String(project?.masterAudioAssetId || ''),
+    dialogueTrackDefaults: normalizeDialogueTrackDefaults(project?.dialogueTrackDefaults || DEFAULT_DIALOGUE_TRACK_DEFAULTS),
     audioMixMode: String(project?.audioMixMode || 'single_master'),
     audioMixSettings: project?.audioMixSettings && typeof project.audioMixSettings === 'object'
       ? {
@@ -386,10 +400,23 @@ const normalizeProject = (project, index = 0) => {
     speakerCameraPreferences: project?.speakerCameraPreferences && typeof project.speakerCameraPreferences === 'object'
       ? project.speakerCameraPreferences
       : {},
+    multicamShotPresets: Array.isArray(project?.multicamShotPresets) && project.multicamShotPresets.length > 0
+      ? project.multicamShotPresets.map((preset, presetIndex) => ({
+        id: String(preset?.id || `preset-${presetIndex + 1}`),
+        cameraId: String(preset?.cameraId || getMulticamCameraIdForShotId(preset?.id || '1A')),
+        label: String(preset?.label || `Shot ${presetIndex + 1}`),
+        zoom: Number(preset?.zoom || 1),
+        panX: Number(preset?.panX || 0),
+        panY: Number(preset?.panY || 0),
+        enabled: preset?.enabled !== false,
+        locked: preset?.locked !== false,
+      }))
+      : DEFAULT_MULTICAM_SHOT_PRESETS.map((preset) => ({ ...preset })),
     multicamTimelineSegments: Array.isArray(project?.multicamTimelineSegments)
       ? project.multicamTimelineSegments.map((segment, segmentIndex) => ({
         id: String(segment?.id || `${baseId}-segment-${segmentIndex + 1}`),
-        cameraId: String(segment?.cameraId || 'camera1'),
+        shotId: String(segment?.shotId || segment?.manualShotId || '1A'),
+        cameraId: String(segment?.cameraId || getMulticamCameraIdForShotId(segment?.shotId || segment?.manualShotId || '1A')),
         cameraClipId: String(segment?.cameraClipId || ''),
         startSeconds: Number(segment?.startSeconds || 0),
         endSeconds: Number(segment?.endSeconds || 0),
@@ -397,7 +424,9 @@ const normalizeProject = (project, index = 0) => {
         silenceCandidate: Boolean(segment?.silenceCandidate),
         autoDecision: String(segment?.autoDecision || 'hold'),
         manualCameraId: String(segment?.manualCameraId || ''),
+        manualShotId: String(segment?.manualShotId || ''),
         isLocked: Boolean(segment?.isLocked),
+        isManual: segment?.isManual !== false,
       }))
       : [],
     manualOverrides: project?.manualOverrides && typeof project.manualOverrides === 'object'
@@ -1429,7 +1458,7 @@ function App() {
 
     clipIds.forEach((clipId) => {
       setClipPlaybackUrl(clipId, '');
-      void deleteClipMedia(clipId).catch(() => {});
+      void deleteClipMedia(clipId).catch(() => { });
     });
 
     setClipVault((previous) => previous.filter((clip) => String(clip.projectId || '') !== normalizedProjectId));
@@ -1736,7 +1765,7 @@ function App() {
 
         const leftTrimEnd = hasFiniteEnd ? Math.min(boundedSplit, currentEnd) : boundedSplit;
         const rightTrimStart = leftTrimEnd;
-        const leftItem = {
+      const leftItem = {
           ...sourceItem,
           trimStartSeconds: Number(currentStart.toFixed(2)),
           trimEndSeconds: Number(leftTrimEnd.toFixed(2)),
@@ -1745,7 +1774,7 @@ function App() {
           captionConfirmedAt: '',
           captionTextOverride: '',
         };
-        const rightItem = {
+      const rightItem = {
           ...sourceItem,
           id: createTimelineItem(sourceItem.clipId).id,
           trimStartSeconds: Number(rightTrimStart.toFixed(2)),
@@ -1850,6 +1879,9 @@ function App() {
     const mediaAssets = Array.isArray(draft?.mediaAssets) ? draft.mediaAssets : [];
     const multicamTimelineSegments = Array.isArray(draft?.timelineSegments) ? draft.timelineSegments : [];
     const masterAudioAssetId = String(draft?.masterAudioAssetId || mediaAssets[0]?.id || 'camera1');
+    const multicamShotPresets = Array.isArray(draft?.shotPresets) && draft.shotPresets.length > 0
+      ? draft.shotPresets
+      : DEFAULT_MULTICAM_SHOT_PRESETS;
     const audioMixMode = String(draft?.audioMixMode || 'single_master');
     const audioMixSettings = draft?.audioMixSettings && typeof draft.audioMixSettings === 'object'
       ? {
@@ -1934,7 +1966,8 @@ function App() {
     }
 
     const timelineItems = multicamTimelineSegments.map((segment) => {
-      const cameraAssetId = String(segment.cameraId || 'camera1');
+      const shotId = String(segment.shotId || segment.manualShotId || '1A');
+      const cameraAssetId = String(segment.cameraId || getMulticamCameraIdForShotId(shotId));
       const clipId = clipIdByAssetId.get(cameraAssetId) || clipEntries[0]?.id || '';
       return {
         ...createTimelineItem(clipId),
@@ -1945,6 +1978,7 @@ function App() {
         effectsIntensity: 100,
         meta: {
           cameraId: cameraAssetId,
+          shotId,
           confidence: Number(segment.confidence || 0),
           silenceCandidate: Boolean(segment.silenceCandidate),
           autoDecision: String(segment.autoDecision || 'hold'),
@@ -1976,9 +2010,13 @@ function App() {
         audioMixSettings,
         speakerProfiles: Array.isArray(draft?.speakerProfiles) ? draft.speakerProfiles : [],
         speakerCameraPreferences: draft?.speakerCameraPreferences || {},
+        dialogueTrackDefaults: normalizeDialogueTrackDefaults(draft?.dialogueTrackDefaults || DEFAULT_DIALOGUE_TRACK_DEFAULTS),
+        multicamShotPresets,
         multicamTimelineSegments: multicamTimelineSegments.map((segment) => ({
           ...segment,
-          cameraClipId: clipIdByAssetId.get(String(segment.cameraId || '')) || '',
+          shotId: String(segment.shotId || segment.manualShotId || '1A'),
+          cameraId: String(segment.cameraId || getMulticamCameraIdForShotId(segment.shotId || segment.manualShotId || '1A')),
+          cameraClipId: clipIdByAssetId.get(String(segment.cameraId || getMulticamCameraIdForShotId(segment.shotId || segment.manualShotId || '1A')) || '') || '',
         })),
         manualOverrides: {
           segments: {},
@@ -2006,17 +2044,33 @@ function App() {
     document.body.style.userSelect = 'none';
   }, [isSidebarCollapsed, sidebarWidth]);
 
+  useEffect(() => {
+    const handleAggressiveOverscroll = (e) => {
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        e.preventDefault();
+      }
+    };
+
+    document.addEventListener('mousewheel', handleAggressiveOverscroll, { passive: false });
+    document.addEventListener('wheel', handleAggressiveOverscroll, { passive: false });
+
+    return () => {
+      document.removeEventListener('mousewheel', handleAggressiveOverscroll);
+      document.removeEventListener('wheel', handleAggressiveOverscroll);
+    };
+  }, []);
+
   const showVaultSidebar = workspace === 'vault' && !isSidebarCollapsed;
 
   return (
-    <div className={`min-h-screen font-display ${isDarkMode ? 'dark text-slate-100 bg-background-dark' : 'text-slate-900 bg-background-light'}`}>
+    <div className={`min-h-screen flex flex-col font-display ${isDarkMode ? 'dark text-slate-100 bg-background-dark' : 'text-slate-900 bg-background-light'}`}>
       {import.meta.env.DEV && localDebugStatus && (
         <div className="fixed top-3 right-3 z-[100] rounded-lg bg-slate-900/90 text-white text-xs px-3 py-2 shadow-xl max-w-xs">
           {localDebugStatus}
         </div>
       )}
 
-      <div className="flex min-h-screen">
+      <div className="flex flex-1">
         {showVaultSidebar && (
           <>
             <Sidebar
@@ -2037,7 +2091,7 @@ function App() {
           </>
         )}
 
-        <main className="flex-1 flex flex-col h-screen overflow-hidden">
+        <main className="flex-1 flex flex-col min-h-screen overflow-x-hidden">
           <input
             ref={studioFileInputRef}
             type="file"
@@ -2067,7 +2121,7 @@ function App() {
             activeView={activeTopNavView}
           />
 
-          <div ref={mainScrollContainerRef} className="flex-1 overflow-y-auto p-4 lg:p-8 space-y-8 scroll-smooth pb-24 lg:pb-8">
+          <div ref={mainScrollContainerRef} className="flex-1 w-full p-4 lg:p-8 space-y-8 pb-24 lg:pb-8">
             {workspace === 'studio' && (
               <>
                 <div ref={previewSectionRef}>

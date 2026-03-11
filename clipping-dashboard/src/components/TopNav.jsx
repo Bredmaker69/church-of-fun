@@ -103,7 +103,7 @@ const TopNav = ({
                                 onStudioUrlSubmit?.(studioUrlValue);
                             }}
                             placeholder={studioPrepMode === 'multicam'
-                                ? 'Multicam mode uses Add Source for Camera 1 + Camera 2.'
+                                ? 'Multicam mode uses Add Source for Camera A + Camera B.'
                                 : 'Paste URL or use Add Source for a local video.'}
                             className="w-full bg-white/75 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700 rounded-full px-4 py-2.5 text-sm"
                         />
